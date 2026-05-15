@@ -1,21 +1,31 @@
 import argparse
 import json
+import logging
 import os
-import re
+import time
 from datetime import datetime
 from datetime import date as date_type
-from email.utils import parsedate_to_datetime
 from difflib import SequenceMatcher
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 import requests
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from analyzer import MentionAnalyzer
+from .analyzer import MentionAnalyzer
+from .title_matching import (
+    canonical_title_tokens,
+    is_semantic_title_duplicate,
+    is_title_contained_duplicate,
+    normalize_title,
+)
 
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 NOTION_API_VERSION = "2022-06-28"
@@ -36,7 +46,7 @@ class NotionExporter:
         token: Optional[str] = None,
         database_id: Optional[str] = None,
         property_names: Optional[Dict[str, str]] = None,
-        ensure_schema: bool = True,
+        ensure_schema: bool = False,
     ):
         self.token = token or os.getenv("NOTION_TOKEN")
         self.database_id = database_id or os.getenv("NOTION_DATABASE_ID")
@@ -59,6 +69,11 @@ class NotionExporter:
         if ensure_schema:
             self.ensure_database_schema()
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(requests.RequestException)
+    )
     def ensure_database_schema(self) -> None:
         database = self.get_database()
         existing = database.get("properties", {})
@@ -82,14 +97,24 @@ class NotionExporter:
         response = self.session.patch(endpoint, json={"properties": missing}, timeout=30)
         response.raise_for_status()
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(requests.RequestException)
+    )
     def get_database(self) -> Dict:
         endpoint = f"https://api.notion.com/v1/databases/{self.database_id}"
         response = self.session.get(endpoint, timeout=30)
         response.raise_for_status()
         return response.json()
 
-    def export_mentions(self, mentions: Iterable[Dict], update_existing: bool = True) -> Dict[str, int]:
-        stats = {"created": 0, "updated": 0, "skipped": 0}
+    def export_mentions(
+        self,
+        mentions: Iterable[Dict],
+        update_existing: bool = True,
+        dry_run: bool = False,
+    ) -> Dict[str, int]:
+        stats = {"created": 0, "updated": 0, "skipped": 0, "would_create": 0, "would_update": 0}
         mentions = sorted(
             self.deduplicate_mentions(list(mentions)),
             key=lambda mention: self.parse_date(mention.get("published_at", "")) or "",
@@ -99,6 +124,10 @@ class NotionExporter:
         for index, mention in enumerate(mentions, start=1):
             url = mention.get("url", "")
             if not url:
+                logger.info(
+                    "Notion export skip; reason=missing_url title=%r",
+                    self._trim(mention.get("title", ""), 120),
+                )
                 stats["skipped"] += 1
                 continue
 
@@ -106,13 +135,36 @@ class NotionExporter:
             properties = self.build_properties(mention, row_number=index)
 
             if page_id:
-                self.update_page(page_id, properties)
-                stats["updated"] += 1
+                logger.info(
+                    "Notion export %s; page_id=%s url=%s title=%r",
+                    "would_update" if dry_run else "update",
+                    page_id,
+                    url,
+                    self._trim(mention.get("title", ""), 120),
+                )
+                if dry_run:
+                    stats["would_update"] += 1
+                else:
+                    self.update_page(page_id, properties)
+                    stats["updated"] += 1
+                    time.sleep(0.5)  # Rate limit: delay between updates
             else:
-                self.create_page(properties)
-                stats["created"] += 1
+                logger.info(
+                    "Notion export %s; url=%s title=%r",
+                    "would_create" if dry_run else "create",
+                    url,
+                    self._trim(mention.get("title", ""), 120),
+                )
+                if dry_run:
+                    stats["would_create"] += 1
+                else:
+                    self.create_page(properties)
+                    stats["created"] += 1
+                    time.sleep(0.5)  # Rate limit: delay between creates
 
-        self.renumber_database()
+        if not dry_run:
+            self.renumber_database()
+        logger.info("Notion export finished; stats=%s", stats)
         return stats
 
     def deduplicate_mentions(self, mentions: List[Dict]) -> List[Dict]:
@@ -124,17 +176,19 @@ class NotionExporter:
         return keepers
 
     def _is_duplicate_mention(self, mention: Dict, keeper: Dict) -> bool:
-        mention_key = self.normalize_title(mention.get("title", ""))
-        keeper_key = self.normalize_title(keeper.get("title", ""))
+        mention_key = normalize_title(mention.get("title", ""))
+        keeper_key = normalize_title(keeper.get("title", ""))
         if not mention_key or not keeper_key:
             return False
-        if mention_key == keeper_key or self._is_title_contained_duplicate(mention_key, keeper_key):
+        if mention_key == keeper_key or is_title_contained_duplicate(mention_key, keeper_key):
             return True
 
         mention_date = self.parse_date(mention.get("published_at", "")) or ""
         keeper_date = self.parse_date(keeper.get("published_at", "")) or ""
         if mention_date and keeper_date and self._date_distance_days(mention_date, keeper_date) > 7:
             return False
+        if is_semantic_title_duplicate(mention_key, keeper_key):
+            return True
         return SequenceMatcher(None, mention_key, keeper_key).ratio() >= 0.72
 
     def deduplicate_database(self) -> Dict[str, int]:
@@ -142,8 +196,27 @@ class NotionExporter:
         duplicate_ids = self.find_duplicate_page_ids(pages)
         for page_id in duplicate_ids:
             self.archive_page(page_id)
+            time.sleep(0.5)  # Rate limit: delay between archives
         renumbered = self.renumber_database()
         return {"archived": len(duplicate_ids), "renumbered": renumbered}
+
+    def archive_urls(self, urls: Iterable[str]) -> Dict[str, int]:
+        stats = {"archived": 0, "missing": 0}
+        for url in urls:
+            page_id = self.find_page_by_url(url)
+            if not page_id:
+                logger.info("Notion archive by URL skipped; reason=missing url=%s", url)
+                stats["missing"] += 1
+                continue
+
+            logger.info("Notion archive by URL; page_id=%s url=%s", page_id, url)
+            self.archive_page(page_id)
+            stats["archived"] += 1
+            time.sleep(0.5)  # Rate limit: delay between archives
+
+        if stats["archived"]:
+            self.renumber_database()
+        return stats
 
     def refresh_existing_analysis(self, use_llm: bool = True) -> Dict[str, int]:
         analyzer = MentionAnalyzer(use_llm=use_llm)
@@ -241,14 +314,14 @@ class NotionExporter:
     def _is_duplicate_page(self, page: Dict, keeper: Dict) -> bool:
         page_title = self._page_title(page)
         keeper_title = self._page_title(keeper)
-        page_key = self.normalize_title(page_title)
-        keeper_key = self.normalize_title(keeper_title)
+        page_key = normalize_title(page_title)
+        keeper_key = normalize_title(keeper_title)
 
         if not page_key or not keeper_key:
             return False
         if page_key == keeper_key:
             return True
-        if self._is_title_contained_duplicate(page_key, keeper_key):
+        if is_title_contained_duplicate(page_key, keeper_key):
             return True
 
         page_date = self._page_date(page)
@@ -256,18 +329,23 @@ class NotionExporter:
         if page_date and keeper_date and self._date_distance_days(page_date, keeper_date) > 7:
             return False
 
+        if is_semantic_title_duplicate(page_key, keeper_key):
+            return True
+
         similarity = SequenceMatcher(None, page_key, keeper_key).ratio()
         return similarity >= 0.72
 
     @staticmethod
     def _is_title_contained_duplicate(left: str, right: str) -> bool:
-        left_tokens = left.split()
-        right_tokens = right.split()
-        if min(len(left_tokens), len(right_tokens)) < 5:
-            return False
-        shorter = " ".join(left_tokens if len(left_tokens) <= len(right_tokens) else right_tokens)
-        longer = " ".join(right_tokens if len(left_tokens) <= len(right_tokens) else left_tokens)
-        return shorter in longer
+        return is_title_contained_duplicate(left, right)
+
+    @staticmethod
+    def _is_semantic_title_duplicate(left: str, right: str) -> bool:
+        return is_semantic_title_duplicate(left, right)
+
+    @staticmethod
+    def _canonical_title_tokens(title: str) -> set[str]:
+        return canonical_title_tokens(title)
 
     def renumber_database(self, descending: bool = False) -> int:
         pages = self.query_database_pages()
@@ -280,6 +358,11 @@ class NotionExporter:
             )
         return len(pages)
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(requests.RequestException)
+    )
     def query_database_pages(self) -> List[Dict]:
         endpoint = f"https://api.notion.com/v1/databases/{self.database_id}/query"
         pages = []
@@ -294,6 +377,7 @@ class NotionExporter:
             if not data.get("has_more"):
                 break
             payload["start_cursor"] = data.get("next_cursor")
+            time.sleep(0.5)  # Rate limit: delay between pagination requests
 
         return pages
 
@@ -352,6 +436,11 @@ class NotionExporter:
         results = response.json().get("results", [])
         return results[0]["id"] if results else None
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(requests.RequestException)
+    )
     def create_page(self, properties: Dict) -> Dict:
         endpoint = "https://api.notion.com/v1/pages"
         payload = {
@@ -362,12 +451,22 @@ class NotionExporter:
         response.raise_for_status()
         return response.json()
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(requests.RequestException)
+    )
     def update_page(self, page_id: str, properties: Dict) -> Dict:
         endpoint = f"https://api.notion.com/v1/pages/{page_id}"
         response = self.session.patch(endpoint, json={"properties": properties}, timeout=30)
         response.raise_for_status()
         return response.json()
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(requests.RequestException)
+    )
     def archive_page(self, page_id: str) -> Dict:
         endpoint = f"https://api.notion.com/v1/pages/{page_id}"
         response = self.session.patch(endpoint, json={"archived": True}, timeout=30)
@@ -412,16 +511,7 @@ class NotionExporter:
 
     @staticmethod
     def normalize_title(title: str) -> str:
-        value = str(title or "").casefold()
-        value = value.replace("’", "'").replace("`", "'")
-        value = re.sub(r"\bwef\b", "world economic forum", value)
-        value = re.sub(r"\s*\|\s*[^|]{2,80}$", "", value)
-        value = re.sub(r"\s+-\s+[^-]{2,80}$", "", value)
-        value = re.sub(r"\s*-\s*", "-", value)
-        value = re.sub(r"\b(\d+)\s*\.\s*(\d+)x\b", r"\1.\2x", value)
-        value = re.sub(r"[^a-z0-9#%.]+", " ", value)
-        value = re.sub(r"\s+", " ", value).strip()
-        return value
+        return normalize_title(title)
 
     @staticmethod
     def _date_distance_days(left: str, right: str) -> int:
@@ -452,6 +542,12 @@ def parse_args() -> argparse.Namespace:
         help="Archive duplicate Notion rows by normalized/fuzzy title, then renumber rows.",
     )
     parser.add_argument(
+        "--archive-url",
+        action="append",
+        default=[],
+        help="Archive a Notion row by exact article URL. Can be passed multiple times.",
+    )
+    parser.add_argument(
         "--refresh-existing-analysis",
         action="store_true",
         help="Re-analyze existing Notion rows only and update context/PM columns without creating rows.",
@@ -462,19 +558,34 @@ def parse_args() -> argparse.Namespace:
         help="Remove the repeated 'Контекст упоминания inDrive:' label from existing Notion context cells.",
     )
     parser.add_argument(
+        "--ensure-schema",
+        action="store_true",
+        help="Create missing Notion database properties before running. Off by default.",
+    )
+    parser.add_argument(
         "--no-ensure-schema",
         action="store_true",
-        help="Do not create missing Notion database properties automatically.",
+        help="Deprecated no-op. Schema changes are disabled by default.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan create/update/skip actions without writing pages or renumbering the database.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    exporter = NotionExporter(ensure_schema=not args.no_ensure_schema)
+    exporter = NotionExporter(ensure_schema=args.ensure_schema)
     if args.dedupe_notion:
         stats = exporter.deduplicate_database()
         print(f"Notion dedupe complete: {stats}")
+        return
+
+    if args.archive_url:
+        stats = exporter.archive_urls(args.archive_url)
+        print(f"Notion archive by URL complete: {stats}")
         return
 
     if args.refresh_existing_analysis:
@@ -492,7 +603,11 @@ def main() -> None:
         print(f"Notion renumber complete: {count} rows")
         return
 
-    stats = exporter.export_mentions(load_mentions(args.input), update_existing=not args.no_update)
+    stats = exporter.export_mentions(
+        load_mentions(args.input),
+        update_existing=not args.no_update,
+        dry_run=args.dry_run,
+    )
     print(f"Notion export complete: {stats}")
 
 

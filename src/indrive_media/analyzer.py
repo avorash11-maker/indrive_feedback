@@ -1,20 +1,17 @@
 import json
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import openai
 from dotenv import load_dotenv
-
-try:
-    from langchain_core.prompts import ChatPromptTemplate
-    from langchain_openai import ChatOpenAI
-except ImportError:  # LLM analysis is optional.
-    ChatOpenAI = None
-    ChatPromptTemplate = None
 
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 COMPANY_TERMS = ("indrive", "indriver", "in-driver")
@@ -72,19 +69,17 @@ class MentionAnalyzer:
         company_context_path: str = "company_context.md",
     ):
         self.company_context = self._load_company_context(company_context_path)
-        self.use_llm = use_llm and bool(os.getenv("OPENAI_API_KEY")) and ChatOpenAI is not None
-        self.llm = None
+        self.use_llm = use_llm and bool(os.getenv("OPENAI_API_KEY"))
+        self.client = None
 
         if self.use_llm:
-            self.llm = ChatOpenAI(
-                model=model or os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                temperature=0,
-            )
+            self.client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     def analyze_article(self, title: str, text: str, url: str = "") -> Dict[str, Any]:
         base = self._heuristic_analysis(title, text, url)
 
-        if not self.llm:
+        if not self.use_llm or self.client is None:
             return base
 
         llm_result = self._llm_analysis(title, text, url, base)
@@ -94,6 +89,10 @@ class MentionAnalyzer:
         llm_result["matched_terms"] = base["matched_terms"]
         llm_result["mentions_indrive"] = base["mentions_indrive"]
         return self._normalize_result({**base, **llm_result})
+
+    def heuristic_analysis(self, title: str, text: str, url: str = "") -> Dict[str, Any]:
+        """Public method for heuristic analysis only."""
+        return self._heuristic_analysis(title, text, url)
 
     def _heuristic_analysis(self, title: str, text: str, url: str = "") -> Dict[str, Any]:
         content = self._normalize(" ".join([title or "", text or "", url or ""]))
@@ -145,11 +144,7 @@ class MentionAnalyzer:
         url: str,
         base: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    """Ты senior product intelligence analyst inDrive. Ты готовишь практичные медиа-инсайты для product managers, operations и safety/growth teams.
+        system_prompt = """Ты senior product intelligence analyst inDrive. Ты готовишь практичные медиа-инсайты для product managers, operations и safety/growth teams.
 
 Контекст компании, который нужно учитывать в каждом анализе:
 {company_context}
@@ -181,35 +176,43 @@ JSON schema:
   "pm_importance_ru": "2-3 предложения: почему это важно для PM; какие продуктовые метрики, сценарии или команды должны это проверить",
   "summary": "короткая русская версия сути статьи",
   "pm_insight": "короткий русский вывод для PM"
-}}""",
-                ),
-                (
-                    "user",
-                    """Title: {title}
+}}"""
+
+        user_prompt = """Title: {title}
 URL: {url}
 Available text/snippet:
 {text}
 
 Heuristic signal:
-{heuristic_signal}""",
-                ),
-            ]
-        )
+{heuristic_signal}"""
+
         try:
-            response = (prompt | self.llm).invoke(
-                {
-                    "company_context": self.company_context,
-                    "title": title or "",
-                    "url": url or "",
-                    "text": (text or "")[:3500],
-                    "heuristic_signal": json.dumps(base, ensure_ascii=False),
-                }
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt.format(company_context=self.company_context)},
+                    {"role": "user", "content": user_prompt.format(
+                        title=title,
+                        url=url,
+                        text=text,
+                        heuristic_signal=json.dumps(base, ensure_ascii=False, indent=2)
+                    )}
+                ],
+                temperature=0,
+                max_tokens=1000,
             )
-            content = response.content.strip()
+            content = response.choices[0].message.content.strip()
             content = re.sub(r"^```json\s*|\s*```$", "", content, flags=re.I | re.S)
             result = json.loads(content)
             return self._normalize_result(result)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "LLM analysis failed; falling back to heuristic result. title=%r url=%r error=%s",
+                self._clean_text(title)[:120],
+                url,
+                exc,
+                exc_info=True,
+            )
             return None
 
     def _normalize_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
@@ -250,7 +253,12 @@ Heuristic signal:
 
     @staticmethod
     def _matches(content: str, terms: List[str] | tuple[str, ...]) -> List[str]:
-        return sorted({term for term in terms if term.casefold() in content})
+        matches = set()
+        for term in terms:
+            pattern = rf"(?<![a-z0-9]){re.escape(term.casefold())}(?![a-z0-9])"
+            if re.search(pattern, content):
+                matches.add(term)
+        return sorted(matches)
 
     @staticmethod
     def _fallback_essence(title: str, text: str) -> str:

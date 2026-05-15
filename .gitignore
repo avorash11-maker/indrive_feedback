@@ -1,9 +1,26 @@
-# Скрываем файл с секретными ключами
+# Секреты и локальные переменные окружения
 .env
 
-# Скрываем системные папки Python
+# Виртуальные окружения Python
+.venv/
+venv/
+
+# Служебные файлы Python
 __pycache__/
 *.pyc
+.pytest_cache/
+pytest-cache-files-*/
+.coverage
+.mypy_cache/
 
-# Скрываем папку с результатами (если не хочешь делиться логами/отчетами)
+# Результаты запусков и отчеты
 output/
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Editor-local settings
+.vscode/

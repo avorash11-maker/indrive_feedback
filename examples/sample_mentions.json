@@ -1,0 +1,92 @@
+[
+  {
+    "title": "Staying safe on the road with inDrive: Tools every driver and rider should know about",
+    "url": "https://example.com/article1",
+    "source": "Example News",
+    "published_at": "2024-05-01T09:25:02Z",
+    "snippet": "Staying safe on the road with inDrive: Tools every driver and rider should know about",
+    "collected_at": "2024-05-06T10:50:53.420085+00:00",
+    "query": "indrive",
+    "provider": "google_news_rss",
+    "analysis": {
+      "sentiment": "neutral",
+      "main_topic": "Прямое упоминание сервиса inDrive",
+      "category_ru": "Водители",
+      "relevance_score": 9,
+      "is_business_critical": true,
+      "summary": "Статья сообщает: Staying safe on the road with inDrive: Tools every driver and rider should know about.",
+      "pm_insight": "PM стоит проверить влияние на привлечение, удержание, доход и удовлетворенность водителей.",
+      "article_essence_ru": "Статья сообщает: Staying safe on the road with inDrive: Tools every driver and rider should know about.",
+      "mention_context_ru": "inDrive упоминается в контексте опыта, доходов, условий или поведения водителей.",
+      "pm_importance_ru": "PM стоит проверить влияние на привлечение, удержание, доход и удовлетворенность водителей.",
+      "matched_terms": {
+        "company": ["indrive"],
+        "service": ["driver"],
+        "competitors": [],
+        "regulation": [],
+        "noise": []
+      },
+      "mentions_indrive": true
+    }
+  },
+  {
+    "title": "Two men jailed for stealing phone from InDrive driver",
+    "url": "https://example.com/article2",
+    "source": "Example Herald",
+    "published_at": "2024-04-23T11:35:33Z",
+    "snippet": "Two men jailed for stealing phone from InDrive driver",
+    "collected_at": "2024-05-06T10:50:53.414426+00:00",
+    "query": "indrive",
+    "provider": "google_news_rss",
+    "analysis": {
+      "sentiment": "negative",
+      "main_topic": "Криминальные инциденты с водителями inDrive",
+      "category_ru": "Безопасность",
+      "relevance_score": 8,
+      "is_business_critical": true,
+      "summary": "Два человека осуждены за кражу телефона у водителя inDrive.",
+      "pm_insight": "PM стоит проверить влияние на безопасность водителей и репутацию сервиса.",
+      "article_essence_ru": "Два человека осуждены за кражу телефона у водителя inDrive.",
+      "mention_context_ru": "inDrive упоминается в контексте безопасности водителей.",
+      "pm_importance_ru": "PM стоит проверить влияние на безопасность водителей и репутацию сервиса.",
+      "matched_terms": {
+        "company": ["indrive"],
+        "service": ["driver"],
+        "competitors": [],
+        "regulation": [],
+        "noise": []
+      },
+      "mentions_indrive": true
+    }
+  },
+  {
+    "title": "Market analysis: Ride-sharing trends in 2024",
+    "url": "https://example.com/article3",
+    "source": "Business Journal",
+    "published_at": "2024-03-15T14:20:00Z",
+    "snippet": "Market analysis: Ride-sharing trends in 2024 including inDrive growth",
+    "collected_at": "2024-05-06T10:50:53.410000+00:00",
+    "query": "indrive",
+    "provider": "newsapi",
+    "analysis": {
+      "sentiment": "positive",
+      "main_topic": "Рыночный контекст с упоминанием inDrive",
+      "category_ru": "Рынок",
+      "relevance_score": 6,
+      "is_business_critical": false,
+      "summary": "Анализ рынка ride-sharing, включая рост inDrive.",
+      "pm_insight": "PM может использовать для понимания рыночных трендов.",
+      "article_essence_ru": "Анализ рынка ride-sharing, включая рост inDrive.",
+      "mention_context_ru": "inDrive упоминается в контексте рыночных трендов.",
+      "pm_importance_ru": "PM может использовать для понимания рыночных трендов.",
+      "matched_terms": {
+        "company": ["indrive"],
+        "service": [],
+        "competitors": [],
+        "regulation": [],
+        "noise": []
+      },
+      "mentions_indrive": true
+    }
+  }
+]

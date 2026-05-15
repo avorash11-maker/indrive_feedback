@@ -2,25 +2,54 @@ import csv
 import json
 import logging
 import os
-import re
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
-from xml.etree import ElementTree
 from urllib.parse import quote_plus, urlparse
+from xml.etree import ElementTree
 
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from requests import HTTPError
 
-from analyzer import MentionAnalyzer
+from .analyzer import MentionAnalyzer
+from .title_matching import (
+    canonical_title_tokens,
+    is_semantic_title_duplicate,
+    is_title_contained_duplicate,
+    normalize_title,
+)
 
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+class ProviderError(Exception):
+    pass
+
+
+def _log_provider_failure(provider: str, query: str, exc: Exception) -> None:
+    status_code = None
+    reason = str(exc)
+    if isinstance(exc, HTTPError) and exc.response is not None:
+        status_code = exc.response.status_code
+        reason = exc.response.text[:300] or exc.response.reason
+
+    logger.warning(
+        "News provider failed; provider=%s query=%r status=%s error=%s detail=%s",
+        provider,
+        query,
+        status_code or "n/a",
+        exc.__class__.__name__,
+        reason,
+    )
 
 
 DEFAULT_QUERIES = [
@@ -69,6 +98,7 @@ class InDriveMentionScraper:
             }
         )
         self.analyzer = MentionAnalyzer(use_llm=use_llm)
+        self.provider_stats: Dict[str, Dict[str, object]] = {}
 
     def run(self, queries: Optional[List[str]] = None) -> List[Dict]:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -77,12 +107,15 @@ class InDriveMentionScraper:
         raw_articles: List[Dict] = []
         gdelt_seen = set()
         for query in queries:
-            raw_articles.extend(self.search_newsapi(query))
+            raw_articles.extend(self._safe_provider_fetch("newsapi", self.search_newsapi, query))
+            time.sleep(1)  # Rate limit: delay between API calls
             gdelt_query = "indriver" if "indriver" in query.casefold() else "indrive"
             if gdelt_query not in gdelt_seen:
-                raw_articles.extend(self.search_gdelt(query))
+                raw_articles.extend(self._safe_provider_fetch("gdelt", self.search_gdelt, query))
                 gdelt_seen.add(gdelt_query)
-            raw_articles.extend(self.search_google_news(query))
+                time.sleep(1)  # Rate limit: delay between API calls
+            raw_articles.extend(self._safe_provider_fetch("google_news_rss", self.search_google_news, query))
+            time.sleep(1)  # Rate limit: delay between API calls
 
         logger.info("Collected %s raw articles before deduplication", len(raw_articles))
         raw_articles = self._deduplicate(raw_articles)
@@ -91,7 +124,7 @@ class InDriveMentionScraper:
         mentions = []
         audit_items = []
         for article in raw_articles:
-            prefilter_analysis = self.analyzer._heuristic_analysis(
+            prefilter_analysis = self.analyzer.heuristic_analysis(
                 article.get("title", ""),
                 article.get("snippet", ""),
                 article.get("url", ""),
@@ -120,10 +153,47 @@ class InDriveMentionScraper:
         )
 
         result = [asdict(item) for item in mentions]
-        self.export(result, audit_items)
+        self.export(result, audit_items, self._build_run_summary(queries, result, audit_items))
         logger.info("Saved %s relevant mentions", len(result))
         return result
 
+    def _safe_provider_fetch(self, provider_name: str, provider_call, query: str) -> List[Dict]:
+        stats = self.provider_stats.setdefault(
+            provider_name,
+            {"attempts": 0, "successes": 0, "failures": 0, "articles": 0, "last_error": ""},
+        )
+        stats["attempts"] = int(stats["attempts"]) + 1
+        try:
+            articles = provider_call(query)
+            stats["successes"] = int(stats["successes"]) + 1
+            stats["articles"] = int(stats["articles"]) + len(articles)
+            return articles
+        except ProviderError as exc:
+            stats["failures"] = int(stats["failures"]) + 1
+            stats["last_error"] = str(exc)
+            return []
+
+    def _build_run_summary(
+        self,
+        queries: List[str],
+        mentions: List[Dict],
+        audit_items: List[Dict],
+    ) -> Dict[str, object]:
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "days": self.days,
+            "min_score": self.min_score,
+            "queries": queries,
+            "audited_articles": len(audit_items),
+            "relevant_mentions": len(mentions),
+            "provider_stats": self.provider_stats,
+        }
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(requests.RequestException)
+    )
     def search_newsapi(self, query: str) -> List[Dict]:
         if not self.news_api_key:
             return []
@@ -154,9 +224,14 @@ class InDriveMentionScraper:
                 if item.get("url")
             ]
         except Exception as exc:
-            logger.warning("NewsAPI failed for query %r: %s", query, exc.__class__.__name__)
-            return []
+            _log_provider_failure("newsapi", query, exc)
+            raise ProviderError(f"Failed to fetch from newsapi for query '{query}'") from exc
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(requests.RequestException)
+    )
     def search_gdelt(self, query: str) -> List[Dict]:
         url = "https://api.gdeltproject.org/api/v2/doc/doc"
         gdelt_query = "indriver" if "indriver" in query.casefold() else "indrive"
@@ -186,9 +261,14 @@ class InDriveMentionScraper:
                 if item.get("url")
             ]
         except Exception as exc:
-            logger.warning("GDELT failed for query %r: %s", gdelt_query, exc.__class__.__name__)
-            return []
+            _log_provider_failure("gdelt", gdelt_query, exc)
+            raise ProviderError(f"Failed to fetch from gdelt for query '{query}'") from exc
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(requests.RequestException)
+    )
     def search_google_news(self, query: str) -> List[Dict]:
         rss_url = (
             "https://news.google.com/rss/search?q="
@@ -217,18 +297,28 @@ class InDriveMentionScraper:
                 )
             return [item for item in articles if item["url"]]
         except Exception as exc:
-            logger.warning("Google News RSS failed for query %r: %s", query, exc.__class__.__name__)
-            return []
+            _log_provider_failure("google_news_rss", query, exc)
+            raise ProviderError(f"Failed to fetch from google_news_rss for query '{query}'") from exc
 
-    def export(self, mentions: List[Dict], audit_items: Optional[List[Dict]] = None) -> None:
+    def export(
+        self,
+        mentions: List[Dict],
+        audit_items: Optional[List[Dict]] = None,
+        run_summary: Optional[Dict[str, object]] = None,
+    ) -> None:
         json_path = self.output_dir / "indrive_mentions.json"
         audit_path = self.output_dir / "indrive_mentions_audit.json"
         csv_path = self.output_dir / "indrive_mentions.csv"
         md_path = self.output_dir / "indrive_pm_report.md"
+        summary_path = self.output_dir / "indrive_run_summary.json"
 
         json_path.write_text(json.dumps(mentions, ensure_ascii=False, indent=2), encoding="utf-8")
         audit_path.write_text(
             json.dumps(audit_items or mentions, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        summary_path.write_text(
+            json.dumps(run_summary or {}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
@@ -278,9 +368,10 @@ class InDriveMentionScraper:
                     }
                 )
 
-        md_path.write_text(self._markdown_report(mentions), encoding="utf-8")
+        md_path.write_text(self._markdown_report(mentions, run_summary or {}), encoding="utf-8")
 
-    def _markdown_report(self, mentions: List[Dict]) -> str:
+    def _markdown_report(self, mentions: List[Dict], run_summary: Optional[Dict[str, object]] = None) -> str:
+        provider_stats = ((run_summary or {}).get("provider_stats") or {})
         lines = [
             "# inDrive media mentions report",
             "",
@@ -288,9 +379,26 @@ class InDriveMentionScraper:
             f"Relevant mentions: {len(mentions)}",
             f"Minimum relevance score: {self.min_score}",
             "",
-            "## Product manager view",
+            "## Pipeline health",
             "",
         ]
+        if provider_stats:
+            for provider_name, stats in provider_stats.items():
+                line = (
+                    f"- {provider_name}: attempts={stats.get('attempts', 0)}, "
+                    f"successes={stats.get('successes', 0)}, "
+                    f"failures={stats.get('failures', 0)}, "
+                    f"articles={stats.get('articles', 0)}"
+                )
+                if stats.get("last_error"):
+                    line += f", last_error={stats.get('last_error')}"
+                lines.append(line)
+            lines.append("")
+
+        lines.extend([
+            "## Product manager view",
+            "",
+        ])
         if not mentions:
             lines.append("No relevant mentions found for the selected window.")
             return "\n".join(lines) + "\n"
@@ -344,13 +452,14 @@ class InDriveMentionScraper:
         unique = []
         for article in articles:
             url_key = (article.get("url") or "").strip().casefold()
-            title_key = InDriveMentionScraper._normalize_title(article.get("title", ""))
+            title_key = normalize_title(article.get("title", ""))
 
             if url_key and url_key in seen_urls:
                 continue
             if title_key and any(
                 title_key == existing
-                or InDriveMentionScraper._is_title_contained_duplicate(title_key, existing)
+                or is_title_contained_duplicate(title_key, existing)
+                or is_semantic_title_duplicate(title_key, existing)
                 or SequenceMatcher(None, title_key, existing).ratio() >= 0.72
                 for existing in seen_titles
             ):
@@ -365,26 +474,19 @@ class InDriveMentionScraper:
 
     @staticmethod
     def _normalize_title(title: str) -> str:
-        value = str(title or "").casefold()
-        value = value.replace("’", "'").replace("`", "'")
-        value = re.sub(r"\bwef\b", "world economic forum", value)
-        value = re.sub(r"\s*\|\s*[^|]{2,80}$", "", value)
-        value = re.sub(r"\s+-\s+[^-]{2,80}$", "", value)
-        value = re.sub(r"\s*-\s*", "-", value)
-        value = re.sub(r"\b(\d+)\s*\.\s*(\d+)x\b", r"\1.\2x", value)
-        value = re.sub(r"[^a-z0-9#%.]+", " ", value)
-        value = re.sub(r"\s+", " ", value).strip()
-        return value
+        return normalize_title(title)
 
     @staticmethod
     def _is_title_contained_duplicate(left: str, right: str) -> bool:
-        left_tokens = left.split()
-        right_tokens = right.split()
-        if min(len(left_tokens), len(right_tokens)) < 5:
-            return False
-        shorter = " ".join(left_tokens if len(left_tokens) <= len(right_tokens) else right_tokens)
-        longer = " ".join(right_tokens if len(left_tokens) <= len(right_tokens) else left_tokens)
-        return shorter in longer
+        return is_title_contained_duplicate(left, right)
+
+    @staticmethod
+    def _is_semantic_title_duplicate(left: str, right: str) -> bool:
+        return is_semantic_title_duplicate(left, right)
+
+    @staticmethod
+    def _canonical_title_tokens(title: str) -> set[str]:
+        return canonical_title_tokens(title)
 
     @staticmethod
     def _clean(value: Optional[str]) -> str:
