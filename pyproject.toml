@@ -39,13 +39,17 @@ dev = [
 
 [project.scripts]
 indrive-media = "indrive_media.main:main"
+competitor-tracker = "competitor_tracker.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["indrive_media*"]
+include = ["indrive_media*", "competitor_tracker*"]
+
+[tool.setuptools.package-data]
+competitor_tracker = ["default_config.json"]
 
 [tool.pytest.ini_options]
 minversion = "6.0"

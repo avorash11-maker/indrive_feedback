@@ -1,0 +1,361 @@
+"""Command-line entrypoint for the new competitor tracker."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from datetime import datetime, timezone
+from typing import Optional, Sequence
+
+from .analyzer import CompetitorAlertAnalyzer, CompetitorAnalyzer
+from .config import TrackerConfig, TrackerRuntimeConfig
+from .digest import DigestBuilder
+from .models import RunSummary
+from .normalization import deduplicate_raw_articles
+from .notion_sync import CompetitorNotionMirrorSync
+from .providers import Provider, ProviderError, ProviderRequest, build_providers
+from .storage import JsonFileStorage, SQLiteTrackerStorage
+from .telegram_sender import TelegramSender
+
+COMMAND_NAMES = {"run", "dry-run", "send-digest", "sync-notion", "backfill"}
+
+
+def add_common_args(parser: argparse.ArgumentParser) -> None:
+    """Attach shared tracker options to a subcommand parser."""
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="Lookback window for competitor signals.",
+    )
+    parser.add_argument(
+        "--min-score",
+        type=int,
+        default=5,
+        help="Minimum score required to keep a mention in the digest.",
+    )
+    parser.add_argument(
+        "--competitor",
+        action="append",
+        dest="competitors",
+        help="Competitor to track. Can be passed multiple times.",
+    )
+    parser.add_argument(
+        "--region",
+        action="append",
+        dest="regions",
+        help="Region key from config. Can be passed multiple times.",
+    )
+    parser.add_argument(
+        "--export-csv",
+        action="store_true",
+        help="Save CSV artifacts for manual QA alongside JSON/Markdown outputs.",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Create parser for the new tracker namespace without affecting legacy CLI."""
+    parser = argparse.ArgumentParser(
+        description="CLI for the new competitor tracker."
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Run the competitor tracker pipeline locally.",
+    )
+    add_common_args(run_parser)
+    run_parser.add_argument(
+        "--to-telegram",
+        action="store_true",
+        help="Send the ranked digest to Telegram.",
+    )
+    run_parser.add_argument(
+        "--telegram-dry-run",
+        action="store_true",
+        help="Render and log Telegram delivery without sending any API request.",
+    )
+    run_parser.add_argument(
+        "--to-notion",
+        action="store_true",
+        help="Mirror final competitor alerts to Notion when env is configured.",
+    )
+    run_parser.add_argument(
+        "--notion-dry-run",
+        action="store_true",
+        help="Plan Notion mirror actions without writing anything.",
+    )
+
+    dry_run_parser = subparsers.add_parser(
+        "dry-run",
+        help="Run the pipeline and preview Telegram/Notion delivery in dry mode.",
+    )
+    add_common_args(dry_run_parser)
+
+    send_digest_parser = subparsers.add_parser(
+        "send-digest",
+        help="Run the pipeline and deliver the digest to Telegram.",
+    )
+    add_common_args(send_digest_parser)
+    send_digest_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="delivery_dry_run",
+        help="Log Telegram delivery without calling the API.",
+    )
+
+    sync_notion_parser = subparsers.add_parser(
+        "sync-notion",
+        help="Run the pipeline and mirror final alerts to Notion.",
+    )
+    add_common_args(sync_notion_parser)
+    sync_notion_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="delivery_dry_run",
+        help="Preview Notion sync actions without writing any pages.",
+    )
+
+    backfill_parser = subparsers.add_parser(
+        "backfill",
+        help="Run historical collection without external delivery.",
+    )
+    add_common_args(backfill_parser)
+
+    return parser
+
+
+def collect_raw_articles(
+    *,
+    config: TrackerConfig,
+    runtime: TrackerRuntimeConfig,
+    regions: Sequence[str],
+    competitors: Sequence[str],
+    days: Optional[int] = None,
+    providers: Optional[Sequence[Provider]] = None,
+) -> tuple[list, tuple[str, ...], dict[str, str]]:
+    """Generate queries, fetch raw articles, deduplicate, and store in SQLite."""
+    query_days = days if days is not None else runtime.lookback_days
+    queries = config.queries_for_regions(regions)
+    request = ProviderRequest(
+        competitors=tuple(competitors),
+        days=query_days,
+        queries=queries,
+        regions=tuple(regions),
+    )
+    active_providers = list(providers) if providers is not None else build_providers(
+        config.enabled_providers
+    )
+
+    raw_articles = []
+    provider_errors: dict[str, str] = {}
+    for provider in active_providers:
+        try:
+            raw_articles.extend(provider.fetch(request))
+        except ProviderError as exc:
+            provider_errors[provider.name] = str(exc)
+
+    raw_articles = deduplicate_raw_articles(raw_articles)
+    sqlite_storage = SQLiteTrackerStorage(runtime.database_path)
+    sqlite_storage.insert_raw_articles(raw_articles)
+    return raw_articles, tuple(provider.name for provider in active_providers), provider_errors
+
+
+def resolve_targets(
+    config: TrackerConfig,
+    requested_regions: Optional[Sequence[str]],
+    requested_competitors: Optional[Sequence[str]],
+) -> tuple[list[str], list[str]]:
+    """Resolve regions and competitor names from config plus CLI filters."""
+    selected_regions = list(requested_regions or config.regions.keys())
+    unknown_regions = sorted(set(selected_regions) - set(config.regions))
+    if unknown_regions:
+        missing_list = ", ".join(unknown_regions)
+        raise ValueError(f"Unknown regions: {missing_list}")
+
+    if requested_competitors:
+        return selected_regions, list(requested_competitors)
+
+    competitors: list[str] = []
+    seen = set()
+    for region in selected_regions:
+        for competitor in config.competitors_by_region[region]:
+            if competitor in seen:
+                continue
+            seen.add(competitor)
+            competitors.append(competitor)
+    return selected_regions, competitors
+
+
+def run_pipeline(
+    *,
+    days: int,
+    min_score: int,
+    competitors: Optional[Sequence[str]] = None,
+    regions: Optional[Sequence[str]] = None,
+    telegram_mode: Optional[str] = None,
+    notion_mode: Optional[str] = None,
+    export_csv: bool = False,
+) -> dict[str, object]:
+    """Execute the competitor tracker pipeline for one CLI command."""
+    runtime = TrackerRuntimeConfig.from_env()
+    config = TrackerConfig.load(runtime.config_path)
+    selected_regions, selected_competitors = resolve_targets(config, regions, competitors)
+    sqlite_storage = SQLiteTrackerStorage(runtime.database_path)
+
+    raw_articles, provider_names, provider_errors = collect_raw_articles(
+        config=config,
+        runtime=runtime,
+        regions=selected_regions,
+        competitors=selected_competitors,
+        days=days,
+    )
+
+    analyzer = CompetitorAnalyzer(min_score=min_score, config=config)
+    analysis = analyzer.prefilter_raw_articles(raw_articles, regions=selected_regions)
+    digest = DigestBuilder().build(
+        competitors=selected_competitors,
+        candidates=analysis.candidates,
+        regions=selected_regions,
+        digest_limit=config.daily_digest_limit,
+        storage=sqlite_storage,
+    )
+    sqlite_storage.insert_alerts(digest.alerts)
+
+    alert_analyzer = CompetitorAlertAnalyzer(use_llm=False)
+    alert_schemas = [
+        alert_analyzer.analyze_candidate(alert.candidate) for alert in digest.alerts
+    ]
+
+    storage = JsonFileStorage(runtime.output_dir)
+    candidates_path = storage.save_candidates(analysis.candidates)
+    digest_path = storage.save_digest(digest)
+    preview_path = storage.save_markdown_preview(
+        digest.alerts,
+        alert_schemas,
+        generated_at=digest.generated_at,
+    )
+    candidates_csv_path = storage.save_candidates_csv(analysis.candidates) if export_csv else None
+    run_summary = RunSummary(
+        started_at=datetime.now(timezone.utc).isoformat(),
+        finished_at=datetime.now(timezone.utc).isoformat(),
+        regions=tuple(selected_regions),
+        providers=provider_names,
+        queries_generated=len(config.queries_for_regions(selected_regions)),
+        raw_articles_collected=len(raw_articles),
+        candidates_kept=len(analysis.candidates),
+        alerts_created=len(digest.alerts),
+        daily_digest_limit=config.daily_digest_limit,
+        provider_errors=provider_errors,
+    )
+    summary_path = storage.save_run_summary(run_summary)
+
+    telegram_result = None
+    notion_result = None
+    if telegram_mode in {"dry", "send"}:
+        sender = TelegramSender(
+            storage=sqlite_storage,
+            dry_run=telegram_mode == "dry",
+        )
+        telegram_result = sender.send_daily_digest(
+            alert_schemas,
+            alerts=digest.alerts,
+            source_urls=[alert.candidate.url for alert in digest.alerts],
+            generated_at=digest.generated_at,
+        )
+
+    if notion_mode in {"dry", "sync"}:
+        notion_sync = CompetitorNotionMirrorSync()
+        notion_result = notion_sync.sync_alerts(
+            list(zip(digest.alerts, alert_schemas)),
+            dry_run=notion_mode == "dry",
+        )
+
+    return {
+        "analysis": analysis,
+        "digest": digest,
+        "query_count": len(config.queries_for_regions(selected_regions)),
+        "candidates_path": candidates_path,
+        "digest_path": digest_path,
+        "preview_path": preview_path,
+        "candidates_csv_path": candidates_csv_path,
+        "summary_path": summary_path,
+        "runtime": runtime,
+        "raw_articles_count": len(raw_articles),
+        "telegram_result": telegram_result,
+        "notion_result": notion_result,
+    }
+
+
+def summarize_result(result: dict[str, object]) -> str:
+    """Render a compact CLI summary after one command finishes."""
+    analysis = result["analysis"]
+    runtime = result["runtime"]
+    telegram_result = result["telegram_result"]
+    notion_result = result["notion_result"]
+    summary = (
+        "Competitor tracker completed. "
+        f"kept={len(analysis.candidates)} dropped={analysis.dropped_count} "
+        f"queries={result['query_count']} candidates={result['candidates_path']} "
+        f"raw_articles={result['raw_articles_count']} sqlite={runtime.database_path} "
+        f"digest={result['digest_path']} preview={result['preview_path']} "
+        f"summary={result['summary_path']}"
+    )
+    if result["candidates_csv_path"] is not None:
+        summary += f" csv={result['candidates_csv_path']}"
+    if telegram_result is not None:
+        summary += f" telegram={telegram_result}"
+    if notion_result is not None:
+        summary += f" notion={notion_result}"
+    return summary
+
+
+def normalize_argv(argv: Optional[Sequence[str]]) -> list[str]:
+    """Keep backward compatibility by treating bare flags as `run`."""
+    normalized = list(argv) if argv is not None else sys.argv[1:]
+    if not normalized:
+        return ["run"]
+    if normalized[0] in COMMAND_NAMES or normalized[0] in {"-h", "--help"}:
+        return normalized
+    return ["run", *normalized]
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    """Run the competitor tracker CLI without touching the legacy CLI."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    args = build_parser().parse_args(normalize_argv(argv))
+    command = args.command or "run"
+
+    telegram_mode = None
+    notion_mode = None
+    if command == "run":
+        if args.to_telegram or args.telegram_dry_run:
+            telegram_mode = "dry" if args.telegram_dry_run else "send"
+        if args.to_notion or args.notion_dry_run:
+            notion_mode = "dry" if args.notion_dry_run else "sync"
+    elif command == "dry-run":
+        telegram_mode = "dry"
+        notion_mode = "dry"
+    elif command == "send-digest":
+        telegram_mode = "dry" if args.delivery_dry_run else "send"
+    elif command == "sync-notion":
+        notion_mode = "dry" if args.delivery_dry_run else "sync"
+    elif command == "backfill":
+        telegram_mode = None
+        notion_mode = None
+
+    result = run_pipeline(
+        days=args.days,
+        min_score=args.min_score,
+        competitors=args.competitors,
+        regions=args.regions,
+        telegram_mode=telegram_mode,
+        notion_mode=notion_mode,
+        export_csv=args.export_csv,
+    )
+    print(summarize_result(result))
+
+
+if __name__ == "__main__":
+    main()

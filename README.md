@@ -1,146 +1,95 @@
-# inDrive Media Intelligence Pipeline
+# inDrive Media Intelligence
 
-A robust AI-powered media monitoring system for tracking inDrive mentions across global news sources. This project demonstrates advanced integration of heuristic filtering, LLM analysis, and automated data pipelines to solve real-world business intelligence challenges in the ride-hailing and delivery industry.
+AI-assisted pipeline for media monitoring: collects news about inDrive, removes duplicates, scores relevance, enriches high-signal mentions, and exports results into analyst-friendly reports and Notion.
 
-## Business Problem
+## Product Branches
 
-In the competitive ride-hailing and delivery market, companies like inDrive need to:
-- **Monitor global media coverage** for regulatory changes, competitor actions, and market sentiment
-- **Identify critical business signals** such as new permits, safety incidents, or pricing discussions
-- **Scale analysis beyond manual review** of thousands of daily news articles
-- **Maintain data quality** while handling noisy, duplicate-rich news feeds
+- `legacy pipeline`: текущий production-like поток для `indrive_media`, который собирает упоминания про inDrive и остаётся источником правды в этом репозитории.
+- `new competitor tracker`: новая продуктовая ветка, которая начинается рядом с legacy-контуром, но не должна менять текущее поведение `indrive_media` до отдельного рефакторинга и явного переключения.
 
-Traditional approaches fail because news APIs return high volumes of irrelevant content, and manual filtering doesn't scale. This project solves these challenges with an automated, AI-enhanced pipeline that delivers actionable insights to product managers and executives.
+## Зачем этот проект
 
-## Solution Overview
+Командам продукта и operations недостаточно просто “собирать новости”. Нужен поток сигналов, который:
 
-This system automates media intelligence by:
-- Aggregating news from multiple sources (NewsAPI, GDELT, Google News RSS)
-- Removing duplicates using semantic title matching
-- Applying two-tier analysis: fast heuristic prefiltering + optional LLM deep analysis
-- Scoring relevance on a 0-10 scale with detailed categorization
-- Exporting structured reports and integrating with Notion for team collaboration
+- находит упоминания inDrive в разных источниках;
+- отсекает шум и дубли;
+- выделяет действительно важные сигналы по рынку, безопасности, регулированию и конкурентам;
+- превращает сырые статьи в артефакты, с которыми уже можно работать дальше.
 
-## Architecture & Pipeline
+Этот проект показывает, как такую задачу можно автоматизировать с помощью Python, эвристик, LLM-анализа и интеграции с Notion.
 
-```
-News Sources → Deduplication → Heuristic Prefilter → LLM Analysis → Scoring → Export
-     ↓              ↓              ↓              ↓              ↓              ↓
-  Raw Articles   Title Matching   Keyword Rules   GPT-4o-mini   0-10 Scale   JSON/CSV/MD/Notion
-```
+## Что делает pipeline
 
-### Key Components
+1. Собирает новости из `NewsAPI`, `GDELT` и `Google News RSS`.
+2. Нормализует статьи и удаляет дубли по URL и похожим заголовкам.
+3. Применяет быстрый эвристический prefilter.
+4. При наличии `OPENAI_API_KEY` добавляет LLM-анализ для high-signal материалов.
+5. Сохраняет результаты в `JSON`, `CSV`, `Markdown`.
+6. По флагу экспортирует итоговые записи в Notion.
 
-1. **Data Collection** (`scraper.py`): Multi-source news aggregation with retry/backoff and rate limiting
-2. **Deduplication** (`title_matching.py`): Semantic title matching using canonical tokens and stopwords
-3. **Analysis Engine** (`analyzer.py`): Two-tier scoring system
-4. **Integration** (`notion_integration.py`): Automated export with schema management
-5. **Orchestration** (`src/indrive_media/main.py`): CLI-driven pipeline execution
+## Архитектура
 
-### AI Integration: Heuristic vs LLM Boundary
-
-The system uses a **hybrid approach** to balance speed, cost, and accuracy:
-
-- **Heuristic Layer** (Always Active): Fast keyword-based scoring (0-10) using regex patterns and term matching. Identifies obvious signals like "permit", "regulation", "safety" while filtering noise. Processes ~1000 articles/second.
-- **LLM Layer** (Optional): Deep semantic analysis using GPT-4o-mini for nuanced understanding. Provides detailed categorization (topic, category, context, importance) and handles edge cases. Processes ~10 articles/second with API costs.
-
-**Trade-offs**:
-- Heuristic-only: Free, fast, but misses subtle signals (e.g., "cashless payment adoption" vs explicit "pricing strategy")
-- LLM-enhanced: Higher accuracy (~85% vs 65%), but slower and costs ~$0.01/article
-- Production recommendation: Use LLM for critical monitoring, heuristic for broad surveillance
-
-## Sample Output
-
-### Structured JSON Export
-```json
-{
-  "title": "inDrive Secures Operating Permit in São Paulo",
-  "url": "https://example.com/news",
-  "published_at": "2024-01-15",
-  "source": "Reuters",
-  "analysis": {
-    "relevance_score": 9,
-    "topic": "Regulatory Expansion",
-    "category": "Business Development",
-    "context": "inDrive obtained authorization to operate ride-hailing services in Brazil's largest city",
-    "pm_importance": "High priority: New market entry requires pricing and safety feature adjustments"
-  }
-}
+```text
+News Sources -> Deduplication -> Heuristic Prefilter -> LLM Analysis -> Scoring -> Export
 ```
 
-### PM Report (Markdown)
-```markdown
-# inDrive Media Intelligence Report
-Generated: 2024-01-15 | Period: 30 days | Min Score: 6
+Ключевые модули:
 
-## High Priority (Score 8-10)
-- **Regulatory**: 3 mentions - New permits in Brazil, Mexico
-- **Safety**: 2 mentions - Incident investigations
-- **Competition**: 1 mention - Pricing comparison with Uber
+- `src/indrive_media/scraper.py` — сбор данных из внешних источников
+- `src/indrive_media/title_matching.py` — логика дедупликации
+- `src/indrive_media/analyzer.py` — эвристический и LLM-анализ
+- `src/indrive_media/notion_integration.py` — экспорт в Notion
+- `src/indrive_media/main.py` — orchestration и CLI
 
-## Medium Priority (Score 6-7)
-- **Market Expansion**: 5 mentions - Delivery service growth
-```
+Подробная схема: [docs/architecture.md](/C:/Users/shar0/Desktop/indrive_feedback/docs/architecture.md)
 
-## Limitations & Failure Modes
+Важно: пока CLI `python main.py` и `indrive-media` относятся только к legacy pipeline. Конкурентный трекер здесь пока обозначен как отдельное направление развития, а не как замена текущего контура.
 
-### Technical Limitations
-- **API Dependencies**: Relies on external news APIs with potential rate limits and outages
-- **Geographic Bias**: English-language sources may miss local coverage
-- **Temporal Lag**: News APIs have 1-24 hour delays
-- **Cost Scaling**: LLM analysis costs scale linearly with article volume
+## Почему это хороший AI automation case
 
-### Failure Modes
-- **False Positives**: Over-scoring irrelevant articles (mitigated by score thresholds)
-- **False Negatives**: Missing critical signals in noisy data (LLM reduces this)
-- **Duplicate Handling**: Semantic matching may incorrectly merge related but distinct stories
-- **API Failures**: Pipeline fails fast on network issues (configurable retry)
-- **Data Quality**: Noisy sources can introduce bias (multi-source validation helps)
+Этот репозиторий показывает не только “вызов модели”, а полный рабочий контур:
 
-### Known Edge Cases
-- Ambiguous company mentions (e.g., "drive" in non-transport context)
-- International name variations ("inDrive" vs "inDriver")
-- Satirical or opinion pieces scoring high on keywords
+- интеграцию с внешними источниками данных;
+- дешёвый rule-based prefilter перед LLM;
+- понятную границу между heuristic и LLM слоями;
+- safe workflow для Notion через `dry-run`;
+- тестируемость и воспроизводимый CLI-процесс.
 
 ## Quick Start
 
-Set up a clean local environment:
+Создай чистое окружение и установи зависимости:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements-dev.txt
+```
+
+Проверь, что тесты проходят:
+
+```powershell
 .\.venv\Scripts\python -m pytest
+```
+
+Запусти pipeline локально:
+
+```powershell
 .\.venv\Scripts\python main.py --days 30 --min-score 6 --no-llm
 ```
 
-This repository uses a `src/` layout. The simplest local workflow is:
-
-- run tests with `python -m pytest`
-- run the pipeline from the repo root with `python main.py ...`
-
-Optional: install the package in editable mode if you want the packaged CLI entrypoint:
+Если хочешь использовать packaged CLI:
 
 ```powershell
 .\.venv\Scripts\python -m pip install -e .
-```
-
-Then the equivalent CLI becomes:
-
-```powershell
 .\.venv\Scripts\indrive-media --days 30 --min-score 6 --no-llm
 ```
 
-For VS Code, use `.venv\Scripts\python.exe` as the project interpreter.
+## Конфигурация
 
-## Configuration
-
-Create a local `.env` based on `.env.example`:
+Создай `.env` из шаблона:
 
 ```powershell
 Copy-Item .env.example .env
 ```
-
-Template:
 
 ```env
 OPENAI_API_KEY=
@@ -151,221 +100,146 @@ NOTION_TOKEN=
 NOTION_DATABASE_ID=
 ```
 
-`OPENAI_API_KEY` and `NEWS_API_KEY` are optional. Without them, you'll get GDELT, Google News RSS, and heuristic scoring.
+Что важно:
 
-`NOTION_TOKEN` and `NOTION_DATABASE_ID` are only needed for Notion export.
+- `OPENAI_API_KEY` опционален; без него проект работает только на эвристиках
+- `NEWS_API_KEY` опционален; без него останутся `GDELT` и `Google News RSS`
+- `NOTION_TOKEN` и `NOTION_DATABASE_ID` нужны только для экспорта в Notion
 
-Important: The real `.env` contains secrets and stays in `.gitignore`.
+## Основные команды
 
-## Usage
-
-Canonical local run from the repository root:
+Базовый запуск:
 
 ```powershell
 .\.venv\Scripts\python main.py --days 30 --min-score 6
 ```
 
-Run without OpenAI:
+Без LLM:
 
 ```powershell
 .\.venv\Scripts\python main.py --days 30 --min-score 6 --no-llm
 ```
 
-Custom search queries:
+С кастомными запросами:
 
 ```powershell
 .\.venv\Scripts\python main.py --query "`"inDrive`" delivery" --query "`"inDrive`" taxi safety"
 ```
 
-Different output directory:
+С другим output directory:
 
 ```powershell
 .\.venv\Scripts\python main.py --days 7 --min-score 8 --output-dir output_week
 ```
 
-If you installed the package in editable mode, replace `python main.py` with `indrive-media`.
-
-Main CLI flags:
+CLI flags:
 
 ```text
---days DAYS              News search window in days. Default: 30.
---min-score MIN_SCORE    Minimum score for final report inclusion. Default: 6.
---no-llm                 Disable OpenAI, use heuristic analysis only.
---query QUERY            Custom search query. Can be passed multiple times.
---output-dir OUTPUT_DIR  Output directory. Default: output.
---to-notion              After collection, export results to Notion.
---notion-ensure-schema   Create missing Notion properties before export.
---notion-dry-run         Plan Notion create/update/skip actions without writing.
+--days DAYS
+--min-score MIN_SCORE
+--no-llm
+--query QUERY
+--output-dir OUTPUT_DIR
+--to-notion
+--notion-ensure-schema
+--notion-dry-run
 ```
 
-### Relevance Heuristic
+## Эвристика релевантности
 
-Эвристический score без OpenAI:
+Базовый score строится по простым сигналам:
 
 ```text
-+7 если найдено прямое упоминание inDrive / inDriver / in-driver
-+2 если найдены сервисные термины: taxi, ride-hailing, driver, passenger, fare, delivery, courier, freight
-+1 если найдены конкуренты: Uber, Bolt, Grab, Gojek, Didi и т.д.
-+1 если найдены регуляторные или риск-термины: regulation, law, ban, license, strike, safety, pricing
--2 если найден шумовой термин и нет прямого упоминания inDrive
++7  прямое упоминание inDrive / inDriver / in-driver
++2  сервисные термины: taxi, ride-hailing, driver, passenger, fare, delivery, courier, freight
++1  конкуренты: Uber, Bolt, Grab, Gojek, Didi и т.д.
++1  регуляторные и риск-термины: regulation, law, ban, license, strike, safety, pricing
+-2  шумовой термин без прямого упоминания inDrive
 ```
 
-Итоговый score ограничивается диапазоном `0..10`.
+Итоговый `relevance_score` ограничен диапазоном `0..10`.
 
 ## Notion Export
 
-В Notion нужна database с колонками:
+Проект умеет создавать и обновлять записи в Notion-базе с полями:
 
-| Колонка | Тип |
-| --- | --- |
-| `Название статьи` | Title |
-| `№` | Number |
-| `Дата` | Date |
-| `Ссылка на статью` | URL |
-| `Контекст` | Rich text |
-| `Почему важно для PM` | Rich text |
+- `Название статьи`
+- `№`
+- `Дата`
+- `Ссылка на статью`
+- `Контекст`
+- `Почему важно для PM`
 
-Настройка Notion:
-
-1. Создайте integration: https://www.notion.so/my-integrations
-2. Скопируйте `Internal Integration Secret` в `.env` как `NOTION_TOKEN`.
-3. Откройте нужную database в Notion и дайте доступ integration через `... -> Connections`.
-4. Скопируйте ID базы из URL и добавьте в `.env` как `NOTION_DATABASE_ID`.
-
-Безопасная проверка перед записью:
+Проверка без записи:
 
 ```powershell
 .\.venv\Scripts\python -m indrive_media.notion_integration --input output/indrive_mentions.json --dry-run
 ```
 
-Экспорт готового файла:
-
-```powershell
-.\.venv\Scripts\python -m indrive_media.notion_integration --input output/indrive_mentions.json
-```
-
-Сбор новостей и dry-run экспорта:
-
-```powershell
-.\.venv\Scripts\indrive-media --days 30 --min-score 6 --to-notion --notion-dry-run
-```
-
-Сбор новостей и реальный экспорт:
+Реальный экспорт:
 
 ```powershell
 .\.venv\Scripts\indrive-media --days 30 --min-score 6 --to-notion
 ```
 
-По умолчанию экспорт не меняет схему Notion database. Если нужно автоматически создать недостающие колонки, используйте явный флаг:
+Экспорт не должен плодить дубли: если URL уже есть в базе, запись обновляется.
 
-```powershell
-.\.venv\Scripts\python -m indrive_media.notion_integration --input output/indrive_mentions.json --ensure-schema
-.\.venv\Scripts\indrive-media --days 30 --min-score 6 --to-notion --notion-ensure-schema
-```
+## Выходные файлы
 
-Экспорт не должен создавать дубли по URL: если запись с таким `Ссылка на статью` уже есть, она обновляется; если URL новый, создается новая запись.
+После запуска проект создаёт артефакты в `output/`:
 
-Флаг `--no-ensure-schema` поддерживается для обратной совместимости и ничего не делает, потому что изменение схемы уже выключено по умолчанию.
+- `output/indrive_mentions.json` — итоговые релевантные материалы
+- `output/indrive_mentions.csv` — плоская таблица для просмотра
+- `output/indrive_pm_report.md` — человекочитаемый отчёт
+- `output/indrive_mentions_audit.json` — аудит всех просмотренных материалов
+- `output/indrive_run_summary.json` — сводка по запуску и health check провайдеров
 
-## Tests
+Пример результата: [examples/sample_mentions.json](/C:/Users/shar0/Desktop/indrive_feedback/examples/sample_mentions.json)
 
-Подготовить чистое локальное окружение:
+## Тесты
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python -m pip install -r requirements-dev.txt
-```
+В проекте есть `pytest`-покрытие для ключевых сценариев:
 
-Запустить тесты:
+- heuristic scoring
+- title deduplication
+- Notion dry-run / create / update behavior
+- pipeline health reporting
+
+Запуск:
 
 ```powershell
 .\.venv\Scripts\python -m pytest
 ```
 
-Тесты покрывают:
+## Ограничения
 
-- эвристическую релевантность `MentionAnalyzer`;
-- дедупликацию заголовков в `scraper.py`;
-- `parse_date()` и fuzzy duplicate logic в `notion_integration.py`;
-- Notion create/update/dry-run поведение без реального API.
+- проект зависит от внешних news APIs и их доступности;
+- англоязычные источники могут пропускать локальный контекст;
+- heuristic layer может давать false positives и false negatives;
+- LLM-анализ точнее, но медленнее и дороже;
+- дедупликация похожих новостей всегда остаётся компромиссом.
 
-## Packaging
-
-The project is packaged with `pyproject.toml`, `setuptools`, and a `src/` layout.
-
-- Local development workflow: `python main.py ...` and `python -m pytest`
-- Packaged CLI workflow: `python -m pip install -e .` and then `indrive-media ...`
-- CI workflow: install with `python -m pip install -e .[dev]` and run `python -m pytest`
-
-This keeps the repository easy to run from a checkout while still supporting a clean packaging story for CI and demos.
-
-## Tech Stack & Development
-
-- **Language**: Python 3.13
-- **Key Libraries**: requests, tenacity, beautifulsoup4, openai, python-dotenv
-- **Architecture**: Modular CLI application with separation of concerns
-- **Testing**: pytest with 22 tests covering analysis, deduplication, Notion integration, and pipeline health reporting
-- **Deployment**: Designed for scheduled execution with local runs or GitHub Actions
-
-This project showcases practical AI automation: external signal collection, heuristic plus LLM analysis, structured exports, and operational visibility for a real workflow.
-
-## Output Files
-
-Основные результаты лежат в папке `output/`.
+## Структура репозитория
 
 ```text
-output/indrive_mentions.json
+.
+|-- src/indrive_media/
+|-- tests/
+|-- docs/
+|-- examples/
+|-- main.py
+|-- pyproject.toml
+|-- requirements.txt
+|-- requirements-dev.txt
 ```
 
-Итоговые релевантные упоминания в JSON. Используется для экспорта в Notion.
+## Что можно улучшить дальше
 
-```text
-output/indrive_mentions.csv
-```
+- добавить screenshot или short demo GIF c результатом в Notion;
+- сократить путь от raw output к “executive summary”;
+- вынести providers и exporters в более расширяемые adapters;
+- добавить scheduled run для полностью автоматического мониторинга.
 
-Таблица для просмотра и ручного анализа.
+## License
 
-```text
-output/indrive_pm_report.md
-```
-
-Человекочитаемый Markdown-отчет: источник, дата, relevance, категория, контекст и PM importance.
-
-```text
-output/indrive_mentions_audit.json
-```
-
-Аудит всех просмотренных материалов, включая отфильтрованные.
-
-```text
-output/indrive_run_summary.json
-```
-
-Сводка по запуску: окно поиска, число релевантных материалов, статистика по провайдерам и последняя ошибка по каждому источнику.
-
-## Monitoring
-
-Во время обычного запуска проект пишет проблемы в консоль через `logging`:
-
-- ошибки news-провайдеров идут как `WARNING: News provider failed ...`;
-- сетевые вызовы OpenAI и Notion видны как `INFO` / traceback при сбое;
-- финальная статистика записи в Notion печатается в конце запуска.
-
-После завершения запуска удобнее всего смотреть:
-
-- `output/indrive_run_summary.json` — быстрый health check по `newsapi`, `gdelt`, `google_news_rss`;
-- `output/indrive_pm_report.md` — человекочитаемый отчет, теперь с секцией `Pipeline health`;
-- `output/indrive_mentions_audit.json` — что именно прошло через фильтрацию и анализ;
-- терминальный лог текущего запуска — полный контекст ошибок и traceback.
-
-## Repository Artifacts
-
-This repository includes additional documentation and examples:
-
-- **[docs/architecture.md](docs/architecture.md)**: Detailed system architecture with Mermaid diagrams and design decisions
-- **[examples/sample_mentions.json](examples/sample_mentions.json)**: Sample dataset showing typical analysis output structure
-- **[LICENSE](LICENSE)**: MIT license for open-source distribution
-- **[pyproject.toml](pyproject.toml)**: Modern Python packaging configuration
-- **[.github/workflows/ci.yml](.github/workflows/ci.yml)**: CI pipeline for automated testing
-
-These artifacts demonstrate engineering maturity, clear documentation practices, and production-ready code organization.
+MIT — см. [LICENSE](/C:/Users/shar0/Desktop/indrive_feedback/LICENSE).

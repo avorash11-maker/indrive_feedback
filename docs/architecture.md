@@ -1,5 +1,12 @@
 # Architecture Overview
 
+## Product Split
+
+- `Legacy pipeline`: текущий `indrive_media` flow в этом репозитории. Он покрывает сбор, дедупликацию, scoring, optional LLM enrichment и экспорт.
+- `New competitor tracker`: новая ветка продукта, которую стоит развивать рядом, не меняя существующее поведение legacy pipeline до отдельного этапа рефакторинга.
+
+На текущем этапе все диаграммы и компоненты ниже описывают именно legacy pipeline и действующий CLI-контур.
+
 ## System Components
 
 ```mermaid

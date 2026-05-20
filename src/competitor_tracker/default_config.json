@@ -1,0 +1,42 @@
+{
+  "regions": {
+    "latam": {
+      "label": "Latin America",
+      "geo_terms": ["Mexico", "Brazil", "Colombia", "Peru", "Chile", "LATAM"],
+      "language_hints": ["es", "pt", "en"]
+    },
+    "mena": {
+      "label": "Middle East and North Africa",
+      "geo_terms": ["Egypt", "Morocco", "Saudi Arabia", "UAE", "MENA"],
+      "language_hints": ["ar", "en", "fr"]
+    },
+    "africa": {
+      "label": "Africa",
+      "geo_terms": ["South Africa", "Kenya", "Nigeria", "Egypt", "Africa"],
+      "language_hints": ["en", "fr", "sw"]
+    },
+    "sea": {
+      "label": "Southeast Asia",
+      "geo_terms": ["Indonesia", "Thailand", "Vietnam", "Philippines", "SEA"],
+      "language_hints": ["en", "id", "th", "vi"]
+    }
+  },
+  "competitors_by_region": {
+    "latam": ["Uber", "DiDi", "Cabify", "Rappi"],
+    "mena": ["Uber", "Careem", "Jeeny", "Bolt"],
+    "africa": ["Uber", "Bolt", "Yango", "Little"],
+    "sea": ["Grab", "Gojek", "Uber", "foodpanda"]
+  },
+  "topic_groups": {
+    "pricing": ["price", "pricing", "fare", "commission", "discount"],
+    "regulation": ["regulation", "permit", "license", "ban", "compliance"],
+    "safety": ["safety", "incident", "security", "background check", "insurance"],
+    "product_launch": ["launch", "rollout", "expansion", "pilot", "partnership"]
+  },
+  "keyword_templates": [
+    "\"{competitor}\" {topic_keywords} {geo_terms}",
+    "\"{competitor}\" {topic_name} {region_label} {language_hints}"
+  ],
+  "daily_digest_limit": 12,
+  "enabled_providers": ["newsapi", "gdelt", "google_news_rss"]
+}
