@@ -1,0 +1,118 @@
+name: Competitor Tracker
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run delivery in dry-run mode"
+        required: false
+        default: true
+        type: boolean
+      days:
+        description: "Lookback window in days"
+        required: false
+        default: "7"
+        type: string
+      regions:
+        description: "Comma-separated region keys, for example sea,latam"
+        required: false
+        default: ""
+        type: string
+      export_csv:
+        description: "Export CSV review artifacts"
+        required: false
+        default: true
+        type: boolean
+      to_telegram:
+        description: "Send digest to Telegram"
+        required: false
+        default: false
+        type: boolean
+      to_notion:
+        description: "Sync final alerts to Notion"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  competitor-tracker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      COMPETITOR_TRACKER_OUTPUT_DIR: output/competitor_tracker
+      COMPETITOR_TRACKER_DB_PATH: output/competitor_tracker/tracker.db
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+      COMPETITOR_TRACKER_NOTION_DATABASE_ID: ${{ secrets.COMPETITOR_TRACKER_NOTION_DATABASE_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+
+      - name: Run competitor tracker
+        shell: bash
+        env:
+          INPUT_DRY_RUN: ${{ github.event_name == 'schedule' && 'true' || inputs.dry_run }}
+          INPUT_DAYS: ${{ github.event_name == 'schedule' && '7' || inputs.days }}
+          INPUT_REGIONS: ${{ github.event_name == 'schedule' && '' || inputs.regions }}
+          INPUT_EXPORT_CSV: ${{ github.event_name == 'schedule' && 'true' || inputs.export_csv }}
+          INPUT_TO_TELEGRAM: ${{ github.event_name == 'schedule' && 'false' || inputs.to_telegram }}
+          INPUT_TO_NOTION: ${{ github.event_name == 'schedule' && 'false' || inputs.to_notion }}
+        run: |
+          set -euo pipefail
+          args=("run" "--days" "${INPUT_DAYS}")
+
+          if [[ "${INPUT_EXPORT_CSV}" == "true" ]]; then
+            args+=("--export-csv")
+          fi
+
+          if [[ -n "${INPUT_REGIONS}" ]]; then
+            IFS=',' read -ra regions <<< "${INPUT_REGIONS}"
+            for region in "${regions[@]}"; do
+              trimmed="$(echo "${region}" | xargs)"
+              if [[ -n "${trimmed}" ]]; then
+                args+=("--region" "${trimmed}")
+              fi
+            done
+          fi
+
+          if [[ "${INPUT_DRY_RUN}" == "true" ]]; then
+            if [[ "${INPUT_TO_TELEGRAM}" == "true" ]]; then
+              args+=("--telegram-dry-run")
+            fi
+            if [[ "${INPUT_TO_NOTION}" == "true" ]]; then
+              args+=("--notion-dry-run")
+            fi
+          else
+            if [[ "${INPUT_TO_TELEGRAM}" == "true" ]]; then
+              args+=("--to-telegram")
+            fi
+            if [[ "${INPUT_TO_NOTION}" == "true" ]]; then
+              args+=("--to-notion")
+            fi
+          fi
+
+          python -m competitor_tracker "${args[@]}"
+
+      - name: Upload competitor tracker artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: competitor-tracker-artifacts
+          path: |
+            output/competitor_tracker/
+          if-no-files-found: warn
