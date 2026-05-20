@@ -46,6 +46,16 @@ class RawArticle:
 
 
 @dataclass(frozen=True, slots=True)
+class ArticleContext:
+    """Expanded article context prepared for post-ranking LLM enrichment."""
+
+    title: str
+    snippet: str
+    source_url: str
+    article_body: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateArticle:
     """Scored article kept for downstream alerting or digesting."""
 

@@ -13,7 +13,7 @@ import openai
 
 from .config import TrackerConfig
 from .formatter import format_alert_card
-from .models import CandidateArticle, RawArticle
+from .models import ArticleContext, CandidateArticle, RawArticle
 
 
 logger = logging.getLogger(__name__)
@@ -246,10 +246,75 @@ class CompetitorAnalyzer:
             reasons.append(f"language_hint:{language_hint}")
 
         priority_terms = {
-            "pricing": ("commission", "discount", "fare"),
-            "regulation": ("ban", "permit", "license", "compliance"),
-            "safety": ("incident", "security", "insurance"),
-            "product_launch": ("launch", "rollout", "expansion", "partnership"),
+            "pricing": ("commission", "discount", "fare", "price", "pricing"),
+            "regulation": ("ban", "permit", "license", "compliance", "regulation", "regulatory approval"),
+            "safety": ("incident", "security", "insurance", "background check", "safety"),
+            "product_launch": ("launch", "rollout", "expansion", "partnership", "pilot"),
+            "market_expansion": (
+                "launch",
+                "launching in",
+                "new city",
+                "entering market",
+                "market entry",
+                "expansion",
+                "license obtained",
+                "regulatory approval",
+            ),
+            "campaign_launches": (
+                "campaign",
+                "partnership",
+                "brand ambassador",
+                "new feature",
+                "strategic partnership",
+                "driver recruitment campaign",
+            ),
+            "pricing_promo": (
+                "discount",
+                "promo code",
+                "price cut",
+                "subscription",
+                "first ride free",
+                "discounted rides",
+                "referral bonus",
+                "loyalty program",
+                "low commission",
+                "bonus for new drivers",
+            ),
+            "industry_context": (
+                "ride-hailing",
+                "e-hailing",
+                "on-demand mobility",
+                "ride-sharing",
+                "taxi app",
+                "vtc",
+                "maas",
+                "mobility as a service",
+            ),
+            "strategic_operations": (
+                "market entry",
+                "launching operations",
+                "license obtained",
+                "regulatory approval",
+                "strategic partnership",
+                "driver recruitment campaign",
+            ),
+            "performance_growth": (
+                "first ride free",
+                "discounted rides",
+                "referral bonus",
+                "loyalty program",
+                "low commission",
+                "bonus for new drivers",
+            ),
+            "product_features_innovation": (
+                "intercity",
+                "delivery",
+                "courier service",
+                "freight",
+                "fixed price",
+                "bidding model",
+                "safety features",
+            ),
         }
         if any(term in text_blob for term in priority_terms.get(topic_group, ())):
             score += 2
@@ -272,6 +337,10 @@ class CompetitorAnalyzer:
 class CompetitorAlertAnalyzer:
     """LLM-powered alert analyzer for competitor tracker candidates."""
 
+    INSUFFICIENT_SOURCE_DATA_MESSAGE = (
+        "Недостаточно данных для анализа, так как сайт источника недоступен"
+    )
+
     def __init__(
         self,
         use_llm: bool = True,
@@ -282,15 +351,28 @@ class CompetitorAlertAnalyzer:
         self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
         if self.use_llm:
-            self.client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            try:
+                self.client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            except Exception as exc:
+                logger.warning(
+                    "Competitor alert LLM client initialization failed; using rule-based fallback. error=%s",
+                    exc,
+                )
+                self.client = None
+                self.use_llm = False
 
-    def analyze_candidate(self, candidate: CandidateArticle) -> dict[str, Any]:
+    def analyze_candidate(
+        self,
+        candidate: CandidateArticle,
+        *,
+        article_context: Optional[ArticleContext] = None,
+    ) -> dict[str, Any]:
         """Return normalized competitor alert schema for one candidate."""
         fallback = self._fallback_alert(candidate)
         if not self.use_llm or self.client is None:
             return fallback
 
-        llm_result = self._llm_alert_analysis(candidate)
+        llm_result = self._llm_alert_analysis(candidate, article_context=article_context)
         if not llm_result:
             return fallback
         return self._normalize_alert({**fallback, **llm_result})
@@ -309,20 +391,36 @@ class CompetitorAlertAnalyzer:
     def _llm_alert_analysis(
         self,
         candidate: CandidateArticle,
+        *,
+        article_context: Optional[ArticleContext] = None,
     ) -> Optional[dict[str, Any]]:
-        system_prompt = """You are a senior competitive intelligence analyst for a mobility platform.
+        system_prompt = """You are a senior international marketing strategist for inDrive with deep experience in ride-hailing, mobility marketplaces, regional go-to-market, growth, brand strategy, and competitor response.
 
-Your job is to turn a prefiltered competitor candidate into a crisp, actionable alert for product and growth teams.
+Your task is to analyze a competitor article and produce a sharp, practical alert for the inDrive Marcom and growth team.
+
+Your output must help the team:
+- understand exactly what happened
+- understand why it matters strategically
+- estimate likely impact on perception, positioning, growth, driver/rider trust, or market narrative
+- decide what inDrive should do better, faster, or differently
+
+Think like a senior operator responsible for competitor response, local market messaging, regional GTM, and strategic brand reaction.
 
 Rules:
+- Use only evidence from the provided article context.
+- Do not invent facts, metrics, partnerships, timelines, internal intent, or campaign performance.
+- If evidence is limited, be explicit and stay cautious.
+- Do not overstate strategic meaning when the source signal is weak.
+- Think like a high-level international marketer, not a generic summarizer.
+- Recommended actions must be concrete and useful for brand, growth, communications, partnerships, creative strategy, regional GTM, or driver/rider messaging.
+- Recommended actions must be applicable to inDrive, not generic advice for "a company".
+- Avoid vague advice like "monitor this" unless no stronger action is justified by the article.
+- Keep wording concise, executive-friendly, and actionable.
 - Return only strict JSON without markdown.
-- Be concise, specific, and honest.
-- If the source text is limited, rely only on available evidence.
-- Keep fields business-readable.
 - `priority` must be one of LOW, MEDIUM, HIGH.
 - `confidence` must be a number from 0 to 1.
 
-JSON schema:
+Return this schema:
 {
   "competitor": "string",
   "region": "string",
@@ -336,13 +434,29 @@ JSON schema:
   "confidence": 0.0
 }"""
 
-        user_prompt = """Candidate:
+        user_prompt = """Candidate metadata:
 {candidate_payload}
 
-Source title: {title}
-Source snippet: {snippet}
+Article title: {title}
+Article snippet: {snippet}
+Article body: {article_body}
 Source query: {query}
-Source URL: {url}"""
+Source URL: {url}
+
+Write the alert for the inDrive Marcom / growth team.
+
+Focus especially on:
+- competitor strategy
+- market narrative
+- campaign or messaging angle
+- likely effect on driver/rider perception
+- what inDrive can do better or differently
+
+When writing:
+- "what_happened" should state the event clearly and concretely
+- "why_it_matters" should explain the strategic meaning, not just restate the article
+- "potential_impact" should focus on likely effects on trust, perception, positioning, growth, or supply-demand narrative
+- "recommended_action" should give specific next moves for inDrive, ideally in messaging, creative, partnerships, GTM, driver/rider value proposition, or local communications"""
 
         candidate_payload = {
             "competitor": candidate.competitor,
@@ -354,6 +468,29 @@ Source URL: {url}"""
             "reasons": list(candidate.reasons),
             "language_hint": candidate.language_hint,
         }
+        context = article_context or ArticleContext(
+            title=candidate.title,
+            snippet=candidate.raw_article.snippet,
+            source_url=candidate.url,
+            article_body="",
+        )
+        if article_context is not None and (
+            not context.article_body or context.article_body == "Unavailable"
+        ):
+            return self._normalize_alert(
+                {
+                    "competitor": candidate.competitor,
+                    "region": candidate.region or "",
+                    "country": candidate.country_hint or "",
+                    "topic": candidate.topic_group.replace("_", " "),
+                    "priority": self._priority_from_score(candidate.score),
+                    "what_happened": candidate.summary or candidate.title,
+                    "why_it_matters": self.INSUFFICIENT_SOURCE_DATA_MESSAGE,
+                    "potential_impact": "Potential impact remains unclear and needs validation.",
+                    "recommended_action": self.INSUFFICIENT_SOURCE_DATA_MESSAGE,
+                    "confidence": 0.0,
+                }
+            )
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -365,10 +502,11 @@ Source URL: {url}"""
                             candidate_payload=json.dumps(
                                 candidate_payload, ensure_ascii=False, indent=2
                             ),
-                            title=candidate.title,
-                            snippet=candidate.raw_article.snippet,
+                            title=context.title,
+                            snippet=context.snippet,
                             query=candidate.raw_article.query,
-                            url=candidate.url,
+                            url=context.source_url,
+                            article_body=context.article_body or "Unavailable",
                         ),
                     },
                 ],

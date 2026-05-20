@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 from competitor_tracker.analyzer import CompetitorAlertAnalyzer, CompetitorAnalyzer
 from competitor_tracker.config import TrackerConfig
-from competitor_tracker.models import CandidateArticle, RawArticle
+from competitor_tracker.models import ArticleContext, CandidateArticle, RawArticle
 
 
 def build_config() -> TrackerConfig:
@@ -134,34 +134,41 @@ def test_competitor_alert_analyzer_returns_fallback_schema_without_llm():
 
 
 def test_competitor_alert_analyzer_uses_openai_response_shape():
+    captured = {}
+
+    def fake_create(**kwargs):
+        captured["model"] = kwargs["model"]
+        captured["messages"] = kwargs["messages"]
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="""
+                        {
+                          "competitor": "Grab / Move It",
+                          "region": "Southeast Asia",
+                          "country": "Philippines",
+                          "topic": "Marketing + Policy Narrative",
+                          "priority": "MEDIUM",
+                          "what_happened": "Platforms are promoting driver support programs as part of public messaging.",
+                          "why_it_matters": "Driver support is becoming part of brand communication, not just operations.",
+                          "potential_impact": "Improved driver perception and stronger trust narrative.",
+                          "recommended_action": "Highlight driver benefits in campaigns and test driver care messaging.",
+                          "confidence": 0.86
+                        }
+                        """
+                    )
+                )
+            ]
+        )
+
     analyzer = CompetitorAlertAnalyzer(use_llm=False)
     analyzer.use_llm = True
     analyzer.model = "gpt-4o-mini"
     analyzer.client = SimpleNamespace(
         chat=SimpleNamespace(
             completions=SimpleNamespace(
-                create=lambda **kwargs: SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            message=SimpleNamespace(
-                                content="""
-                                {
-                                  "competitor": "Grab / Move It",
-                                  "region": "Southeast Asia",
-                                  "country": "Philippines",
-                                  "topic": "Marketing + Policy Narrative",
-                                  "priority": "MEDIUM",
-                                  "what_happened": "Platforms are promoting driver support programs as part of public messaging.",
-                                  "why_it_matters": "Driver support is becoming part of brand communication, not just operations.",
-                                  "potential_impact": "Improved driver perception and stronger trust narrative.",
-                                  "recommended_action": "Highlight driver benefits in campaigns and test driver care messaging.",
-                                  "confidence": 0.86
-                                }
-                                """
-                            )
-                        )
-                    ]
-                )
+                create=fake_create
             )
         )
     )
@@ -187,3 +194,58 @@ def test_competitor_alert_analyzer_uses_openai_response_shape():
     assert alert["priority"] == "MEDIUM"
     assert alert["confidence"] == 0.86
     assert "driver support" in alert["what_happened"].lower()
+    assert "senior international marketing strategist for inDrive" in captured["messages"][0]["content"]
+    assert "Think like a senior operator responsible for competitor response" in captured["messages"][0]["content"]
+    assert "Do not invent facts, metrics, partnerships, timelines, internal intent, or campaign performance." in captured["messages"][0]["content"]
+    assert 'Recommended actions must be applicable to inDrive, not generic advice for "a company".' in captured["messages"][0]["content"]
+    assert '"recommended_action": "string"' in captured["messages"][0]["content"]
+    assert "Write the alert for the inDrive Marcom / growth team." in captured["messages"][1]["content"]
+    assert "competitor strategy" in captured["messages"][1]["content"]
+    assert "what inDrive can do better or differently" in captured["messages"][1]["content"]
+    assert '"why_it_matters" should explain the strategic meaning, not just restate the article' in captured["messages"][1]["content"]
+    assert '"recommended_action" should give specific next moves for inDrive' in captured["messages"][1]["content"]
+
+
+def test_competitor_alert_analyzer_skips_llm_when_article_body_is_unavailable():
+    analyzer = CompetitorAlertAnalyzer(use_llm=False)
+    analyzer.use_llm = True
+    analyzer.model = "gpt-4o-mini"
+
+    def fail_if_called(**kwargs):
+        raise AssertionError("OpenAI client should not be called without article body")
+
+    analyzer.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fail_if_called)
+        )
+    )
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Grab offers support programs to drivers as fuel prices soar",
+            url="https://example.com/grab-fuel",
+            provider="google_news_rss",
+            snippet="Driver support programs gain public attention in the Philippines.",
+        ),
+        competitor="Grab / Move It",
+        topic_group="marketing + policy narrative",
+        score=8,
+        region="sea",
+        country_hint="Philippines",
+        language_hint="en",
+    )
+
+    alert = analyzer.analyze_candidate(
+        candidate,
+        article_context=ArticleContext(
+            title=candidate.title,
+            snippet=candidate.raw_article.snippet,
+            source_url=candidate.url,
+            article_body="",
+        ),
+    )
+
+    assert alert["competitor"] == "Grab / Move It"
+    assert alert["country"] == "Philippines"
+    assert alert["why_it_matters"] == analyzer.INSUFFICIENT_SOURCE_DATA_MESSAGE
+    assert alert["recommended_action"] == analyzer.INSUFFICIENT_SOURCE_DATA_MESSAGE
+    assert alert["confidence"] == 0.0

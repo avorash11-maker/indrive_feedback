@@ -9,6 +9,8 @@ def make_result():
     return {
         "analysis": analysis,
         "digest": None,
+        "alert_schemas": [],
+        "article_contexts": [],
         "query_count": 0,
         "candidates_path": Path("output/competitor_tracker/candidates.json"),
         "digest_path": Path("output/competitor_tracker/digest.json"),

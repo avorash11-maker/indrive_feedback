@@ -1,245 +1,276 @@
-# inDrive Media Intelligence
+# Competitor Tracker MVP
 
-AI-assisted pipeline for media monitoring: collects news about inDrive, removes duplicates, scores relevance, enriches high-signal mentions, and exports results into analyst-friendly reports and Notion.
+Config-driven competitor intelligence pipeline for daily market monitoring. The system collects low-cost public signals, removes duplicates, applies a cheap rule-based prefilter before any LLM step, ranks the strongest candidates, and delivers a compact digest to Telegram with an optional Notion mirror.
 
-## Product Branches
+## Product Split
 
-- `legacy pipeline`: текущий production-like поток для `indrive_media`, который собирает упоминания про inDrive и остаётся источником правды в этом репозитории.
-- `new competitor tracker`: новая продуктовая ветка, которая начинается рядом с legacy-контуром, но не должна менять текущее поведение `indrive_media` до отдельного рефакторинга и явного переключения.
+- `competitor_tracker` is the new MVP product branch in this repository.
+- `legacy pipeline` (`indrive_media`) stays in place and is not the source of truth for the new competitor tracker.
 
-## Зачем этот проект
+## What This MVP Does
 
-Командам продукта и operations недостаточно просто “собирать новости”. Нужен поток сигналов, который:
+The current MVP is optimized for a practical daily monitoring loop:
 
-- находит упоминания inDrive в разных источниках;
-- отсекает шум и дубли;
-- выделяет действительно важные сигналы по рынку, безопасности, регулированию и конкурентам;
-- превращает сырые статьи в артефакты, с которыми уже можно работать дальше.
+- `SQLite` is the operational source of truth for raw articles, candidates, alerts, runs, and delivery history.
+- Regions, competitors, topic groups, keyword templates, provider list, and digest limit are driven by config.
+- News collection uses low-cost public sources: `Google News RSS` and `GDELT`.
+- A rule-based prefilter detects competitor, topic, region, country/language hints, and baseline score before any LLM call.
+- Digest ranking prioritizes `priority -> freshness -> confidence/score`.
+- Duplicate suppression works both within one run and across history.
+- Final alerts can be:
+  - previewed locally as `JSON`, `Markdown`, optional `CSV`
+  - sent to `Telegram`
+  - mirrored to `Notion` as a showcase/archive layer
 
-Этот проект показывает, как такую задачу можно автоматизировать с помощью Python, эвристик, LLM-анализа и интеграции с Notion.
+## Why This Architecture
 
-## Что делает pipeline
+The design goal is not “use AI everywhere”, but “use AI only where it helps”.
 
-1. Собирает новости из `NewsAPI`, `GDELT` и `Google News RSS`.
-2. Нормализует статьи и удаляет дубли по URL и похожим заголовкам.
-3. Применяет быстрый эвристический prefilter.
-4. При наличии `OPENAI_API_KEY` добавляет LLM-анализ для high-signal материалов.
-5. Сохраняет результаты в `JSON`, `CSV`, `Markdown`.
-6. По флагу экспортирует итоговые записи в Notion.
+- `SQLite first`: the system keeps local operational history and does not depend on Notion to run.
+- `Cheap before smart`: rule-based filtering reduces unnecessary LLM usage and lowers daily cost.
+- `Config over code`: new regions, competitors, and topic groups can be adjusted without rewriting pipeline logic.
+- `Digest, not firehose`: suppression and ranking keep the daily output readable for humans.
+- `Optional integrations`: Telegram and Notion are delivery layers, not core state.
 
-## Архитектура
+## Current Stack
+
+- Python
+- `SQLite` for operational storage
+- `Google News RSS` and `GDELT` for ingestion
+- optional `OpenAI` step for richer alert narratives
+- `Telegram` for delivery
+- optional `Notion` mirror for archive / portfolio presentation
+- `pytest` for unit and integration-style coverage
+
+## Core Flow
 
 ```text
-News Sources -> Deduplication -> Heuristic Prefilter -> LLM Analysis -> Scoring -> Export
+Config
+  -> Query Expansion
+  -> Providers (Google News RSS, GDELT)
+  -> Normalization + Raw Deduplication
+  -> Rule-Based Prefilter
+  -> SQLite History Checks
+  -> Ranking + Suppression
+  -> Alert Formatting
+  -> Telegram / Notion / Local Artifacts
 ```
 
-Ключевые модули:
+Detailed architecture: [docs/architecture.md](/C:/Users/shar0/Desktop/indrive_feedback/docs/architecture.md)
 
-- `src/indrive_media/scraper.py` — сбор данных из внешних источников
-- `src/indrive_media/title_matching.py` — логика дедупликации
-- `src/indrive_media/analyzer.py` — эвристический и LLM-анализ
-- `src/indrive_media/notion_integration.py` — экспорт в Notion
-- `src/indrive_media/main.py` — orchestration и CLI
+## Repository Highlights
 
-Подробная схема: [docs/architecture.md](/C:/Users/shar0/Desktop/indrive_feedback/docs/architecture.md)
-
-Важно: пока CLI `python main.py` и `indrive-media` относятся только к legacy pipeline. Конкурентный трекер здесь пока обозначен как отдельное направление развития, а не как замена текущего контура.
-
-## Почему это хороший AI automation case
-
-Этот репозиторий показывает не только “вызов модели”, а полный рабочий контур:
-
-- интеграцию с внешними источниками данных;
-- дешёвый rule-based prefilter перед LLM;
-- понятную границу между heuristic и LLM слоями;
-- safe workflow для Notion через `dry-run`;
-- тестируемость и воспроизводимый CLI-процесс.
+- [src/competitor_tracker/config.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/config.py)
+  Config loader, validation, and query expansion.
+- [src/competitor_tracker/providers.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/providers.py)
+  Low-cost provider adapters for `Google News RSS` and `GDELT`.
+- [src/competitor_tracker/analyzer.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/analyzer.py)
+  Rule-based prefilter plus alert analyzer.
+- [src/competitor_tracker/digest.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/digest.py)
+  Ranking and suppression logic.
+- [src/competitor_tracker/storage.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/storage.py)
+  `SQLite` operational storage plus local artifact persistence.
+- [src/competitor_tracker/telegram_sender.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/telegram_sender.py)
+  Telegram delivery with dry-run and delivery logging.
+- [src/competitor_tracker/notion_sync.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/notion_sync.py)
+  Optional Notion mirror.
+- [src/competitor_tracker/cli.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/cli.py)
+  Separate CLI for the new system.
 
 ## Quick Start
 
-Создай чистое окружение и установи зависимости:
+Install the project in a virtual environment:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python -m pip install -e .[dev]
 ```
 
-Проверь, что тесты проходят:
+Run all tests:
 
 ```powershell
 .\.venv\Scripts\python -m pytest
 ```
 
-Запусти pipeline локально:
+Run the new tracker locally:
 
 ```powershell
-.\.venv\Scripts\python main.py --days 30 --min-score 6 --no-llm
+.\.venv\Scripts\python -m competitor_tracker run --days 7 --export-csv
 ```
 
-Если хочешь использовать packaged CLI:
+Or use the packaged entrypoint:
 
 ```powershell
-.\.venv\Scripts\python -m pip install -e .
-.\.venv\Scripts\indrive-media --days 30 --min-score 6 --no-llm
+.\.venv\Scripts\competitor-tracker run --days 7 --export-csv
 ```
 
-## Конфигурация
+## CLI Commands
 
-Создай `.env` из шаблона:
+The new CLI supports:
+
+- `run`
+- `dry-run`
+- `send-digest`
+- `sync-notion`
+- `backfill`
+
+Examples:
 
 ```powershell
-Copy-Item .env.example .env
+.\.venv\Scripts\competitor-tracker dry-run --days 7 --export-csv
+.\.venv\Scripts\competitor-tracker send-digest --dry-run --region sea
+.\.venv\Scripts\competitor-tracker sync-notion --dry-run --region sea
+.\.venv\Scripts\competitor-tracker backfill --days 30 --region sea --export-csv
 ```
+
+## Configuration
+
+The tracker uses one config file as source of truth:
+
+- [default_config.json](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/default_config.json)
+
+It defines:
+
+- `regions`
+- `competitors_by_region`
+- `topic_groups`
+- `keyword_templates`
+- `daily_digest_limit`
+- `enabled_providers`
+
+The default MVP config is now aligned to these monitoring themes:
+
+- `market_expansion`
+  keywords like `launching in`, `new city`, `entering market`, `expansion`
+- `campaign_launches`
+  keywords like `campaign`, `partnership`, `brand ambassador`, `new feature`
+- `pricing_promo`
+  keywords like `discount`, `promo code`, `price cut`, `subscription`
+- `industry_context`
+  terms like `ride-hailing`, `e-hailing`, `on-demand mobility`, `ride-sharing`, `taxi app`, `VTC`, `MaaS`
+- `strategic_operations`
+  terms like `market entry`, `launching operations`, `license obtained`, `regulatory approval`, `strategic partnership`, `driver recruitment campaign`
+- `performance_growth`
+  terms like `first ride free`, `discounted rides`, `referral bonus`, `loyalty program`, `low commission for drivers`, `bonus for new drivers`
+- `product_features_innovation`
+  terms like `intercity`, `delivery`, `courier service`, `freight`, `fixed price`, `bidding model`, `safety features`
+
+Runtime settings come from env:
 
 ```env
-OPENAI_API_KEY=
-NEWS_API_KEY=
-OPENAI_MODEL=gpt-4o-mini
+COMPETITOR_TRACKER_CONFIG_PATH=
+COMPETITOR_TRACKER_OUTPUT_DIR=
+COMPETITOR_TRACKER_DB_PATH=
+COMPETITOR_TRACKER_LOOKBACK_DAYS=
+COMPETITOR_TRACKER_MIN_SCORE=
+
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 
 NOTION_TOKEN=
 NOTION_DATABASE_ID=
+COMPETITOR_TRACKER_NOTION_DATABASE_ID=
 ```
 
-Что важно:
+Important:
 
-- `OPENAI_API_KEY` опционален; без него проект работает только на эвристиках
-- `NEWS_API_KEY` опционален; без него останутся `GDELT` и `Google News RSS`
-- `NOTION_TOKEN` и `NOTION_DATABASE_ID` нужны только для экспорта в Notion
+- `Telegram` is optional.
+- `Notion` is optional.
+- Without `Notion` env, the pipeline should skip mirror sync with a warning, not fail.
+- `SQLite` remains the main operational store either way.
 
-## Основные команды
+## Output Artifacts
 
-Базовый запуск:
+Each run can generate a review-friendly set of artifacts in `output/competitor_tracker/`:
 
-```powershell
-.\.venv\Scripts\python main.py --days 30 --min-score 6
-```
+- `run_summary.json`
+- `candidates.json`
+- `digest.json`
+- `digest_preview.md`
+- `candidates_review.csv` when `--export-csv` is enabled
+- `tracker.db`
 
-Без LLM:
+The markdown preview intentionally uses readable Russian section labels where helpful for manual review:
 
-```powershell
-.\.venv\Scripts\python main.py --days 30 --min-score 6 --no-llm
-```
+- `Что произошло`
+- `Почему это важно`
+- `Потенциальное влияние`
+- `Что делать`
 
-С кастомными запросами:
+This makes it easier to validate false positives and signal quality over a 1-2 week test period without querying SQLite by hand.
 
-```powershell
-.\.venv\Scripts\python main.py --query "`"inDrive`" delivery" --query "`"inDrive`" taxi safety"
-```
+## Delivery Layers
 
-С другим output directory:
+### Telegram
 
-```powershell
-.\.venv\Scripts\python main.py --days 7 --min-score 8 --output-dir output_week
-```
+Telegram is the main delivery channel for the MVP.
 
-CLI flags:
+- supports `dry-run`
+- logs delivery history into `SQLite`
+- enables suppression of already sent alerts
 
-```text
---days DAYS
---min-score MIN_SCORE
---no-llm
---query QUERY
---output-dir OUTPUT_DIR
---to-notion
---notion-ensure-schema
---notion-dry-run
-```
+### Notion
 
-## Эвристика релевантности
+Notion is an optional mirror, not the database of record.
 
-Базовый score строится по простым сигналам:
+- final alerts can be archived to a separate competitor tracker database
+- dry-run is supported
+- if env is missing, sync is skipped safely
 
-```text
-+7  прямое упоминание inDrive / inDriver / in-driver
-+2  сервисные термины: taxi, ride-hailing, driver, passenger, fare, delivery, courier, freight
-+1  конкуренты: Uber, Bolt, Grab, Gojek, Didi и т.д.
-+1  регуляторные и риск-термины: regulation, law, ban, license, strike, safety, pricing
--2  шумовой термин без прямого упоминания inDrive
-```
+## Reliability
 
-Итоговый `relevance_score` ограничен диапазоном `0..10`.
+The new branch is covered by:
 
-## Notion Export
+- unit tests for config, models, normalization, storage, providers, ranking, formatter, Telegram, and Notion
+- integration-style tests for:
+  - full dry-run with mocked providers
+  - duplicate suppression across runs
+  - already-sent suppression
+  - digest top-cap behavior
+  - provider partial failure
+  - optional Notion behavior
 
-Проект умеет создавать и обновлять записи в Notion-базе с полями:
-
-- `Название статьи`
-- `№`
-- `Дата`
-- `Ссылка на статью`
-- `Контекст`
-- `Почему важно для PM`
-
-Проверка без записи:
-
-```powershell
-.\.venv\Scripts\python -m indrive_media.notion_integration --input output/indrive_mentions.json --dry-run
-```
-
-Реальный экспорт:
-
-```powershell
-.\.venv\Scripts\indrive-media --days 30 --min-score 6 --to-notion
-```
-
-Экспорт не должен плодить дубли: если URL уже есть в базе, запись обновляется.
-
-## Выходные файлы
-
-После запуска проект создаёт артефакты в `output/`:
-
-- `output/indrive_mentions.json` — итоговые релевантные материалы
-- `output/indrive_mentions.csv` — плоская таблица для просмотра
-- `output/indrive_pm_report.md` — человекочитаемый отчёт
-- `output/indrive_mentions_audit.json` — аудит всех просмотренных материалов
-- `output/indrive_run_summary.json` — сводка по запуску и health check провайдеров
-
-Пример результата: [examples/sample_mentions.json](/C:/Users/shar0/Desktop/indrive_feedback/examples/sample_mentions.json)
-
-## Тесты
-
-В проекте есть `pytest`-покрытие для ключевых сценариев:
-
-- heuristic scoring
-- title deduplication
-- Notion dry-run / create / update behavior
-- pipeline health reporting
-
-Запуск:
+Run them with:
 
 ```powershell
 .\.venv\Scripts\python -m pytest
 ```
 
-## Ограничения
+## GitHub Actions
 
-- проект зависит от внешних news APIs и их доступности;
-- англоязычные источники могут пропускать локальный контекст;
-- heuristic layer может давать false positives и false negatives;
-- LLM-анализ точнее, но медленнее и дороже;
-- дедупликация похожих новостей всегда остаётся компромиссом.
+The legacy CI workflow stays untouched.
 
-## Структура репозитория
+The new tracker has its own workflow:
 
-```text
-.
-|-- src/indrive_media/
-|-- tests/
-|-- docs/
-|-- examples/
-|-- main.py
-|-- pyproject.toml
-|-- requirements.txt
-|-- requirements-dev.txt
-```
+- [competitor-tracker.yml](/C:/Users/shar0/Desktop/indrive_feedback/.github/workflows/competitor-tracker.yml)
 
-## Что можно улучшить дальше
+It supports:
 
-- добавить screenshot или short demo GIF c результатом в Notion;
-- сократить путь от raw output к “executive summary”;
-- вынести providers и exporters в более расширяемые adapters;
-- добавить scheduled run для полностью автоматического мониторинга.
+- daily schedule
+- manual dispatch
+- dry-run mode
+- secrets for Telegram / Notion / OpenAI
+- artifact upload from `output/competitor_tracker/`
+
+## Legacy Pipeline
+
+The repository still contains the original `indrive_media` pipeline and its CLI:
+
+- [src/indrive_media/main.py](/C:/Users/shar0/Desktop/indrive_feedback/src/indrive_media/main.py)
+- [main.py](/C:/Users/shar0/Desktop/indrive_feedback/main.py)
+
+That legacy flow remains available and should not be assumed to behave like the new competitor tracker MVP.
+
+## Portfolio Framing
+
+This repository can now be shown as a portfolio case for:
+
+- productized competitor monitoring
+- low-cost AI pipeline design
+- config-driven monitoring systems
+- digest-first alerting architecture
+- safe migration from legacy pipeline to new product branch
 
 ## License
 
-MIT — см. [LICENSE](/C:/Users/shar0/Desktop/indrive_feedback/LICENSE).
+MIT — see [LICENSE](/C:/Users/shar0/Desktop/indrive_feedback/LICENSE)

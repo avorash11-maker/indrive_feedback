@@ -1,48 +1,293 @@
-# Architecture Overview
+# Competitor Tracker Architecture
 
-## Product Split
+## Product Positioning
 
-- `Legacy pipeline`: текущий `indrive_media` flow в этом репозитории. Он покрывает сбор, дедупликацию, scoring, optional LLM enrichment и экспорт.
-- `New competitor tracker`: новая ветка продукта, которую стоит развивать рядом, не меняя существующее поведение legacy pipeline до отдельного этапа рефакторинга.
+This repository currently contains two product branches:
 
-На текущем этапе все диаграммы и компоненты ниже описывают именно legacy pipeline и действующий CLI-контур.
+- `competitor_tracker` — the new MVP for daily competitor monitoring
+- `indrive_media` — the legacy pipeline that remains in the repository for continuity
+
+This document describes the new `competitor_tracker` architecture first. The legacy pipeline is summarized briefly at the end.
+
+## MVP Goal
+
+Build a low-cost daily competitor digest that:
+
+- tracks configured competitors across selected regions
+- focuses on market moves, launches, partnerships, promo/pricing, and related strategic signals
+- suppresses duplicates and already-sent alerts
+- delivers a compact operational digest instead of a firehose
+- keeps local state in `SQLite`
+- optionally mirrors final alerts into `Notion`
+
+## Design Principles
+
+### SQLite as source of truth
+
+`SQLite` is the operational backbone of the MVP. It stores:
+
+- raw articles
+- scored candidates
+- final alerts
+- run summaries
+- delivery history
+
+This keeps the tracker usable even when external integrations are unavailable.
+
+### Cheap signals before expensive enrichment
+
+The tracker first applies normalization, deduplication, topic detection, region detection, and scoring. This lowers the number of signals that would ever need richer enrichment.
+
+### Config-driven monitoring
+
+Regions, competitors, topic groups, query templates, provider list, and digest limits come from config, not hardcoded flows.
+
+### Digest-first delivery
+
+The system is designed to decide “what is worth showing today”, not just “what was found”.
 
 ## System Components
 
 ```mermaid
 graph TD
-    A[src/indrive_media/main.py] --> B[scraper.py]
-    A --> C[analyzer.py]
-    A --> D[notion_integration.py]
+    A[Tracker Config] --> B[Query Expansion]
+    B --> C[Providers]
+    C --> D[Normalization + Raw Dedup]
+    D --> E[Rule-Based Prefilter]
+    E --> F[SQLite History]
+    F --> G[Ranking + Suppression]
+    G --> H[Alert Schemas]
+    H --> I[Local Artifacts]
+    H --> J[Telegram Delivery]
+    H --> K[Optional Notion Mirror]
 
-    B --> E[title_matching.py]
-    C --> E
-    D --> E
+    C --> C1[Google News RSS]
+    C --> C2[GDELT]
 
-    B --> F[External APIs]
-    C --> G[OpenAI API]
-    D --> H[Notion API]
-
-    F --> I[NewsAPI]
-    F --> J[GDELT]
-    F --> K[Google News RSS]
-
-    L[Output Files] --> M[JSON]
-    L --> N[CSV]
-    L --> O[Markdown Report]
+    I --> I1[run_summary.json]
+    I --> I2[digest.json]
+    I --> I3[digest_preview.md]
+    I --> I4[candidates_review.csv]
+    I --> I5[tracker.db]
 ```
+
+## Main Modules
+
+### Configuration
+
+- [src/competitor_tracker/config.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/config.py)
+- [default_config.json](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/default_config.json)
+
+Responsibilities:
+
+- load and validate config
+- define regions and competitors
+- define topic groups and keyword templates
+- expand search queries for providers
+- keep runtime settings separate from domain config
+
+Default monitoring themes currently encoded in config:
+
+- `market_expansion`
+- `campaign_launches`
+- `pricing_promo`
+- `industry_context`
+- `strategic_operations`
+- `performance_growth`
+- `product_features_innovation`
+
+### Providers
+
+- [src/competitor_tracker/providers.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/providers.py)
+
+Responsibilities:
+
+- fetch low-cost public articles
+- normalize provider payloads into `RawArticle`
+- isolate provider-specific request logic
+
+Current providers:
+
+- `Google News RSS`
+- `GDELT`
+
+### Normalization and Deduplication
+
+- [src/competitor_tracker/normalization.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/normalization.py)
+
+Responsibilities:
+
+- normalize URLs, titles, dates, and source labels
+- deduplicate raw hits across providers
+- keep new tracker logic independent from legacy `indrive_media`
+
+### Analysis
+
+- [src/competitor_tracker/analyzer.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/analyzer.py)
+
+Responsibilities:
+
+- rule-based prefilter before any optional LLM usage
+- detect:
+  - competitor
+  - topic group
+  - region
+  - country hint
+  - language hint
+- assign baseline score and reasons
+- produce alert-ready schema for readable delivery
+
+### Ranking and Suppression
+
+- [src/competitor_tracker/digest.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/digest.py)
+
+Responsibilities:
+
+- rank by:
+  - priority
+  - freshness
+  - confidence
+  - score
+- suppress duplicates within one run
+- suppress alerts already sent in previous runs
+- suppress near-duplicate alerts from recent history
+- apply top-N digest limit
+
+### Storage
+
+- [src/competitor_tracker/storage.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/storage.py)
+
+Responsibilities:
+
+- persist local JSON / CSV / Markdown artifacts
+- maintain `SQLite` operational history
+
+Current `SQLite` tables:
+
+- `articles_raw`
+- `article_candidates`
+- `alerts`
+- `runs`
+- `delivery_log`
+
+### Delivery and Mirror Layers
+
+- [src/competitor_tracker/telegram_sender.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/telegram_sender.py)
+- [src/competitor_tracker/notion_sync.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/notion_sync.py)
+- [src/competitor_tracker/formatter.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/formatter.py)
+
+Responsibilities:
+
+- format readable alerts and daily digests
+- send to Telegram with dry-run and delivery logging
+- mirror final alerts to Notion when configured
+
+Important boundary:
+
+- `Telegram` is the main delivery layer
+- `Notion` is a showcase/archive mirror
+- neither replaces `SQLite` as the operational state store
 
 ## Data Flow
 
-1. **Scraping Phase**: `scraper.py` collects news from multiple APIs with deduplication
-2. **Analysis Phase**: `analyzer.py` applies heuristic and LLM analysis to filter relevant mentions
-3. **Integration Phase**: `notion_integration.py` exports results to Notion database with deduplication
-4. **Output**: Multiple formats (JSON, CSV, Markdown) for different use cases
+### 1. Query Expansion
 
-## Key Design Decisions
+The tracker uses config-defined:
 
-- **Modular Architecture**: Separate concerns for scraping, analysis, and integration
-- **Centralized Deduplication**: `title_matching.py` provides consistent duplicate detection
-- **Retry & Rate Limiting**: Tenacity decorators and time.sleep for API reliability
-- **Public APIs**: Clean interfaces between modules (no private method calls)
-- **Modern Packaging**: pyproject.toml with setuptools for distribution
+- regions
+- competitors by region
+- topic groups
+- keyword templates
+
+These become provider queries.
+
+### 2. Collection
+
+Providers fetch raw public articles and map them into `RawArticle`.
+
+### 3. Normalization
+
+Raw articles are normalized and deduplicated before scoring.
+
+### 4. Prefilter
+
+The rule-based analyzer converts valid raw articles into `CandidateArticle` objects and drops weak or irrelevant items early.
+
+### 5. History-Aware Digesting
+
+Candidates become alerts, then the digest builder:
+
+- ranks them
+- compares against history
+- suppresses repeats
+- trims the result to a daily cap
+
+### 6. Artifacts and Delivery
+
+The run produces:
+
+- `run_summary.json`
+- `candidates.json`
+- `digest.json`
+- `digest_preview.md`
+- optional `candidates_review.csv`
+- `tracker.db`
+
+And optionally:
+
+- sends digest to Telegram
+- mirrors alerts to Notion
+
+## Low-Cost Daily Digest Strategy
+
+The MVP is intentionally optimized for low-cost daily operation:
+
+- no paid ingestion dependency is required to get started
+- most filtering happens before any richer analysis step
+- `SQLite` keeps history local and cheap
+- digest cap prevents operational overload
+- markdown and CSV artifacts make manual QA simple during live trial periods
+
+## Reliability Strategy
+
+The new branch is protected by:
+
+- unit tests for key modules
+- integration-style tests for:
+  - full dry-run with mocked providers
+  - duplicate suppression across runs
+  - already-sent suppression
+  - digest cap behavior
+  - provider partial failure
+  - optional Notion behavior
+
+This makes the refactor safer while the product branch is still evolving.
+
+## Automation Path
+
+The competitor tracker has its own GitHub Actions workflow:
+
+- [competitor-tracker.yml](/C:/Users/shar0/Desktop/indrive_feedback/.github/workflows/competitor-tracker.yml)
+
+It supports:
+
+- scheduled daily execution
+- manual dispatch
+- dry-run mode
+- artifact upload
+
+The original CI workflow remains separate.
+
+## Legacy Pipeline
+
+The legacy branch is still present in:
+
+- [src/indrive_media/](/C:/Users/shar0/Desktop/indrive_feedback/src/indrive_media)
+
+Its responsibilities are different:
+
+- inDrive mention monitoring
+- legacy export/reporting flow
+- separate CLI and legacy integration path
+
+It should not be treated as the architecture of the new competitor tracker MVP.

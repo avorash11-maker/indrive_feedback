@@ -9,9 +9,27 @@ def test_load_default_competitor_tracker_config():
     config = TrackerConfig.load_default()
 
     assert "latam" in config.regions
+    assert "africa" in config.regions
+    assert "mea" in config.regions
+    assert "cis_central_asia" in config.regions
     assert config.regions["latam"].label == "Latin America"
-    assert "Uber" in config.competitors_by_region["latam"]
-    assert "pricing" in config.topic_groups
+    assert config.competitors_by_region["latam"] == ("Uber", "DiDi", "Cabify", "99")
+    assert config.competitors_by_region["sea"] == ("Grab", "Gojek", "Maxim", "Bolt")
+    assert config.competitors_by_region["africa"] == ("Bolt", "Uber", "Careem", "Yassir", "Heetch")
+    assert config.competitors_by_region["mea"] == ("Bolt", "Uber", "Careem", "Yassir", "Heetch")
+    assert config.competitors_by_region["cis_central_asia"] == ("Yandex Go", "Bolt", "Maxim")
+    assert "market_expansion" in config.topic_groups
+    assert "campaign_launches" in config.topic_groups
+    assert "pricing_promo" in config.topic_groups
+    assert "industry_context" in config.topic_groups
+    assert "strategic_operations" in config.topic_groups
+    assert "performance_growth" in config.topic_groups
+    assert "product_features_innovation" in config.topic_groups
+    assert "launching in" in config.topic_groups["market_expansion"]
+    assert "brand ambassador" in config.topic_groups["campaign_launches"]
+    assert "promo code" in config.topic_groups["pricing_promo"]
+    assert "ride-hailing" in config.topic_groups["industry_context"]
+    assert "bidding model" in config.topic_groups["product_features_innovation"]
     assert config.daily_digest_limit == 12
     assert config.enabled_providers == ("newsapi", "gdelt", "google_news_rss")
 

@@ -5,33 +5,101 @@
       "geo_terms": ["Mexico", "Brazil", "Colombia", "Peru", "Chile", "LATAM"],
       "language_hints": ["es", "pt", "en"]
     },
-    "mena": {
-      "label": "Middle East and North Africa",
-      "geo_terms": ["Egypt", "Morocco", "Saudi Arabia", "UAE", "MENA"],
-      "language_hints": ["ar", "en", "fr"]
-    },
     "africa": {
       "label": "Africa",
       "geo_terms": ["South Africa", "Kenya", "Nigeria", "Egypt", "Africa"],
       "language_hints": ["en", "fr", "sw"]
     },
+    "mea": {
+      "label": "Middle East",
+      "geo_terms": ["Saudi Arabia", "UAE", "Qatar", "Jordan", "MEA"],
+      "language_hints": ["ar", "en", "fr"]
+    },
     "sea": {
       "label": "Southeast Asia",
       "geo_terms": ["Indonesia", "Thailand", "Vietnam", "Philippines", "SEA"],
       "language_hints": ["en", "id", "th", "vi"]
+    },
+    "cis_central_asia": {
+      "label": "CIS / Central Asia",
+      "geo_terms": ["Kazakhstan", "Uzbekistan", "Kyrgyzstan", "Georgia", "CIS", "Central Asia"],
+      "language_hints": ["ru", "en", "kk", "uz"]
     }
   },
   "competitors_by_region": {
-    "latam": ["Uber", "DiDi", "Cabify", "Rappi"],
-    "mena": ["Uber", "Careem", "Jeeny", "Bolt"],
-    "africa": ["Uber", "Bolt", "Yango", "Little"],
-    "sea": ["Grab", "Gojek", "Uber", "foodpanda"]
+    "latam": ["Uber", "DiDi", "Cabify", "99"],
+    "africa": ["Bolt", "Uber", "Careem", "Yassir", "Heetch"],
+    "mea": ["Bolt", "Uber", "Careem", "Yassir", "Heetch"],
+    "sea": ["Grab", "Gojek", "Maxim", "Bolt"],
+    "cis_central_asia": ["Yandex Go", "Bolt", "Maxim"]
   },
   "topic_groups": {
-    "pricing": ["price", "pricing", "fare", "commission", "discount"],
-    "regulation": ["regulation", "permit", "license", "ban", "compliance"],
-    "safety": ["safety", "incident", "security", "background check", "insurance"],
-    "product_launch": ["launch", "rollout", "expansion", "pilot", "partnership"]
+    "market_expansion": [
+      "launching in",
+      "launch",
+      "launching operations",
+      "new city",
+      "entering market",
+      "market entry",
+      "expansion",
+      "license obtained",
+      "regulatory approval"
+    ],
+    "campaign_launches": [
+      "campaign",
+      "partnership",
+      "brand ambassador",
+      "new feature",
+      "strategic partnership",
+      "driver recruitment campaign"
+    ],
+    "pricing_promo": [
+      "discount",
+      "promo code",
+      "price cut",
+      "subscription",
+      "first ride free",
+      "discounted rides",
+      "referral bonus",
+      "loyalty program",
+      "low commission for drivers",
+      "bonus for new drivers"
+    ],
+    "industry_context": [
+      "ride-hailing",
+      "e-hailing",
+      "on-demand mobility",
+      "ride-sharing",
+      "taxi app",
+      "vtc",
+      "maas",
+      "mobility as a service"
+    ],
+    "strategic_operations": [
+      "market entry",
+      "launching operations",
+      "license obtained",
+      "regulatory approval",
+      "strategic partnership",
+      "driver recruitment campaign"
+    ],
+    "performance_growth": [
+      "first ride free",
+      "discounted rides",
+      "referral bonus",
+      "loyalty program",
+      "low commission for drivers",
+      "bonus for new drivers"
+    ],
+    "product_features_innovation": [
+      "intercity",
+      "delivery",
+      "courier service",
+      "freight",
+      "fixed price",
+      "bidding model",
+      "safety features"
+    ]
   },
   "keyword_templates": [
     "\"{competitor}\" {topic_keywords} {geo_terms}",

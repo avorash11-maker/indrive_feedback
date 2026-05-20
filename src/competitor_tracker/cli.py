@@ -8,6 +8,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
+from .article_context import ArticleContextExtractor
 from .analyzer import CompetitorAlertAnalyzer, CompetitorAnalyzer
 from .config import TrackerConfig, TrackerRuntimeConfig
 from .digest import DigestBuilder
@@ -19,6 +20,7 @@ from .storage import JsonFileStorage, SQLiteTrackerStorage
 from .telegram_sender import TelegramSender
 
 COMMAND_NAMES = {"run", "dry-run", "send-digest", "sync-notion", "backfill"}
+POST_RANKING_LLM_TOP_N = 15
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -188,6 +190,45 @@ def resolve_targets(
     return selected_regions, competitors
 
 
+def build_delivery_alert_schemas(
+    digest_alerts,
+    *,
+    llm_top_n: int = POST_RANKING_LLM_TOP_N,
+):
+    """Enrich only the strongest post-ranking alerts with LLM output."""
+    fallback_analyzer = CompetitorAlertAnalyzer(use_llm=False)
+    if not digest_alerts:
+        return [], []
+
+    llm_limit = max(0, llm_top_n)
+    llm_analyzer = (
+        CompetitorAlertAnalyzer(use_llm=True) if llm_limit > 0 else fallback_analyzer
+    )
+    fallback_context_extractor = ArticleContextExtractor()
+    context_extractor = (
+        fallback_context_extractor if llm_analyzer.use_llm else None
+    )
+
+    alert_schemas = []
+    article_contexts = []
+    for index, alert in enumerate(digest_alerts):
+        article_context = None
+        analyzer = llm_analyzer if index < llm_limit else fallback_analyzer
+        if context_extractor is not None and index < llm_limit:
+            article_context = context_extractor.extract(alert.candidate)
+        article_contexts.append(
+            article_context
+            or fallback_context_extractor.build_fallback_context(alert.candidate)
+        )
+        alert_schemas.append(
+            analyzer.analyze_candidate(
+                alert.candidate,
+                article_context=article_context,
+            )
+        )
+    return alert_schemas, article_contexts
+
+
 def run_pipeline(
     *,
     days: int,
@@ -223,10 +264,7 @@ def run_pipeline(
     )
     sqlite_storage.insert_alerts(digest.alerts)
 
-    alert_analyzer = CompetitorAlertAnalyzer(use_llm=False)
-    alert_schemas = [
-        alert_analyzer.analyze_candidate(alert.candidate) for alert in digest.alerts
-    ]
+    alert_schemas, article_contexts = build_delivery_alert_schemas(digest.alerts)
 
     storage = JsonFileStorage(runtime.output_dir)
     candidates_path = storage.save_candidates(analysis.candidates)
@@ -275,6 +313,8 @@ def run_pipeline(
     return {
         "analysis": analysis,
         "digest": digest,
+        "alert_schemas": alert_schemas,
+        "article_contexts": article_contexts,
         "query_count": len(config.queries_for_regions(selected_regions)),
         "candidates_path": candidates_path,
         "digest_path": digest_path,

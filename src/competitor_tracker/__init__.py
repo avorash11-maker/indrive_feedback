@@ -3,6 +3,7 @@
 from .config import TrackerConfig, TrackerRuntimeConfig
 from .models import (
     Alert,
+    ArticleContext,
     CandidateArticle,
     Competitor,
     CompetitorDigest,
@@ -15,6 +16,7 @@ __all__ = [
     "TrackerConfig",
     "TrackerRuntimeConfig",
     "RawArticle",
+    "ArticleContext",
     "CandidateArticle",
     "Alert",
     "RunSummary",
