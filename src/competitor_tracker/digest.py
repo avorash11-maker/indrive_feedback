@@ -19,6 +19,7 @@ class DigestBuilder:
     """Builds a compact digest from analyzed competitor mentions."""
 
     PRIORITY_ORDER = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+    DEFERRED_MAX_AGE_DAYS = 2
 
     def build(
         self,
@@ -30,8 +31,16 @@ class DigestBuilder:
         storage: Optional[SQLiteTrackerStorage] = None,
         delivery_channel: str = "daily_digest",
         delivery_destination: str = "",
+        include_deferred: bool = False,
     ) -> CompetitorDigest:
         candidate_list = list(candidates)
+        if storage is not None and include_deferred:
+            candidate_list = self._merge_deferred_candidates(
+                candidate_list,
+                storage=storage,
+                delivery_channel=delivery_channel,
+                delivery_destination=delivery_destination,
+            )
         alerts = [candidate.to_alert() for candidate in candidate_list]
         alerts = self._rank_alerts(alerts)
         if storage is not None:
@@ -58,11 +67,33 @@ class DigestBuilder:
             key=lambda alert: (
                 self.PRIORITY_ORDER.get(alert.priority.upper(), 0),
                 self._freshness_sort_key(alert.candidate.published_date),
+                self._deferred_sort_key(alert),
                 alert.confidence,
                 alert.score,
             ),
             reverse=True,
         )
+
+    def _merge_deferred_candidates(
+        self,
+        candidates: Sequence[CandidateArticle],
+        *,
+        storage: SQLiteTrackerStorage,
+        delivery_channel: str,
+        delivery_destination: str,
+    ) -> list[CandidateArticle]:
+        storage.expire_stale_deferred(
+            channel=delivery_channel,
+            destination=delivery_destination,
+            max_age_days=self.DEFERRED_MAX_AGE_DAYS,
+        )
+        deferred_candidates = storage.get_deferred_candidates(
+            channel=delivery_channel,
+            destination=delivery_destination,
+            max_age_days=self.DEFERRED_MAX_AGE_DAYS,
+            limit=100,
+        )
+        return [*list(candidates), *deferred_candidates]
 
     def _suppress_history(
         self,
@@ -90,7 +121,10 @@ class DigestBuilder:
 
     def _is_similar_to_history(self, alert, history: Sequence[dict]) -> bool:
         title_key = normalize_title(alert.candidate.title)
+        deferred_digest_key = alert.candidate.raw_article.metadata.get("deferred_digest_key")
         for item in history:
+            if deferred_digest_key and item.get("digest_key") == deferred_digest_key:
+                continue
             if item.get("competitor") != alert.competitor:
                 continue
             if item.get("topic_group") != alert.topic_group:
@@ -134,3 +168,7 @@ class DigestBuilder:
     @staticmethod
     def _freshness_sort_key(value: Optional[str]) -> str:
         return value or ""
+
+    @staticmethod
+    def _deferred_sort_key(alert) -> int:
+        return 0 if alert.candidate.raw_article.metadata.get("deferred_digest_key") else 1

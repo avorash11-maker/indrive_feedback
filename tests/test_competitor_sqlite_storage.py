@@ -128,3 +128,134 @@ def test_sqlite_storage_checks_and_marks_delivered(tmp_path):
         ).fetchone()
 
     assert row == ("delivered", "2026-05-18T09:06:00Z", "msg-123")
+
+
+def test_sqlite_storage_returns_only_recent_undelivered_deferred_candidates(tmp_path):
+    storage = SQLiteTrackerStorage(tmp_path / "tracker.db")
+
+    recent_undelivered = build_candidate()
+    delivered = CandidateArticle(
+        raw_article=RawArticle(
+            title="Uber expands courier service in Bogota",
+            url="https://example.com/uber-courier-co",
+            provider="newsapi",
+            source="Example News",
+            published_at="2026-05-18T10:00:00Z",
+            snippet="Courier launch in Colombia.",
+            query="\"Uber\" courier Colombia",
+            region="latam",
+            language="en",
+            competitor_hints=("Uber",),
+            metadata={"source_type": "news"},
+        ),
+        competitor="Uber",
+        topic_group="product_launch",
+        score=9,
+        matched_keywords=("launch",),
+        summary="Uber courier launch in Colombia.",
+        region="latam",
+        language_hint="en",
+        reasons=("new product rollout",),
+    )
+    expired = CandidateArticle(
+        raw_article=RawArticle(
+            title="Uber old alert in Guadalajara",
+            url="https://example.com/uber-old-mx",
+            provider="newsapi",
+            source="Example News",
+            published_at="2026-05-15T09:00:00Z",
+            snippet="Older signal.",
+            query="\"Uber\" old Mexico",
+            region="latam",
+            language="en",
+            competitor_hints=("Uber",),
+            metadata={"source_type": "news"},
+        ),
+        competitor="Uber",
+        topic_group="product_launch",
+        score=7,
+        matched_keywords=("launch",),
+        summary="Older Uber signal.",
+        region="latam",
+        language_hint="en",
+        reasons=("older",),
+    )
+
+    recent_alert = recent_undelivered.to_alert()
+    delivered_alert = delivered.to_alert()
+    expired_alert = expired.to_alert()
+    storage.insert_alert(recent_alert)
+    storage.insert_alert(delivered_alert)
+    storage.insert_alert(expired_alert)
+    storage.mark_deferred(
+        alert_key=recent_alert.digest_key,
+        channel="telegram",
+        destination="12345",
+    )
+    storage.mark_deferred(
+        alert_key=expired_alert.digest_key,
+        channel="telegram",
+        destination="12345",
+    )
+
+    storage.mark_delivered(
+        alert_key=delivered_alert.digest_key,
+        channel="telegram",
+        delivered_at="2026-05-18T10:05:00Z",
+        destination="12345",
+    )
+
+    with sqlite3.connect(tmp_path / "tracker.db") as connection:
+        connection.execute(
+            "UPDATE alerts SET created_at = datetime('now', '-3 days') WHERE digest_key = ?",
+            (expired_alert.digest_key,),
+        )
+        connection.commit()
+
+    deferred = storage.get_deferred_candidates(
+        channel="telegram",
+        destination="12345",
+        max_age_days=2,
+    )
+
+    assert [candidate.url for candidate in deferred] == [recent_undelivered.url]
+
+
+def test_sqlite_storage_marks_deferred_and_expires_stale_entries(tmp_path):
+    storage = SQLiteTrackerStorage(tmp_path / "tracker.db")
+    alert = build_candidate().to_alert()
+    storage.insert_alert(alert)
+
+    delivery_id = storage.mark_deferred(
+        alert_key=alert.digest_key,
+        channel="telegram",
+        destination="12345",
+        metadata={"mode": "daily_digest"},
+    )
+    assert delivery_id > 0
+
+    with sqlite3.connect(tmp_path / "tracker.db") as connection:
+        connection.execute(
+            "UPDATE alerts SET created_at = datetime('now', '-3 days') WHERE digest_key = ?",
+            (alert.digest_key,),
+        )
+        connection.commit()
+
+    expired_count = storage.expire_stale_deferred(
+        channel="telegram",
+        destination="12345",
+        max_age_days=2,
+    )
+
+    assert expired_count == 1
+    with sqlite3.connect(tmp_path / "tracker.db") as connection:
+        row = connection.execute(
+            """
+            SELECT status
+            FROM delivery_log
+            WHERE alert_key = ? AND channel = ? AND destination = ?
+            """,
+            (alert.digest_key, "telegram", "12345"),
+        ).fetchone()
+
+    assert row == ("expired",)

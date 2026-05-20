@@ -388,3 +388,145 @@ def test_post_ranking_llm_enrichment_only_applies_to_top_fifteen(tmp_path, monke
     assert len(llm_calls) == 15
     assert len(fallback_calls) == 1
     assert result["alert_schemas"][-1]["why_it_matters"] == "fallback"
+
+
+def test_telegram_delivery_uses_only_llm_targeted_top_slice(tmp_path, monkeypatch):
+    articles = build_capped_articles(16)
+    config = build_config(
+        daily_digest_limit=16,
+        competitors_by_region={"sea": [item.competitor_hints[0] for item in articles]},
+    )
+    patch_runtime(monkeypatch, tmp_path, config)
+    monkeypatch.setattr(cli, "build_providers", lambda names: [StaticProvider("mock_news", articles)])
+
+    class FakeAlertAnalyzer:
+        def __init__(self, use_llm, model=None):
+            self.use_llm = use_llm
+
+        def analyze_candidate(self, candidate, *, article_context=None):
+            return {
+                "competitor": candidate.competitor,
+                "region": candidate.region or "",
+                "country": candidate.country_hint or "",
+                "topic": candidate.topic_group,
+                "priority": "MEDIUM",
+                "what_happened": candidate.title,
+                "why_it_matters": "llm" if self.use_llm else "fallback",
+                "potential_impact": "impact",
+                "recommended_action": "act",
+                "confidence": 0.7,
+            }
+
+    sender_calls = {}
+
+    class FakeTelegramSender:
+        def __init__(self, storage, dry_run):
+            sender_calls["dry_run"] = dry_run
+
+        def send_daily_digest(self, alert_schemas, alerts, source_urls, generated_at):
+            sender_calls["alerts"] = len(alerts)
+            sender_calls["schemas"] = len(alert_schemas)
+            sender_calls["fallback_count"] = sum(
+                1 for item in alert_schemas if item["why_it_matters"] == "fallback"
+            )
+            return {"ok": True, "dry_run": True}
+
+    monkeypatch.setattr(cli, "CompetitorAlertAnalyzer", FakeAlertAnalyzer)
+    monkeypatch.setattr(cli, "TelegramSender", FakeTelegramSender)
+
+    result = cli.run_pipeline(
+        days=7,
+        min_score=5,
+        regions=["sea"],
+        telegram_mode="dry",
+    )
+
+    assert len(result["digest"].alerts) == 16
+    assert len(result["alert_schemas"]) == 16
+    assert result["alert_schemas"][-1]["why_it_matters"] == "fallback"
+    assert sender_calls == {
+        "dry_run": True,
+        "alerts": 15,
+        "schemas": 15,
+        "fallback_count": 0,
+    }
+
+
+def test_unsent_telegram_alert_is_carried_over_on_next_run(tmp_path, monkeypatch):
+    articles = build_capped_articles(16)
+    config = build_config(
+        daily_digest_limit=16,
+        competitors_by_region={"sea": [item.competitor_hints[0] for item in articles]},
+    )
+    patch_runtime(monkeypatch, tmp_path, config)
+
+    provider_calls = {"count": 0}
+
+    def fake_build_providers(names):
+        provider_calls["count"] += 1
+        if provider_calls["count"] == 1:
+            return [StaticProvider("mock_news", articles)]
+        return [StaticProvider("mock_news", [])]
+
+    class FakeAlertAnalyzer:
+        def __init__(self, use_llm, model=None):
+            self.use_llm = use_llm
+
+        def analyze_candidate(self, candidate, *, article_context=None):
+            return {
+                "competitor": candidate.competitor,
+                "region": candidate.region or "",
+                "country": candidate.country_hint or "",
+                "topic": candidate.topic_group,
+                "priority": "MEDIUM",
+                "what_happened": candidate.title,
+                "why_it_matters": "llm" if self.use_llm else "fallback",
+                "potential_impact": "impact",
+                "recommended_action": "act",
+                "confidence": 0.7,
+            }
+
+    class FakeTelegramSender:
+        def __init__(self, storage, dry_run):
+            self.storage = storage
+            self.chat_id = "12345"
+
+        def send_daily_digest(self, alert_schemas, alerts, source_urls, generated_at):
+            for alert in alerts:
+                self.storage.mark_delivered(
+                    alert_key=alert.digest_key,
+                    channel="telegram",
+                    delivered_at="2026-05-20T09:00:00Z",
+                    destination=self.chat_id,
+                )
+            return {"ok": True, "dry_run": False, "message_id": "1"}
+
+    monkeypatch.setattr(cli, "build_providers", fake_build_providers)
+    monkeypatch.setattr(cli, "CompetitorAlertAnalyzer", FakeAlertAnalyzer)
+    monkeypatch.setattr(cli, "TelegramSender", FakeTelegramSender)
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
+
+    first = cli.run_pipeline(
+        days=7,
+        min_score=5,
+        regions=["sea"],
+        telegram_mode="send",
+    )
+    second = cli.run_pipeline(
+        days=7,
+        min_score=5,
+        regions=["sea"],
+        telegram_mode="send",
+    )
+
+    assert len(first["digest"].alerts) == 16
+    assert len(second["digest"].alerts) == 1
+    assert second["digest"].alerts[0].digest_key == first["digest"].alerts[-1].digest_key
+
+    storage = SQLiteTrackerStorage(tmp_path / "output" / "tracker.db")
+    deferred_candidates = storage.get_deferred_candidates(
+        channel="telegram",
+        destination="12345",
+        max_age_days=2,
+    )
+    assert deferred_candidates == []

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from typing import Optional, Sequence
@@ -229,6 +230,22 @@ def build_delivery_alert_schemas(
     return alert_schemas, article_contexts
 
 
+def select_telegram_delivery_payload(
+    alerts,
+    alert_schemas,
+    article_contexts,
+    *,
+    llm_top_n: int = POST_RANKING_LLM_TOP_N,
+):
+    """Send only the post-ranking LLM-targeted top slice to Telegram."""
+    delivery_limit = min(len(alerts), max(0, llm_top_n))
+    return (
+        list(alerts[:delivery_limit]),
+        list(alert_schemas[:delivery_limit]),
+        list(article_contexts[:delivery_limit]),
+    )
+
+
 def run_pipeline(
     *,
     days: int,
@@ -261,6 +278,11 @@ def run_pipeline(
         regions=selected_regions,
         digest_limit=config.daily_digest_limit,
         storage=sqlite_storage,
+        delivery_channel="telegram" if telegram_mode in {"dry", "send"} else "daily_digest",
+        delivery_destination=os.getenv("TELEGRAM_CHAT_ID", "")
+        if telegram_mode in {"dry", "send"}
+        else "",
+        include_deferred=telegram_mode in {"dry", "send"},
     )
     sqlite_storage.insert_alerts(digest.alerts)
 
@@ -292,14 +314,30 @@ def run_pipeline(
     telegram_result = None
     notion_result = None
     if telegram_mode in {"dry", "send"}:
+        telegram_alerts, telegram_schemas, _ = select_telegram_delivery_payload(
+            digest.alerts,
+            alert_schemas,
+            article_contexts,
+        )
+        if telegram_mode == "send":
+            for alert in digest.alerts:
+                sqlite_storage.mark_deferred(
+                    alert_key=alert.digest_key,
+                    channel="telegram",
+                    destination=os.getenv("TELEGRAM_CHAT_ID", ""),
+                    metadata={
+                        "mode": "daily_digest",
+                        "generated_at": digest.generated_at,
+                    },
+                )
         sender = TelegramSender(
             storage=sqlite_storage,
             dry_run=telegram_mode == "dry",
         )
         telegram_result = sender.send_daily_digest(
-            alert_schemas,
-            alerts=digest.alerts,
-            source_urls=[alert.candidate.url for alert in digest.alerts],
+            telegram_schemas,
+            alerts=telegram_alerts,
+            source_urls=[alert.candidate.url for alert in telegram_alerts],
             generated_at=digest.generated_at,
         )
 

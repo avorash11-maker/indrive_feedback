@@ -465,6 +465,72 @@ class SQLiteTrackerStorage:
             ).fetchone()
         return int(row["id"])
 
+    def mark_deferred(
+        self,
+        *,
+        alert_key: str,
+        channel: str,
+        destination: str = "",
+        metadata: Optional[dict[str, str]] = None,
+    ) -> int:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO delivery_log (
+                    alert_key, channel, status, delivered_at, destination,
+                    external_id, error_message, metadata_json
+                ) VALUES (?, ?, 'deferred', NULL, ?, '', '', ?)
+                ON CONFLICT(alert_key, channel, destination) DO UPDATE SET
+                    status = CASE
+                        WHEN delivery_log.status = 'delivered' THEN delivery_log.status
+                        ELSE 'deferred'
+                    END,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    alert_key,
+                    channel,
+                    destination,
+                    _json_dumps(metadata or {}),
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT id
+                FROM delivery_log
+                WHERE alert_key = ? AND channel = ? AND destination = ?
+                """,
+                (alert_key, channel, destination),
+            ).fetchone()
+        return int(row["id"])
+
+    def expire_stale_deferred(
+        self,
+        *,
+        channel: str,
+        destination: str = "",
+        max_age_days: int = 2,
+    ) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE delivery_log
+                SET status = 'expired',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE channel = ?
+                  AND destination = ?
+                  AND status = 'deferred'
+                  AND alert_key IN (
+                      SELECT digest_key
+                      FROM alerts
+                      WHERE created_at < datetime('now', ?)
+                  )
+                """,
+                (channel, destination, f"-{max_age_days} days"),
+            )
+        return int(cursor.rowcount or 0)
+
     def get_recent_alert_history(self, limit: int = 200) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -491,3 +557,86 @@ class SQLiteTrackerStorage:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_deferred_candidates(
+        self,
+        *,
+        channel: str,
+        destination: str = "",
+        max_age_days: int = 2,
+        limit: int = 100,
+    ) -> list[CandidateArticle]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    a.digest_key,
+                    a.priority,
+                    a.confidence,
+                    a.score AS alert_score,
+                    c.competitor,
+                    c.topic_group,
+                    c.score AS candidate_score,
+                    c.matched_keywords_json,
+                    c.summary,
+                    c.region,
+                    c.country_hint,
+                    c.language_hint,
+                    c.reasons_json,
+                    r.title,
+                    r.url,
+                    r.provider,
+                    r.source,
+                    r.published_at,
+                    r.snippet,
+                    r.query_text,
+                    r.language,
+                    r.competitor_hints_json,
+                    r.metadata_json
+                FROM alerts a
+                JOIN article_candidates c ON c.id = a.candidate_id
+                JOIN articles_raw r ON r.id = c.raw_article_id
+                JOIN delivery_log d
+                    ON d.alert_key = a.digest_key
+                   AND d.channel = ?
+                   AND d.destination = ?
+                WHERE d.status = 'deferred'
+                  AND a.created_at >= datetime('now', ?)
+                ORDER BY COALESCE(r.published_at, a.created_at) DESC, a.id DESC
+                LIMIT ?
+                """,
+                (channel, destination, f"-{max_age_days} days", limit),
+            ).fetchall()
+
+        deferred_candidates: list[CandidateArticle] = []
+        for row in rows:
+            metadata = json.loads(row["metadata_json"] or "{}")
+            metadata["deferred_digest_key"] = row["digest_key"]
+            raw_article = RawArticle(
+                title=row["title"],
+                url=row["url"],
+                provider=row["provider"],
+                source=row["source"],
+                published_at=row["published_at"],
+                snippet=row["snippet"],
+                query=row["query_text"],
+                region=row["region"],
+                language=row["language"],
+                competitor_hints=tuple(json.loads(row["competitor_hints_json"] or "[]")),
+                metadata=metadata,
+            )
+            deferred_candidates.append(
+                CandidateArticle(
+                    raw_article=raw_article,
+                    competitor=row["competitor"],
+                    topic_group=row["topic_group"],
+                    score=int(row["candidate_score"]),
+                    matched_keywords=tuple(json.loads(row["matched_keywords_json"] or "[]")),
+                    summary=row["summary"],
+                    region=row["region"],
+                    country_hint=row["country_hint"],
+                    language_hint=row["language_hint"],
+                    reasons=tuple(json.loads(row["reasons_json"] or "[]")),
+                )
+            )
+        return deferred_candidates

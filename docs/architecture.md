@@ -46,6 +46,16 @@ Regions, competitors, topic groups, query templates, provider list, and digest l
 
 The system is designed to decide “what is worth showing today”, not just “what was found”.
 
+### Managed carry-over
+
+The Telegram path is not a blind retry queue. The tracker keeps a bounded carry-over model:
+
+- alerts sent to Telegram become `delivered`
+- relevant alerts that miss the Telegram top slice become `deferred`
+- deferred alerts can re-enter ranking on the next Telegram run
+- deferred alerts expire after `48 hours`
+- stale carry-over alerts get a slight ranking penalty versus equally strong fresh alerts
+
 ## System Components
 
 ```mermaid
@@ -146,12 +156,14 @@ Responsibilities:
 - rank by:
   - priority
   - freshness
+  - deferred penalty
   - confidence
   - score
 - suppress duplicates within one run
 - suppress alerts already sent in previous runs
 - suppress near-duplicate alerts from recent history
 - apply top-N digest limit
+- re-introduce fresh `deferred` Telegram alerts for the next run without keeping them forever
 
 ### Storage
 
@@ -169,6 +181,13 @@ Current `SQLite` tables:
 - `alerts`
 - `runs`
 - `delivery_log`
+
+Delivery log statuses now have operational meaning:
+
+- `delivered` — successfully sent to Telegram
+- `deferred` — relevant but did not fit into the current Telegram top slice
+- `expired` — deferred too long and no longer retried
+- `dry_run` — previewed without a real delivery attempt
 
 ### Delivery and Mirror Layers
 
@@ -221,6 +240,7 @@ Candidates become alerts, then the digest builder:
 - compares against history
 - suppresses repeats
 - trims the result to a daily cap
+- optionally merges the Telegram `deferred` pool back into the next ranking pass
 
 ### 6. Artifacts and Delivery
 
@@ -238,6 +258,8 @@ And optionally:
 - sends digest to Telegram
 - mirrors alerts to Notion
 
+Telegram-specific carry-over only applies to the delivery path. Local-only runs still produce artifacts and history, but they do not keep building an endless retry queue.
+
 ## Low-Cost Daily Digest Strategy
 
 The MVP is intentionally optimized for low-cost daily operation:
@@ -246,6 +268,7 @@ The MVP is intentionally optimized for low-cost daily operation:
 - most filtering happens before any richer analysis step
 - `SQLite` keeps history local and cheap
 - digest cap prevents operational overload
+- deferred carry-over prevents relevant alerts from disappearing while still avoiding a Telegram firehose
 - markdown and CSV artifacts make manual QA simple during live trial periods
 
 ## Reliability Strategy

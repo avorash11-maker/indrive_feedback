@@ -17,6 +17,11 @@ The current MVP is optimized for a practical daily monitoring loop:
 - A rule-based prefilter detects competitor, topic, region, country/language hints, and baseline score before any LLM call.
 - Digest ranking prioritizes `priority -> freshness -> confidence/score`.
 - Duplicate suppression works both within one run and across history.
+- Telegram delivery uses a bounded carry-over queue:
+  - `delivered` alerts are not retried
+  - relevant alerts that miss the Telegram top cap become `deferred`
+  - deferred alerts can compete again on the next Telegram run for up to `48 hours`
+  - stale deferred alerts become `expired`
 - Final alerts can be:
   - previewed locally as `JSON`, `Markdown`, optional `CSV`
   - sent to `Telegram`
@@ -30,6 +35,7 @@ The design goal is not “use AI everywhere”, but “use AI only where it help
 - `Cheap before smart`: rule-based filtering reduces unnecessary LLM usage and lowers daily cost.
 - `Config over code`: new regions, competitors, and topic groups can be adjusted without rewriting pipeline logic.
 - `Digest, not firehose`: suppression and ranking keep the daily output readable for humans.
+- `Carry-over, not loss`: relevant alerts that miss today's Telegram window can re-enter the next run, but only for a limited time.
 - `Optional integrations`: Telegram and Notion are delivery layers, not core state.
 
 ## Current Stack
@@ -208,6 +214,10 @@ Telegram is the main delivery channel for the MVP.
 - supports `dry-run`
 - logs delivery history into `SQLite`
 - enables suppression of already sent alerts
+- keeps a Telegram-specific `deferred` queue for relevant alerts that miss the top slice
+- retries deferred alerts for up to `48 hours`
+- marks stale deferred alerts as `expired`
+- gives fresh new alerts a slight ranking advantage over yesterday's carry-over alerts
 
 ### Notion
 
