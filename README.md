@@ -167,6 +167,7 @@ Important config contract:
 - For competitors that are valid in multiple regions, region is not inferred from competitor alone. The tracker uses detected geo/country hints first; if those hints are missing or ambiguous, it preserves the pipeline-detected region when available or leaves region empty rather than trusting an LLM guess.
 - Final alert schemas can include internal provenance flags such as `competitor_source`, `region_source`, `country_source`, and `geo_validation_fallback` for QA and downstream validation.
 - `country` validation understands configured country vocabulary plus common aliases and ISO-style country codes.
+- Local review artifacts such as markdown preview and review CSV should expose geo/date validation outcomes for manual QA, while the Telegram card should stay concise and human-readable.
 
 The default MVP config is now aligned to these monitoring themes:
 

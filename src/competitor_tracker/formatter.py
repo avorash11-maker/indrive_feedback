@@ -109,6 +109,11 @@ def format_daily_digest_markdown(
                 f"- Приоритет: {_clean(str(alert.get('priority', '')).upper())}",
                 f"- Рынок: {market}",
                 f"- Уверенность: {_clean(alert.get('confidence'))}",
+                f"- Валидация geo/date: competitor={_clean(alert.get('competitor_source') or 'n/a')}, "
+                f"region={_clean(alert.get('region_source') or 'n/a')}, "
+                f"country={_clean(alert.get('country_source') or 'n/a')}, "
+                f"date={_clean(alert.get('published_date_source') or 'unknown')}, "
+                f"fallback={_clean(alert.get('geo_validation_fallback'))}",
                 "",
                 "### Что произошло",
                 _clean(alert.get("what_happened")),

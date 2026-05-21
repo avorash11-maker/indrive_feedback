@@ -30,15 +30,21 @@ def build_candidate() -> CandidateArticle:
 def build_alert_schema() -> dict:
     return {
         "competitor": "Grab",
+        "competitor_source": "pipeline",
         "region": "sea",
+        "region_source": "pipeline",
         "country": "Philippines",
+        "country_source": "pipeline",
         "topic": "driver_support",
         "priority": "medium",
+        "published_date": "2026-05-19",
+        "published_date_source": "metadata",
         "what_happened": "Grab launched a new driver support package in Manila.",
         "why_it_matters": "This can strengthen driver loyalty and brand perception.",
         "potential_impact": "Higher driver retention and stronger narrative in the market.",
         "recommended_action": "Compare with local inDrive messaging and benefits.",
         "confidence": 0.82,
+        "geo_validation_fallback": False,
     }
 
 
@@ -52,12 +58,15 @@ def test_json_file_storage_saves_markdown_preview_and_csv(tmp_path):
         [build_alert_schema()],
         generated_at="2026-05-19T09:00:00Z",
     )
-    csv_path = storage.save_candidates_csv([candidate])
+    csv_path = storage.save_candidates_csv([candidate], alert_schemas=[build_alert_schema()])
 
     preview_text = preview_path.read_text(encoding="utf-8")
     assert "Ежедневный превью-дайджест competitor tracker" in preview_text
     assert "### Что произошло" in preview_text
     assert "https://example.com/grab-driver-support" in preview_text
+    assert "Валидация geo/date:" in preview_text
+    assert "competitor=pipeline" in preview_text
+    assert "date=metadata" in preview_text
 
     with csv_path.open(encoding="utf-8", newline="") as csv_file:
         rows = list(csv.DictReader(csv_file))
@@ -65,6 +74,12 @@ def test_json_file_storage_saves_markdown_preview_and_csv(tmp_path):
     assert len(rows) == 1
     assert rows[0]["competitor"] == "Grab"
     assert rows[0]["country_hint"] == "Philippines"
+    assert rows[0]["final_country"] == "Philippines"
+    assert rows[0]["published_date_source"] == "metadata"
+    assert rows[0]["competitor_source"] == "pipeline"
+    assert rows[0]["region_source"] == "pipeline"
+    assert rows[0]["country_source"] == "pipeline"
+    assert rows[0]["geo_validation_fallback"] == "False"
     assert rows[0]["matched_keywords"] == "driver support | bonus"
 
 

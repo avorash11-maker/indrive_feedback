@@ -92,7 +92,11 @@ class JsonFileStorage:
         )
         return output_path
 
-    def save_candidates_csv(self, candidates: Sequence[CandidateArticle]) -> Path:
+    def save_candidates_csv(
+        self,
+        candidates: Sequence[CandidateArticle],
+        alert_schemas: Optional[Sequence[dict[str, Any]]] = None,
+    ) -> Path:
         output_path = self.base_dir / "candidates_review.csv"
         with output_path.open("w", encoding="utf-8", newline="") as csv_file:
             writer = csv.DictWriter(
@@ -105,6 +109,15 @@ class JsonFileStorage:
                     "region",
                     "country_hint",
                     "language_hint",
+                    "final_competitor",
+                    "final_region",
+                    "final_country",
+                    "published_date",
+                    "published_date_source",
+                    "competitor_source",
+                    "region_source",
+                    "country_source",
+                    "geo_validation_fallback",
                     "title",
                     "source",
                     "published_at",
@@ -115,7 +128,12 @@ class JsonFileStorage:
                 ],
             )
             writer.writeheader()
-            for candidate in candidates:
+            for index, candidate in enumerate(candidates):
+                alert_schema = (
+                    alert_schemas[index]
+                    if alert_schemas is not None and index < len(alert_schemas)
+                    else {}
+                )
                 writer.writerow(
                     {
                         "competitor": candidate.competitor,
@@ -125,6 +143,15 @@ class JsonFileStorage:
                         "region": candidate.region or "",
                         "country_hint": candidate.country_hint or "",
                         "language_hint": candidate.language_hint or "",
+                        "final_competitor": alert_schema.get("competitor", ""),
+                        "final_region": alert_schema.get("region", ""),
+                        "final_country": alert_schema.get("country", ""),
+                        "published_date": alert_schema.get("published_date", ""),
+                        "published_date_source": alert_schema.get("published_date_source", ""),
+                        "competitor_source": alert_schema.get("competitor_source", ""),
+                        "region_source": alert_schema.get("region_source", ""),
+                        "country_source": alert_schema.get("country_source", ""),
+                        "geo_validation_fallback": alert_schema.get("geo_validation_fallback", ""),
                         "title": candidate.title,
                         "source": candidate.raw_article.source,
                         "published_at": candidate.raw_article.published_at or "",

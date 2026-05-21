@@ -408,7 +408,11 @@ def run_pipeline(
         alert_schemas,
         generated_at=digest.generated_at,
     )
-    candidates_csv_path = storage.save_candidates_csv(analysis.candidates) if export_csv else None
+    candidates_csv_path = (
+        storage.save_candidates_csv(analysis.candidates, alert_schemas=alert_schemas)
+        if export_csv
+        else None
+    )
     run_summary = RunSummary(
         started_at=datetime.now(timezone.utc).isoformat(),
         finished_at=datetime.now(timezone.utc).isoformat(),

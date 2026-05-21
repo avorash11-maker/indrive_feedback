@@ -295,6 +295,7 @@ Candidates become alerts, then the digest builder:
 Before final alert delivery, LLM enrichment is allowed to improve narrative fields, but `competitor` and `region` remain constrained by pipeline-detected values and config validation.
 The same principle applies to `country`: a detected `candidate.country_hint` stays primary, while region-level `country_validation_terms` improve recall for otherwise safe LLM country values.
 The tracker also keeps internal provenance markers such as `competitor_source`, `region_source`, `country_source`, and `geo_validation_fallback` so validation outcomes remain inspectable without changing the human-readable formatter.
+Those validation markers should be visible in local review artifacts like markdown preview and CSV export, but they should not clutter the Telegram delivery card.
 
 ### 6. Artifacts and Delivery
 
