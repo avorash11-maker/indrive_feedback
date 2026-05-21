@@ -3,26 +3,31 @@
     "latam": {
       "label": "Latin America",
       "geo_terms": ["Mexico", "Brazil", "Colombia", "Peru", "Chile", "LATAM"],
+      "country_validation_terms": ["Mexico", "MX", "Brazil", "BR", "Colombia", "CO", "Peru", "PE", "Chile", "CL", "Argentina", "AR", "Ecuador", "EC", "Uruguay", "UY", "Paraguay", "PY", "Bolivia", "BO", "Costa Rica", "CR", "Dominican Republic", "DO", "Guatemala", "GT", "Panama", "PA"],
       "language_hints": ["es", "pt", "en"]
     },
     "africa": {
       "label": "Africa",
       "geo_terms": ["South Africa", "Kenya", "Nigeria", "Egypt", "Africa"],
+      "country_validation_terms": ["South Africa", "ZA", "Kenya", "KE", "Nigeria", "NG", "Egypt", "EG", "Morocco", "MA", "Ghana", "GH", "Tanzania", "TZ", "Uganda", "UG", "Ivory Coast", "Cote d'Ivoire", "Senegal", "SN", "Tunisia", "TN", "Algeria", "DZ", "Ethiopia", "ET"],
       "language_hints": ["en", "fr", "sw"]
     },
     "mea": {
       "label": "Middle East",
       "geo_terms": ["Saudi Arabia", "UAE", "Qatar", "Jordan", "MEA"],
+      "country_validation_terms": ["Saudi Arabia", "SA", "KSA", "UAE", "AE", "United Arab Emirates", "Qatar", "QA", "Jordan", "JO", "Bahrain", "BH", "Kuwait", "KW", "Oman", "OM", "Iraq", "IQ", "Lebanon", "LB", "Egypt", "EG", "Algeria", "DZ", "Morocco", "MA", "Nigeria", "NG", "Kenya", "KE", "South Africa", "ZA"],
       "language_hints": ["ar", "en", "fr"]
     },
     "sea": {
       "label": "Southeast Asia",
       "geo_terms": ["Indonesia", "Thailand", "Vietnam", "Philippines", "SEA"],
+      "country_validation_terms": ["Indonesia", "ID", "Thailand", "TH", "Vietnam", "VN", "Philippines", "PH", "Singapore", "SG", "Malaysia", "MY", "Cambodia", "KH", "Laos", "LA", "Myanmar", "MM", "Brunei", "BN"],
       "language_hints": ["en", "id", "th", "vi"]
     },
     "cis_central_asia": {
       "label": "CIS / Central Asia",
       "geo_terms": ["Kazakhstan", "Uzbekistan", "Kyrgyzstan", "Georgia", "CIS", "Central Asia"],
+      "country_validation_terms": ["Russia", "RU", "Russian Federation", "Kazakhstan", "KZ", "Uzbekistan", "UZ", "Belarus", "BY", "Kyrgyzstan", "KG", "Georgia", "GE", "Armenia", "AM", "Azerbaijan", "AZ", "Tajikistan", "TJ", "Mongolia", "MN"],
       "language_hints": ["ru", "en", "kk", "uz"]
     }
   },

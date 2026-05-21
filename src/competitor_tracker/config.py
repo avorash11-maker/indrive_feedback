@@ -30,6 +30,7 @@ class RegionConfig:
 
     label: str
     geo_terms: Tuple[str, ...]
+    country_validation_terms: Tuple[str, ...]
     language_hints: Tuple[str, ...]
 
 
@@ -65,6 +66,9 @@ class TrackerConfig:
             region_key: RegionConfig(
                 label=region_data["label"].strip(),
                 geo_terms=_dedupe_keep_order(region_data["geo_terms"]),
+                country_validation_terms=_dedupe_keep_order(
+                    region_data.get("country_validation_terms", region_data["geo_terms"])
+                ),
                 language_hints=_dedupe_keep_order(region_data["language_hints"]),
             )
             for region_key, region_data in payload["regions"].items()
@@ -120,11 +124,19 @@ class TrackerConfig:
                 raise ValueError(f"Region '{region_key}' must be an object")
             label = region_data.get("label")
             geo_terms = region_data.get("geo_terms")
+            country_validation_terms = region_data.get("country_validation_terms")
             language_hints = region_data.get("language_hints")
             if not isinstance(label, str) or not label.strip():
                 raise ValueError(f"Region '{region_key}' must have a non-empty label")
             if not isinstance(geo_terms, list) or not any(term.strip() for term in geo_terms):
                 raise ValueError(f"Region '{region_key}' must define non-empty geo_terms")
+            if country_validation_terms is not None and (
+                not isinstance(country_validation_terms, list)
+                or not any(term.strip() for term in country_validation_terms)
+            ):
+                raise ValueError(
+                    f"Region '{region_key}' must define non-empty country_validation_terms when provided"
+                )
             if not isinstance(language_hints, list) or not any(
                 hint.strip() for hint in language_hints
             ):

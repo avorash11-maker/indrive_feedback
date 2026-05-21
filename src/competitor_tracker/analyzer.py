@@ -20,6 +20,105 @@ from .models import ArticleContext, CandidateArticle, RawArticle
 logger = logging.getLogger(__name__)
 
 
+COUNTRY_ALIAS_MAP = {
+    "ae": "United Arab Emirates",
+    "uae": "United Arab Emirates",
+    "u a e": "United Arab Emirates",
+    "united arab emirates": "United Arab Emirates",
+    "sa": "Saudi Arabia",
+    "ksa": "Saudi Arabia",
+    "saudi": "Saudi Arabia",
+    "saudi arabia": "Saudi Arabia",
+    "qa": "Qatar",
+    "jo": "Jordan",
+    "bh": "Bahrain",
+    "kw": "Kuwait",
+    "om": "Oman",
+    "iq": "Iraq",
+    "lb": "Lebanon",
+    "eg": "Egypt",
+    "egypt": "Egypt",
+    "mx": "Mexico",
+    "mexico": "Mexico",
+    "br": "Brazil",
+    "brazil": "Brazil",
+    "brasil": "Brazil",
+    "co": "Colombia",
+    "colombia": "Colombia",
+    "pe": "Peru",
+    "peru": "Peru",
+    "cl": "Chile",
+    "chile": "Chile",
+    "ar": "Argentina",
+    "argentina": "Argentina",
+    "ec": "Ecuador",
+    "ecuador": "Ecuador",
+    "uy": "Uruguay",
+    "py": "Paraguay",
+    "bo": "Bolivia",
+    "cr": "Costa Rica",
+    "do": "Dominican Republic",
+    "gt": "Guatemala",
+    "pa": "Panama",
+    "za": "South Africa",
+    "south africa": "South Africa",
+    "ke": "Kenya",
+    "kenya": "Kenya",
+    "ng": "Nigeria",
+    "nigeria": "Nigeria",
+    "ma": "Morocco",
+    "morocco": "Morocco",
+    "gh": "Ghana",
+    "tz": "Tanzania",
+    "ug": "Uganda",
+    "ci": "Cote d'Ivoire",
+    "cote d'ivoire": "Cote d'Ivoire",
+    "cote divoire": "Cote d'Ivoire",
+    "côte d'ivoire": "Cote d'Ivoire",
+    "côte divoire": "Cote d'Ivoire",
+    "ivory coast": "Ivory Coast",
+    "sn": "Senegal",
+    "tn": "Tunisia",
+    "dz": "Algeria",
+    "algeria": "Algeria",
+    "et": "Ethiopia",
+    "id": "Indonesia",
+    "indonesia": "Indonesia",
+    "th": "Thailand",
+    "thailand": "Thailand",
+    "vn": "Vietnam",
+    "vietnam": "Vietnam",
+    "ph": "Philippines",
+    "philippines": "Philippines",
+    "sg": "Singapore",
+    "singapore": "Singapore",
+    "my": "Malaysia",
+    "malaysia": "Malaysia",
+    "kh": "Cambodia",
+    "la": "Laos",
+    "mm": "Myanmar",
+    "bn": "Brunei",
+    "ru": "Russia",
+    "russia": "Russia",
+    "russian federation": "Russia",
+    "kz": "Kazakhstan",
+    "kazakhstan": "Kazakhstan",
+    "uz": "Uzbekistan",
+    "uzbekistan": "Uzbekistan",
+    "by": "Belarus",
+    "belarus": "Belarus",
+    "kg": "Kyrgyzstan",
+    "kyrgyzstan": "Kyrgyzstan",
+    "ge": "Georgia",
+    "georgia": "Georgia",
+    "am": "Armenia",
+    "armenia": "Armenia",
+    "az": "Azerbaijan",
+    "tj": "Tajikistan",
+    "mn": "Mongolia",
+}
+
+
 @dataclass(slots=True)
 class AnalysisResult:
     """Analyzer output for a batch of mentions."""
@@ -240,7 +339,10 @@ class CompetitorAnalyzer:
 
         if article.region and article.region in self.config.regions:
             region_config = self.config.regions[article.region]
-            return article.region, region_config.geo_terms[0] if region_config.geo_terms else None
+            for geo_term in region_config.geo_terms:
+                if geo_term.casefold() in text_blob:
+                    return article.region, geo_term
+            return article.region, None
 
         for region in regions:
             region_config = self.config.regions[region]
@@ -616,7 +718,10 @@ When writing:
             )
             content = response.choices[0].message.content.strip()
             content = re.sub(r"^```json\s*|\s*```$", "", content, flags=re.I | re.S)
-            return self._normalize_alert(json.loads(content), candidate=candidate)
+            return self._normalize_alert(
+                json.loads(content),
+                apply_truth_validation=False,
+            )
         except Exception as exc:
             logger.warning(
                 "Competitor alert LLM analysis failed; falling back to rule-based alert. title=%r url=%r error=%s",
@@ -684,6 +789,7 @@ When writing:
         alert: dict[str, Any],
         *,
         candidate: Optional[CandidateArticle] = None,
+        apply_truth_validation: bool = True,
     ) -> dict[str, Any]:
         normalized = dict(alert)
         normalized["competitor"] = CompetitorAlertAnalyzer._clean_text(
@@ -733,6 +839,8 @@ When writing:
         except Exception:
             confidence = 0.0
         normalized["confidence"] = max(0.0, min(1.0, confidence))
+        if not apply_truth_validation:
+            return normalized
         return self._enforce_competitor_region_truth(normalized, candidate=candidate)
 
     def _enforce_competitor_region_truth(
@@ -750,30 +858,179 @@ When writing:
         fallback_country = candidate.country_hint if candidate is not None else ""
 
         competitor = normalized.get("competitor", "")
-        region = normalized.get("region", "")
+        geo_validation_fallback = False
 
         if fallback_competitor and competitor != fallback_competitor:
-            allowed_regions = self.config.region_for_competitor(competitor)
-            if not allowed_regions or (fallback_region and fallback_region not in allowed_regions):
-                normalized["competitor"] = fallback_competitor
-                competitor = fallback_competitor
+            normalized["competitor"] = fallback_competitor
+            competitor = fallback_competitor
+            geo_validation_fallback = True
 
-        if region and not self.config.is_competitor_allowed_in_region(competitor, region):
-            if fallback_region and self.config.is_competitor_allowed_in_region(competitor, fallback_region):
-                normalized["region"] = fallback_region
-                region = fallback_region
-            else:
-                valid_regions = self.config.region_for_competitor(competitor)
-                normalized["region"] = valid_regions[0] if len(valid_regions) == 1 else ""
-                region = normalized["region"]
+        resolved_region, region_fallback, region_source_hint = self._resolve_safe_region(
+            competitor=competitor,
+            llm_region=normalized.get("region", ""),
+            llm_country=normalized.get("country", ""),
+            fallback_region=fallback_region,
+            fallback_country=fallback_country,
+        )
+        normalized["region"] = resolved_region
+        geo_validation_fallback = geo_validation_fallback or region_fallback
 
-        if not normalized.get("region") and fallback_region:
-            normalized["region"] = fallback_region
-
-        if fallback_country and normalized.get("region") == fallback_region:
-            normalized["country"] = fallback_country
+        country_value, country_source, country_fallback = self._resolve_safe_country(
+            llm_country=normalized.get("country", ""),
+            region=normalized.get("region", ""),
+            fallback_region=fallback_region,
+            fallback_country=fallback_country,
+        )
+        normalized["country"] = country_value
+        geo_validation_fallback = geo_validation_fallback or country_fallback
+        normalized["competitor_source"] = self._resolve_identity_source(
+            final_value=normalized.get("competitor", ""),
+            llm_value=alert.get("competitor", ""),
+            pipeline_value=fallback_competitor,
+        )
+        normalized["region_source"] = region_source_hint or self._resolve_identity_source(
+            final_value=normalized.get("region", ""),
+            llm_value=alert.get("region", ""),
+            pipeline_value=fallback_region,
+        )
+        normalized["country_source"] = country_source
+        normalized["geo_validation_fallback"] = geo_validation_fallback
 
         return normalized
+
+    def _resolve_safe_region(
+        self,
+        *,
+        competitor: str,
+        llm_region: str,
+        llm_country: str,
+        fallback_region: str,
+        fallback_country: str,
+    ) -> tuple[str, bool, Optional[str]]:
+        if self.config is None:
+            cleaned_region = self._clean_text(llm_region)
+            return cleaned_region, False, None
+
+        cleaned_llm_region = self._clean_text(llm_region)
+        cleaned_fallback_region = self._clean_text(fallback_region)
+        allowed_regions = self.config.region_for_competitor(competitor)
+
+        if cleaned_fallback_region:
+            region_changed = cleaned_llm_region not in {"", cleaned_fallback_region}
+            return cleaned_fallback_region, region_changed, "pipeline"
+
+        if not allowed_regions:
+            return "", bool(cleaned_llm_region), None
+
+        if len(allowed_regions) == 1:
+            only_region = allowed_regions[0]
+            if not cleaned_llm_region:
+                return only_region, False, None
+            return only_region, cleaned_llm_region != only_region, None
+
+        country_regions = self._regions_matching_country(
+            fallback_country or llm_country,
+            allowed_regions=allowed_regions,
+        )
+        if len(country_regions) == 1:
+            resolved_region = country_regions[0]
+            if cleaned_llm_region and cleaned_llm_region != resolved_region:
+                return resolved_region, True, "geo_country_override"
+            return resolved_region, False, "geo_country_override"
+
+        if cleaned_llm_region and cleaned_llm_region not in allowed_regions:
+            return "", True, None
+        if cleaned_llm_region:
+            return "", True, None
+        return "", False, None
+
+    def _resolve_safe_country(
+        self,
+        *,
+        llm_country: str,
+        region: str,
+        fallback_region: str,
+        fallback_country: str,
+    ) -> tuple[str, str, bool]:
+        if self.config is None:
+            cleaned_country = self._clean_text(llm_country)
+            return cleaned_country, ("llm" if cleaned_country else "empty"), False
+
+        cleaned_country = self._clean_text(llm_country)
+        cleaned_fallback_country = self._clean_text(fallback_country)
+        cleaned_region = self._clean_text(region)
+
+        if cleaned_fallback_country:
+            if not cleaned_country:
+                return cleaned_fallback_country, "pipeline", False
+            if cleaned_region == fallback_region and cleaned_country != cleaned_fallback_country:
+                return cleaned_fallback_country, "pipeline", True
+            return cleaned_fallback_country, "pipeline", cleaned_country != cleaned_fallback_country
+
+        if not cleaned_country or not cleaned_region or cleaned_region not in self.config.regions:
+            return "", "empty", bool(cleaned_country)
+
+        allowed_geo_terms = self._allowed_country_terms_for_region(cleaned_region)
+        normalized_country_key = self._normalize_country_key(cleaned_country)
+        if normalized_country_key in allowed_geo_terms:
+            return allowed_geo_terms[normalized_country_key], "llm", False
+        return "", "empty", True
+
+    @staticmethod
+    def _resolve_identity_source(
+        *,
+        final_value: str,
+        llm_value: str,
+        pipeline_value: str,
+    ) -> str:
+        cleaned_final = CompetitorAlertAnalyzer._clean_text(final_value)
+        cleaned_llm = CompetitorAlertAnalyzer._clean_text(llm_value)
+        cleaned_pipeline = CompetitorAlertAnalyzer._clean_text(pipeline_value)
+        if cleaned_pipeline and cleaned_final == cleaned_pipeline:
+            return "pipeline"
+        if cleaned_llm and cleaned_final == cleaned_llm:
+            return "llm"
+        return "empty"
+
+    def _allowed_country_terms_for_region(self, region: str) -> dict[str, str]:
+        allowed_terms: dict[str, str] = {}
+        for term in self.config.regions[region].country_validation_terms:
+            cleaned_term = self._clean_text(term)
+            if not cleaned_term:
+                continue
+            normalized_key = self._normalize_country_key(cleaned_term)
+            allowed_terms.setdefault(normalized_key, cleaned_term)
+        return allowed_terms
+
+    def _regions_matching_country(
+        self,
+        country: str,
+        *,
+        allowed_regions: Sequence[str],
+    ) -> tuple[str, ...]:
+        if self.config is None:
+            return ()
+
+        cleaned_country = self._clean_text(country)
+        if not cleaned_country:
+            return ()
+
+        normalized_country_key = self._normalize_country_key(cleaned_country)
+        matching_regions = []
+        for region in allowed_regions:
+            allowed_terms = self._allowed_country_terms_for_region(region)
+            if normalized_country_key in allowed_terms:
+                matching_regions.append(region)
+        return tuple(matching_regions)
+
+    @staticmethod
+    def _normalize_country_key(value: str) -> str:
+        cleaned = re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+        return re.sub(
+            r"\s+",
+            " ",
+            COUNTRY_ALIAS_MAP.get(cleaned, cleaned).casefold(),
+        ).strip()
 
     @staticmethod
     def _clean_text(value: str) -> str:

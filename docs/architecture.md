@@ -126,6 +126,7 @@ Responsibilities:
 - define topic groups and keyword templates
 - expand search queries for providers
 - provide the strict competitor-by-region validation matrix for downstream checks
+- allow broader `country_validation_terms` for post-LLM country safety checks
 - keep runtime settings separate from domain config
 
 Default monitoring themes currently encoded in config:
@@ -181,6 +182,9 @@ Responsibilities:
 - assign baseline score and reasons
 - treat detected `competitor` and `region` as pipeline-owned signals during LLM enrichment
 - prevent free-form LLM overrides of `competitor` and `region` unless article evidence clearly disproves the pipeline signal
+- validate final `country` values against `candidate.country_hint` plus region-level `country_validation_terms`
+- when a competitor is valid in multiple regions, resolve region from detected geo/country evidence first; if that evidence is missing or ambiguous, keep the pipeline-detected region when available or leave region empty instead of trusting an LLM guess
+- emit internal provenance flags so downstream QA can see whether final `competitor`, `region`, and `country` came from pipeline or survived LLM enrichment
 - produce alert-ready schema for readable delivery
 
 ### Ranking and Suppression
@@ -289,6 +293,8 @@ Candidates become alerts, then the digest builder:
 - optionally merges the Telegram `deferred` pool back into the next ranking pass
 
 Before final alert delivery, LLM enrichment is allowed to improve narrative fields, but `competitor` and `region` remain constrained by pipeline-detected values and config validation.
+The same principle applies to `country`: a detected `candidate.country_hint` stays primary, while region-level `country_validation_terms` improve recall for otherwise safe LLM country values.
+The tracker also keeps internal provenance markers such as `competitor_source`, `region_source`, `country_source`, and `geo_validation_fallback` so validation outcomes remain inspectable without changing the human-readable formatter.
 
 ### 6. Artifacts and Delivery
 

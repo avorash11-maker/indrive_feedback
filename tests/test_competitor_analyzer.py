@@ -12,11 +12,13 @@ def build_config() -> TrackerConfig:
                 "latam": {
                     "label": "Latin America",
                     "geo_terms": ["Mexico", "Brazil"],
+                    "country_validation_terms": ["Mexico", "Brazil", "Argentina"],
                     "language_hints": ["es", "pt", "en"],
                 },
                 "sea": {
                     "label": "Southeast Asia",
                     "geo_terms": ["Indonesia", "Thailand", "Vietnam"],
+                    "country_validation_terms": ["Indonesia", "Thailand", "Vietnam", "Philippines", "Singapore", "Malaysia"],
                     "language_hints": ["id", "th", "vi", "en"],
                 },
             },
@@ -29,6 +31,37 @@ def build_config() -> TrackerConfig:
                 "regulation": ["regulation", "permit", "license", "ban", "compliance"],
                 "safety": ["safety", "incident", "security", "insurance"],
                 "product_launch": ["launch", "rollout", "expansion", "partnership"],
+            },
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "daily_digest_limit": 10,
+            "enabled_providers": ["gdelt", "google_news_rss"],
+        }
+    )
+
+
+def build_africa_mea_shared_config() -> TrackerConfig:
+    return TrackerConfig.from_dict(
+        {
+            "regions": {
+                "africa": {
+                    "label": "Africa",
+                    "geo_terms": ["South Africa", "Kenya", "Nigeria", "Egypt"],
+                    "country_validation_terms": ["South Africa", "ZA", "Kenya", "KE", "Nigeria", "NG", "Egypt", "EG"],
+                    "language_hints": ["en", "fr"],
+                },
+                "mea": {
+                    "label": "Middle East",
+                    "geo_terms": ["Saudi Arabia", "UAE", "Qatar", "Jordan"],
+                    "country_validation_terms": ["Saudi Arabia", "SA", "KSA", "United Arab Emirates", "UAE", "AE", "Qatar", "QA", "Jordan", "JO", "Egypt", "EG"],
+                    "language_hints": ["ar", "en"],
+                },
+            },
+            "competitors_by_region": {
+                "africa": ["Bolt", "Uber", "Careem", "Yassir", "Heetch"],
+                "mea": ["Bolt", "Uber", "Careem", "Yassir", "Heetch"],
+            },
+            "topic_groups": {
+                "campaign_launches": ["campaign", "partnership", "driver"],
             },
             "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
             "daily_digest_limit": 10,
@@ -115,6 +148,26 @@ def test_prefilter_drops_articles_with_competitor_region_matrix_mismatch():
 
     assert result.candidates == []
     assert result.dropped_count == 1
+
+
+def test_prefilter_keeps_detected_region_without_fabricating_country_hint():
+    analyzer = CompetitorAnalyzer(min_score=5, config=build_africa_mea_shared_config())
+    raw_article = RawArticle(
+        title="Careem launches new driver campaign across the region",
+        url="https://example.com/careem-region-campaign",
+        provider="google_news_rss",
+        snippet="Careem announced a new driver campaign with regional messaging.",
+        query='"Careem" campaign Middle East',
+        region="mea",
+        competitor_hints=("Careem",),
+    )
+
+    result = analyzer.prefilter_raw_articles([raw_article], regions=("mea",))
+
+    assert len(result.candidates) == 1
+    candidate = result.candidates[0]
+    assert candidate.region == "mea"
+    assert candidate.country_hint is None
 
 
 def test_competitor_alert_analyzer_returns_fallback_schema_without_llm():
@@ -441,3 +494,647 @@ def test_competitor_alert_analyzer_rejects_llm_competitor_region_mismatch():
     assert alert["competitor"] == "Grab / Move It"
     assert alert["region"] == "sea"
     assert alert["country"] == "Philippines"
+    assert alert["competitor_source"] == "pipeline"
+    assert alert["region_source"] == "pipeline"
+    assert alert["country_source"] == "pipeline"
+    assert alert["geo_validation_fallback"] is True
+
+
+def test_competitor_alert_analyzer_falls_back_to_candidate_country_hint_on_llm_conflict():
+    def fake_create(**kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="""
+                        {
+                          "competitor": "Grab / Move It",
+                          "region": "sea",
+                          "country": "Mexico",
+                          "topic": "Marketing + Policy Narrative",
+                          "priority": "MEDIUM",
+                          "published_date": "2026-05-19",
+                          "published_date_source": "llm",
+                          "what_happened": "Platforms are promoting driver support programs as part of public messaging.",
+                          "why_it_matters": "Driver support is becoming part of brand communication, not just operations.",
+                          "potential_impact": "Improved driver perception and stronger trust narrative.",
+                          "recommended_action": "Highlight driver benefits in campaigns and test driver care messaging.",
+                          "confidence": 0.86
+                        }
+                        """
+                    )
+                )
+            ]
+        )
+
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
+    analyzer.use_llm = True
+    analyzer.model = "gpt-4o-mini"
+    analyzer.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fake_create)
+        )
+    )
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Grab offers support programs to drivers as fuel prices soar",
+            url="https://example.com/grab-fuel",
+            provider="google_news_rss",
+            snippet="Driver support programs gain public attention in the Philippines.",
+        ),
+        competitor="Grab / Move It",
+        topic_group="marketing + policy narrative",
+        score=8,
+        region="sea",
+        country_hint="Philippines",
+        language_hint="en",
+    )
+
+    alert = analyzer.analyze_candidate(
+        candidate,
+        article_context=ArticleContext(
+            title=candidate.title,
+            snippet=candidate.raw_article.snippet,
+            source_url=candidate.url,
+            article_body="A full article body is available for analysis.",
+            published_at="2026-05-20",
+        ),
+    )
+
+    assert alert["country"] == "Philippines"
+    assert alert["country_source"] == "pipeline"
+    assert alert["geo_validation_fallback"] is True
+
+
+def test_competitor_alert_analyzer_clears_unreliable_llm_country_without_candidate_hint():
+    def fake_create(**kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="""
+                        {
+                          "competitor": "Grab / Move It",
+                          "region": "sea",
+                          "country": "Mexico",
+                          "topic": "Marketing + Policy Narrative",
+                          "priority": "MEDIUM",
+                          "published_date": "2026-05-19",
+                          "published_date_source": "llm",
+                          "what_happened": "Platforms are promoting driver support programs as part of public messaging.",
+                          "why_it_matters": "Driver support is becoming part of brand communication, not just operations.",
+                          "potential_impact": "Improved driver perception and stronger trust narrative.",
+                          "recommended_action": "Highlight driver benefits in campaigns and test driver care messaging.",
+                          "confidence": 0.86
+                        }
+                        """
+                    )
+                )
+            ]
+        )
+
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
+    analyzer.use_llm = True
+    analyzer.model = "gpt-4o-mini"
+    analyzer.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fake_create)
+        )
+    )
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Grab offers support programs to drivers as fuel prices soar",
+            url="https://example.com/grab-fuel",
+            provider="google_news_rss",
+            snippet="Driver support programs gain public attention in the region.",
+        ),
+        competitor="Grab / Move It",
+        topic_group="marketing + policy narrative",
+        score=8,
+        region="sea",
+        country_hint=None,
+        language_hint="en",
+    )
+
+    alert = analyzer.analyze_candidate(
+        candidate,
+        article_context=ArticleContext(
+            title=candidate.title,
+            snippet=candidate.raw_article.snippet,
+            source_url=candidate.url,
+            article_body="A full article body is available for analysis.",
+            published_at="2026-05-20",
+        ),
+    )
+
+    assert alert["country"] == ""
+    assert alert["country_source"] == "empty"
+    assert alert["geo_validation_fallback"] is True
+
+
+def test_competitor_alert_analyzer_keeps_valid_llm_country_from_validation_vocabulary():
+    def fake_create(**kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="""
+                        {
+                          "competitor": "Grab / Move It",
+                          "region": "sea",
+                          "country": "Malaysia",
+                          "topic": "Marketing + Policy Narrative",
+                          "priority": "MEDIUM",
+                          "published_date": "2026-05-19",
+                          "published_date_source": "llm",
+                          "what_happened": "Platforms are promoting driver support programs as part of public messaging.",
+                          "why_it_matters": "Driver support is becoming part of brand communication, not just operations.",
+                          "potential_impact": "Improved driver perception and stronger trust narrative.",
+                          "recommended_action": "Highlight driver benefits in campaigns and test driver care messaging.",
+                          "confidence": 0.86
+                        }
+                        """
+                    )
+                )
+            ]
+        )
+
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
+    analyzer.use_llm = True
+    analyzer.model = "gpt-4o-mini"
+    analyzer.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fake_create)
+        )
+    )
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Grab offers support programs to drivers as fuel prices soar",
+            url="https://example.com/grab-fuel",
+            provider="google_news_rss",
+            snippet="Driver support programs gain public attention in the region.",
+        ),
+        competitor="Grab / Move It",
+        topic_group="marketing + policy narrative",
+        score=8,
+        region="sea",
+        country_hint=None,
+        language_hint="en",
+    )
+
+    alert = analyzer.analyze_candidate(
+        candidate,
+        article_context=ArticleContext(
+            title=candidate.title,
+            snippet=candidate.raw_article.snippet,
+            source_url=candidate.url,
+            article_body="A full article body is available for analysis.",
+            published_at="2026-05-20",
+        ),
+    )
+
+    assert alert["country"] == "Malaysia"
+    assert alert["country_source"] == "llm"
+    assert alert["geo_validation_fallback"] is False
+
+
+def test_competitor_alert_analyzer_understands_iso_country_codes():
+    def fake_create(**kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="""
+                        {
+                          "competitor": "Grab / Move It",
+                          "region": "sea",
+                          "country": "MY",
+                          "topic": "Marketing + Policy Narrative",
+                          "priority": "MEDIUM",
+                          "published_date": "2026-05-19",
+                          "published_date_source": "llm",
+                          "what_happened": "Platforms are promoting driver support programs as part of public messaging.",
+                          "why_it_matters": "Driver support is becoming part of brand communication, not just operations.",
+                          "potential_impact": "Improved driver perception and stronger trust narrative.",
+                          "recommended_action": "Highlight driver benefits in campaigns and test driver care messaging.",
+                          "confidence": 0.86
+                        }
+                        """
+                    )
+                )
+            ]
+        )
+
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
+    analyzer.use_llm = True
+    analyzer.model = "gpt-4o-mini"
+    analyzer.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fake_create)
+        )
+    )
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Grab offers support programs to drivers as fuel prices soar",
+            url="https://example.com/grab-fuel",
+            provider="google_news_rss",
+            snippet="Driver support programs gain public attention in the region.",
+        ),
+        competitor="Grab / Move It",
+        topic_group="marketing + policy narrative",
+        score=8,
+        region="sea",
+        country_hint=None,
+        language_hint="en",
+    )
+
+    alert = analyzer.analyze_candidate(
+        candidate,
+        article_context=ArticleContext(
+            title=candidate.title,
+            snippet=candidate.raw_article.snippet,
+            source_url=candidate.url,
+            article_body="A full article body is available for analysis.",
+            published_at="2026-05-20",
+        ),
+    )
+
+    assert alert["country"] == "Malaysia"
+    assert alert["country_source"] == "llm"
+
+
+def test_competitor_alert_analyzer_understands_target_region_country_aliases():
+    alias_cases = (
+        ("BR", "latam", "Brazil"),
+        ("brasil", "latam", "Brazil"),
+        ("KSA", "mea", "Saudi Arabia"),
+        ("Russian Federation", "cis_central_asia", "Russia"),
+    )
+
+    for raw_country, region, expected_country in alias_cases:
+        config = TrackerConfig.from_dict(
+            {
+                "regions": {
+                    "latam": {
+                        "label": "Latin America",
+                        "geo_terms": ["Mexico", "Brazil"],
+                        "country_validation_terms": ["Brazil", "BR", "Mexico", "MX"],
+                        "language_hints": ["es", "pt", "en"],
+                    },
+                    "mea": {
+                        "label": "Middle East",
+                        "geo_terms": ["Saudi Arabia", "UAE"],
+                        "country_validation_terms": ["Saudi Arabia", "SA", "KSA", "United Arab Emirates", "AE", "UAE"],
+                        "language_hints": ["ar", "en"],
+                    },
+                    "cis_central_asia": {
+                        "label": "CIS / Central Asia",
+                        "geo_terms": ["Kazakhstan", "Georgia"],
+                        "country_validation_terms": ["Russia", "RU", "Russian Federation", "Kazakhstan", "KZ"],
+                        "language_hints": ["ru", "en"],
+                    },
+                },
+                "competitors_by_region": {
+                    "latam": ["Uber"],
+                    "mea": ["Careem"],
+                    "cis_central_asia": ["Yandex Go"],
+                },
+                "topic_groups": {
+                    "pricing": ["price", "pricing"],
+                },
+                "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+                "daily_digest_limit": 10,
+                "enabled_providers": ["gdelt", "google_news_rss"],
+            }
+        )
+
+        def fake_create(**kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=f"""
+                            {{
+                              "competitor": "Test Competitor",
+                              "region": "{region}",
+                              "country": "{raw_country}",
+                              "topic": "Pricing",
+                              "priority": "MEDIUM",
+                              "published_date": "2026-05-19",
+                              "published_date_source": "llm",
+                              "what_happened": "Pricing signal detected.",
+                              "why_it_matters": "Pricing may affect market positioning.",
+                              "potential_impact": "Potential trust and growth impact.",
+                              "recommended_action": "Review local pricing response.",
+                              "confidence": 0.86
+                            }}
+                            """
+                        )
+                    )
+                ]
+            )
+
+        analyzer = CompetitorAlertAnalyzer(use_llm=False, config=config)
+        analyzer.use_llm = True
+        analyzer.model = "gpt-4o-mini"
+        analyzer.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=fake_create)
+            )
+        )
+        candidate = CandidateArticle(
+            raw_article=RawArticle(
+                title="Test pricing signal",
+                url="https://example.com/test-country-alias",
+                provider="google_news_rss",
+                snippet="Regional pricing signal.",
+            ),
+            competitor="Test Competitor",
+            topic_group="pricing",
+            score=8,
+            region=region,
+            country_hint=None,
+            language_hint="en",
+        )
+
+        alert = analyzer.analyze_candidate(
+            candidate,
+            article_context=ArticleContext(
+                title=candidate.title,
+                snippet=candidate.raw_article.snippet,
+                source_url=candidate.url,
+                article_body="A full article body is available for analysis.",
+                published_at="2026-05-20",
+            ),
+        )
+
+        assert alert["country"] == expected_country
+        assert alert["country_source"] == "llm"
+
+
+def test_competitor_alert_analyzer_falls_back_when_llm_changes_competitor_within_same_region():
+    def fake_create(**kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="""
+                        {
+                          "competitor": "Gojek",
+                          "region": "sea",
+                          "country": "Philippines",
+                          "topic": "Marketing + Policy Narrative",
+                          "priority": "MEDIUM",
+                          "published_date": "2026-05-19",
+                          "published_date_source": "llm",
+                          "what_happened": "Platforms are promoting driver support programs as part of public messaging.",
+                          "why_it_matters": "Driver support is becoming part of brand communication, not just operations.",
+                          "potential_impact": "Improved driver perception and stronger trust narrative.",
+                          "recommended_action": "Highlight driver benefits in campaigns and test driver care messaging.",
+                          "confidence": 0.86
+                        }
+                        """
+                    )
+                )
+            ]
+        )
+
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
+    analyzer.use_llm = True
+    analyzer.model = "gpt-4o-mini"
+    analyzer.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fake_create)
+        )
+    )
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Grab offers support programs to drivers as fuel prices soar",
+            url="https://example.com/grab-fuel",
+            provider="google_news_rss",
+            snippet="Driver support programs gain public attention in the Philippines.",
+        ),
+        competitor="Grab / Move It",
+        topic_group="marketing + policy narrative",
+        score=8,
+        region="sea",
+        country_hint="Philippines",
+        language_hint="en",
+    )
+
+    alert = analyzer.analyze_candidate(
+        candidate,
+        article_context=ArticleContext(
+            title=candidate.title,
+            snippet=candidate.raw_article.snippet,
+            source_url=candidate.url,
+            article_body="A full article body is available for analysis.",
+            published_at="2026-05-20",
+        ),
+    )
+
+    assert alert["competitor"] == "Grab / Move It"
+    assert alert["competitor_source"] == "pipeline"
+    assert alert["geo_validation_fallback"] is True
+
+
+def test_competitor_alert_analyzer_clears_ambiguous_shared_region_without_geo_proof():
+    def fake_create(**kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="""
+                        {
+                          "competitor": "Careem",
+                          "region": "mea",
+                          "country": "",
+                          "topic": "Campaign launches",
+                          "priority": "MEDIUM",
+                          "published_date": "2026-05-19",
+                          "published_date_source": "llm",
+                          "what_happened": "Careem launched a broad campaign.",
+                          "why_it_matters": "It may affect local perception.",
+                          "potential_impact": "Potential trust and growth impact.",
+                          "recommended_action": "Validate geo specifics first.",
+                          "confidence": 0.86
+                        }
+                        """
+                    )
+                )
+            ]
+        )
+
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_africa_mea_shared_config())
+    analyzer.use_llm = True
+    analyzer.model = "gpt-4o-mini"
+    analyzer.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fake_create)
+        )
+    )
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Careem launches broad regional campaign",
+            url="https://example.com/careem-regional-campaign",
+            provider="google_news_rss",
+            snippet="Careem expands a broad regional campaign without naming a country.",
+        ),
+        competitor="Careem",
+        topic_group="campaign_launches",
+        score=8,
+        region=None,
+        country_hint=None,
+        language_hint="en",
+    )
+
+    alert = analyzer.analyze_candidate(
+        candidate,
+        article_context=ArticleContext(
+            title=candidate.title,
+            snippet=candidate.raw_article.snippet,
+            source_url=candidate.url,
+            article_body="A full article body is available for analysis.",
+            published_at="2026-05-20",
+        ),
+    )
+
+    assert alert["region"] == ""
+    assert alert["region_source"] == "empty"
+    assert alert["geo_validation_fallback"] is True
+
+
+def test_competitor_alert_analyzer_resolves_shared_region_from_unique_country_hint():
+    def fake_create(**kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="""
+                        {
+                          "competitor": "Careem",
+                          "region": "africa",
+                          "country": "KSA",
+                          "topic": "Campaign launches",
+                          "priority": "MEDIUM",
+                          "published_date": "2026-05-19",
+                          "published_date_source": "llm",
+                          "what_happened": "Careem launched a broad campaign.",
+                          "why_it_matters": "It may affect local perception.",
+                          "potential_impact": "Potential trust and growth impact.",
+                          "recommended_action": "Validate geo specifics first.",
+                          "confidence": 0.86
+                        }
+                        """
+                    )
+                )
+            ]
+        )
+
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_africa_mea_shared_config())
+    analyzer.use_llm = True
+    analyzer.model = "gpt-4o-mini"
+    analyzer.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fake_create)
+        )
+    )
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Careem launches broad regional campaign",
+            url="https://example.com/careem-regional-campaign-ksa",
+            provider="google_news_rss",
+            snippet="Careem expands a broad regional campaign.",
+        ),
+        competitor="Careem",
+        topic_group="campaign_launches",
+        score=8,
+        region=None,
+        country_hint=None,
+        language_hint="en",
+    )
+
+    alert = analyzer.analyze_candidate(
+        candidate,
+        article_context=ArticleContext(
+            title=candidate.title,
+            snippet=candidate.raw_article.snippet,
+            source_url=candidate.url,
+            article_body="A full article body is available for analysis.",
+            published_at="2026-05-20",
+        ),
+    )
+
+    assert alert["region"] == "mea"
+    assert alert["region_source"] == "geo_country_override"
+    assert alert["country"] == "Saudi Arabia"
+    assert alert["country_source"] == "llm"
+    assert alert["geo_validation_fallback"] is True
+
+
+def test_competitor_alert_analyzer_keeps_region_empty_for_ambiguous_shared_country():
+    def fake_create(**kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="""
+                        {
+                          "competitor": "Careem",
+                          "region": "mea",
+                          "country": "Egypt",
+                          "topic": "Campaign launches",
+                          "priority": "MEDIUM",
+                          "published_date": "2026-05-19",
+                          "published_date_source": "llm",
+                          "what_happened": "Careem launched a broad campaign.",
+                          "why_it_matters": "It may affect local perception.",
+                          "potential_impact": "Potential trust and growth impact.",
+                          "recommended_action": "Validate geo specifics first.",
+                          "confidence": 0.86
+                        }
+                        """
+                    )
+                )
+            ]
+        )
+
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_africa_mea_shared_config())
+    analyzer.use_llm = True
+    analyzer.model = "gpt-4o-mini"
+    analyzer.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fake_create)
+        )
+    )
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Careem launches broad regional campaign",
+            url="https://example.com/careem-regional-campaign-egypt",
+            provider="google_news_rss",
+            snippet="Careem expands a broad regional campaign.",
+        ),
+        competitor="Careem",
+        topic_group="campaign_launches",
+        score=8,
+        region=None,
+        country_hint=None,
+        language_hint="en",
+    )
+
+    alert = analyzer.analyze_candidate(
+        candidate,
+        article_context=ArticleContext(
+            title=candidate.title,
+            snippet=candidate.raw_article.snippet,
+            source_url=candidate.url,
+            article_body="A full article body is available for analysis.",
+            published_at="2026-05-20",
+        ),
+    )
+
+    assert alert["region"] == ""
+    assert alert["region_source"] == "empty"
+    assert alert["country"] == ""
+    assert alert["country_source"] == "empty"
+    assert alert["geo_validation_fallback"] is True

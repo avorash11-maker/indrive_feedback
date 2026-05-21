@@ -2,9 +2,11 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from competitor_tracker import cli
 from competitor_tracker.config import TrackerConfig, TrackerRuntimeConfig
-from competitor_tracker.models import RawArticle
+from competitor_tracker.models import ArticleContext, RawArticle
 from competitor_tracker.providers import ProviderError
 from competitor_tracker.storage import SQLiteTrackerStorage
 
@@ -27,6 +29,20 @@ def build_config(
                 "sea": {
                     "label": "Southeast Asia",
                     "geo_terms": ["Philippines", "Indonesia", "Thailand"],
+                    "country_validation_terms": [
+                        "Philippines",
+                        "PH",
+                        "Indonesia",
+                        "ID",
+                        "Thailand",
+                        "TH",
+                        "Malaysia",
+                        "MY",
+                        "Singapore",
+                        "SG",
+                        "Vietnam",
+                        "VN",
+                    ],
                     "language_hints": ["en"],
                 }
             },
@@ -315,6 +331,154 @@ def test_provider_partial_failure_keeps_run_alive_and_records_summary(tmp_path, 
     assert len(result["digest"].alerts) == 1
     summary_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
     assert summary_payload["provider_errors"] == {"failing_provider": "temporary upstream failure"}
+
+
+@pytest.mark.parametrize(
+    ("llm_payload", "expected_country", "expected_country_source", "expected_fallback"),
+    [
+        (
+            {
+                "competitor": "Uber",
+                "region": "sea",
+                "country": "Philippines",
+            },
+            "Philippines",
+            "pipeline",
+            True,
+        ),
+        (
+            {
+                "competitor": "Grab",
+                "region": "latam",
+                "country": "Philippines",
+            },
+            "Philippines",
+            "pipeline",
+            True,
+        ),
+        (
+            {
+                "competitor": "Grab",
+                "region": "sea",
+                "country": "Mexico",
+            },
+            "Philippines",
+            "pipeline",
+            True,
+        ),
+    ],
+)
+def test_run_pipeline_falls_back_to_candidate_truth_layer_on_bad_llm_geo_output(
+    tmp_path,
+    monkeypatch,
+    llm_payload,
+    expected_country,
+    expected_country_source,
+    expected_fallback,
+):
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config)
+    source_article = article(
+        competitor="Grab",
+        title="Grab launches driver campaign in the Philippines",
+        url="https://example.com/grab-philippines-campaign",
+        snippet="Grab is expanding driver messaging in the Philippines.",
+        query='"Grab" campaign_launches Southeast Asia',
+        region="sea",
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [StaticProvider("mock_news", [source_article])],
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    class FakeContextExtractor:
+        def extract(self, candidate):
+            return ArticleContext(
+                title=candidate.title,
+                snippet=candidate.raw_article.snippet,
+                source_url=candidate.url,
+                article_body="Grab launched a driver campaign in the Philippines.",
+                published_at="2026-05-20",
+            )
+
+        def build_fallback_context(self, candidate):
+            return self.extract(candidate)
+
+    class FakeOpenAIClient:
+        def __init__(self, api_key=None):
+            self.chat = type(
+                "ChatNamespace",
+                (),
+                {
+                    "completions": type(
+                        "CompletionNamespace",
+                        (),
+                        {
+                            "create": staticmethod(
+                                lambda **kwargs: type(
+                                    "Response",
+                                    (),
+                                    {
+                                        "choices": [
+                                            type(
+                                                "Choice",
+                                                (),
+                                                {
+                                                    "message": type(
+                                                        "Message",
+                                                        (),
+                                                        {
+                                                            "content": json.dumps(
+                                                                {
+                                                                    **llm_payload,
+                                                                    "topic": "campaign launches",
+                                                                    "priority": "MEDIUM",
+                                                                    "published_date": "2026-05-20",
+                                                                    "published_date_source": "llm",
+                                                                    "what_happened": "LLM returned geo fields.",
+                                                                    "why_it_matters": "Geo truth layer should validate this.",
+                                                                    "potential_impact": "Potential messaging impact.",
+                                                                    "recommended_action": "Keep pipeline truth.",
+                                                                    "confidence": 0.82,
+                                                                }
+                                                            )
+                                                        },
+                                                    )()
+                                                },
+                                            )()
+                                        ]
+                                    },
+                                )()
+                            )
+                        },
+                    )()
+                },
+            )()
+
+    monkeypatch.setattr(cli, "ArticleContextExtractor", FakeContextExtractor)
+    monkeypatch.setattr("competitor_tracker.analyzer.openai.OpenAI", FakeOpenAIClient)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
+
+    assert len(result["digest"].alerts) == 1
+    assert len(result["alert_schemas"]) == 1
+
+    alert = result["alert_schemas"][0]
+    candidate = result["digest"].alerts[0].candidate
+
+    assert candidate.competitor == "Grab"
+    assert candidate.region == "sea"
+    assert candidate.country_hint == "Philippines"
+
+    assert alert["competitor"] == candidate.competitor
+    assert alert["region"] == candidate.region
+    assert alert["country"] == expected_country
+    assert alert["competitor_source"] == "pipeline"
+    assert alert["region_source"] == "pipeline"
+    assert alert["country_source"] == expected_country_source
+    assert alert["geo_validation_fallback"] is expected_fallback
 
 
 def test_optional_notion_behavior_skips_cleanly_when_env_missing(tmp_path, monkeypatch):

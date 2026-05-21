@@ -162,6 +162,11 @@ Important config contract:
 - `competitors_by_region` is not only a query-expansion helper.
 - It is the validation matrix for allowed `competitor + region` combinations in the new tracker flow.
 - If a detected or LLM-returned pair conflicts with this matrix, the pipeline should reject or normalize it instead of trusting free-form model output.
+- Regions can also define `country_validation_terms` as a broader vocabulary for safe `country` validation in final alert schemas.
+- This allows the tracker to accept valid country values that are broader than the query-oriented `geo_terms`, without weakening the fallback rules.
+- For competitors that are valid in multiple regions, region is not inferred from competitor alone. The tracker uses detected geo/country hints first; if those hints are missing or ambiguous, it preserves the pipeline-detected region when available or leaves region empty rather than trusting an LLM guess.
+- Final alert schemas can include internal provenance flags such as `competitor_source`, `region_source`, `country_source`, and `geo_validation_fallback` for QA and downstream validation.
+- `country` validation understands configured country vocabulary plus common aliases and ISO-style country codes.
 
 The default MVP config is now aligned to these monitoring themes:
 

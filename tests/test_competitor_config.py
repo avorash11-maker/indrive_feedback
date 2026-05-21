@@ -13,6 +13,16 @@ def test_load_default_competitor_tracker_config():
     assert "mea" in config.regions
     assert "cis_central_asia" in config.regions
     assert config.regions["latam"].label == "Latin America"
+    assert "Argentina" in config.regions["latam"].country_validation_terms
+    assert "BR" in config.regions["latam"].country_validation_terms
+    assert "MX" in config.regions["latam"].country_validation_terms
+    assert "Singapore" in config.regions["sea"].country_validation_terms
+    assert "MY" in config.regions["sea"].country_validation_terms
+    assert "ID" in config.regions["sea"].country_validation_terms
+    assert "SA" in config.regions["mea"].country_validation_terms
+    assert "AE" in config.regions["mea"].country_validation_terms
+    assert "RU" in config.regions["cis_central_asia"].country_validation_terms
+    assert "KZ" in config.regions["cis_central_asia"].country_validation_terms
     assert config.competitors_by_region["latam"] == ("Uber", "DiDi", "Cabify", "99")
     assert config.competitors_by_region["sea"] == ("Grab", "Gojek", "Maxim", "Bolt")
     assert config.competitors_by_region["africa"] == ("Bolt", "Uber", "Careem", "Yassir", "Heetch")
@@ -109,6 +119,54 @@ def test_load_custom_config_and_expand_queries(tmp_path):
     assert len(queries) == 8
     assert "\"Uber\" pricing Latin America" in queries
     assert "\"DiDi\" regulation OR permit Mexico OR Brazil" in queries
+
+
+def test_country_validation_terms_defaults_to_geo_terms_when_not_provided():
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "latam": {
+                    "label": "Latin America",
+                    "geo_terms": ["Mexico", "Brazil"],
+                    "language_hints": ["es", "pt"],
+                }
+            },
+            "competitors_by_region": {"latam": ["Uber", "DiDi"]},
+            "topic_groups": {"pricing": ["price", "fare"]},
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "daily_digest_limit": 7,
+            "enabled_providers": ["newsapi", "gdelt"],
+        }
+    )
+
+    assert config.regions["latam"].country_validation_terms == ("Mexico", "Brazil")
+
+
+def test_from_dict_accepts_explicit_country_validation_terms():
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "sea": {
+                    "label": "Southeast Asia",
+                    "geo_terms": ["Indonesia", "Thailand"],
+                    "country_validation_terms": ["Indonesia", "Thailand", "Singapore", "Malaysia"],
+                    "language_hints": ["en", "id", "th"],
+                }
+            },
+            "competitors_by_region": {"sea": ["Grab", "Gojek"]},
+            "topic_groups": {"pricing": ["price", "fare"]},
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "daily_digest_limit": 7,
+            "enabled_providers": ["newsapi", "gdelt"],
+        }
+    )
+
+    assert config.regions["sea"].country_validation_terms == (
+        "Indonesia",
+        "Thailand",
+        "Singapore",
+        "Malaysia",
+    )
 
 
 def test_queries_for_region_rejects_unknown_topic_group():
