@@ -17,6 +17,15 @@ The current MVP is optimized for a practical daily monitoring loop:
 - A rule-based prefilter detects competitor, topic, region, country/language hints, and baseline score before any LLM call.
 - Digest ranking prioritizes `priority -> freshness -> confidence/score`.
 - Duplicate suppression works both within one run and across history.
+- Publication date is resolved in layers:
+  - provider / normalized `published_at`
+  - HTML extraction via `htmldate`
+  - optional LLM fallback only when metadata date is missing
+  - final priority is `metadata > llm > unknown`
+- Final digest delivery applies a `7-day` freshness gate:
+  - clearly stale alerts are excluded from the main digest and Telegram
+  - stale-but-important newly detected alerts can still pass through a high-signal override
+  - archived stale articles are kept with `is_expired = True` for QA and debugging
 - Telegram delivery uses a bounded carry-over queue:
   - `delivered` alerts are not retried
   - relevant alerts that miss the Telegram top cap become `deferred`
@@ -36,6 +45,7 @@ The design goal is not “use AI everywhere”, but “use AI only where it help
 - `Config over code`: new regions, competitors, and topic groups can be adjusted without rewriting pipeline logic.
 - `Digest, not firehose`: suppression and ranking keep the daily output readable for humans.
 - `Carry-over, not loss`: relevant alerts that miss today's Telegram window can re-enter the next run, but only for a limited time.
+- `Dates with guardrails`: metadata dates win, LLM dates are fallback-only, and very old articles are archived unless they qualify as strong newly detected signals.
 - `Optional integrations`: Telegram and Notion are delivery layers, not core state.
 
 ## Current Stack
@@ -205,6 +215,12 @@ The markdown preview intentionally uses readable Russian section labels where he
 
 This makes it easier to validate false positives and signal quality over a 1-2 week test period without querying SQLite by hand.
 
+Important QA detail:
+
+- `candidates_review.csv` now includes `is_expired`
+- old articles that miss the `7-day` freshness gate stay in the archive for review
+- late-discovered but high-signal articles can still surface in the digest when they clearly outrank the average signal level
+
 ## Delivery Layers
 
 ### Telegram
@@ -214,6 +230,8 @@ Telegram is the main delivery channel for the MVP.
 - supports `dry-run`
 - logs delivery history into `SQLite`
 - enables suppression of already sent alerts
+- excludes articles older than `7 days` from the main digest by default
+- allows a high-signal override for stale but newly detected important articles
 - keeps a Telegram-specific `deferred` queue for relevant alerts that miss the top slice
 - retries deferred alerts for up to `48 hours`
 - marks stale deferred alerts as `expired`

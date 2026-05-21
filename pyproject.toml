@@ -27,6 +27,7 @@ classifiers = [
 dependencies = [
     "requests>=2.33.1",
     "beautifulsoup4>=4.14.3",
+    "htmldate>=1.9.3",
     "openai>=1.0.0",
     "python-dotenv>=1.2.2",
     "tenacity>=9.0.0",

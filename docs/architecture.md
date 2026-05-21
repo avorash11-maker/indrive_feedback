@@ -46,6 +46,25 @@ Regions, competitors, topic groups, query templates, provider list, and digest l
 
 The system is designed to decide “what is worth showing today”, not just “what was found”.
 
+### Dates with layered confidence
+
+Publication date is not taken from one source blindly. The tracker resolves it in layers:
+
+- provider-level or normalized `published_at`
+- HTML extraction via `htmldate`
+- optional LLM inference only when metadata date is missing
+
+The final trust priority is:
+
+- `metadata`
+- `llm`
+- `unknown`
+
+This is surfaced through:
+
+- `published_date`
+- `published_date_source`
+
 ### Managed carry-over
 
 The Telegram path is not a blind retry queue. The tracker keeps a bounded carry-over model:
@@ -55,6 +74,16 @@ The Telegram path is not a blind retry queue. The tracker keeps a bounded carry-
 - deferred alerts can re-enter ranking on the next Telegram run
 - deferred alerts expire after `48 hours`
 - stale carry-over alerts get a slight ranking penalty versus equally strong fresh alerts
+
+### Anti-echo freshness filter
+
+The tracker does not send obviously stale articles into the main digest by default. Final delivery applies a `7-day` gate:
+
+- articles newer than `7 days` can proceed normally
+- clearly stale alerts are archived and marked `is_expired = True`
+- stale articles can still pass if they are newly detected and materially stronger than the average alert score in the current run
+
+This prevents noisy “echoes” from old stories while still allowing late-breaking pickups or major rewrites from large publishers to reach the team.
 
 ## System Components
 
@@ -138,6 +167,7 @@ Responsibilities:
 Responsibilities:
 
 - rule-based prefilter before any optional LLM usage
+- preserve publication-date provenance for downstream freshness checks
 - detect:
   - competitor
   - topic group
@@ -159,6 +189,7 @@ Responsibilities:
   - deferred penalty
   - confidence
   - score
+- apply final freshness gate before delivery
 - suppress duplicates within one run
 - suppress alerts already sent in previous runs
 - suppress near-duplicate alerts from recent history
@@ -173,6 +204,7 @@ Responsibilities:
 
 - persist local JSON / CSV / Markdown artifacts
 - maintain `SQLite` operational history
+- keep archived stale articles available for QA through metadata and artifacts
 
 Current `SQLite` tables:
 
@@ -181,6 +213,10 @@ Current `SQLite` tables:
 - `alerts`
 - `runs`
 - `delivery_log`
+
+Archive-oriented article metadata can also include:
+
+- `is_expired = true` for stale articles filtered out of the final digest
 
 Delivery log statuses now have operational meaning:
 
@@ -228,6 +264,8 @@ Providers fetch raw public articles and map them into `RawArticle`.
 
 Raw articles are normalized and deduplicated before scoring.
 
+At this stage, provider dates are normalized where possible. Later, article HTML can enrich publication date detection through `htmldate`, and the LLM may infer a date only when metadata is missing.
+
 ### 4. Prefilter
 
 The rule-based analyzer converts valid raw articles into `CandidateArticle` objects and drops weak or irrelevant items early.
@@ -259,6 +297,7 @@ And optionally:
 - mirrors alerts to Notion
 
 Telegram-specific carry-over only applies to the delivery path. Local-only runs still produce artifacts and history, but they do not keep building an endless retry queue.
+Stale alerts that fail the final `7-day` gate do not reach Telegram or the main digest, but they remain visible in archive artifacts and `SQLite` metadata for auditability.
 
 ## Low-Cost Daily Digest Strategy
 
@@ -268,6 +307,9 @@ The MVP is intentionally optimized for low-cost daily operation:
 - most filtering happens before any richer analysis step
 - `SQLite` keeps history local and cheap
 - digest cap prevents operational overload
+- metadata publication dates are trusted first; LLM date inference is fallback-only
+- a `7-day` anti-echo filter removes stale low-value content from delivery
+- strong newly detected stale signals can still pass via override instead of being silently lost
 - deferred carry-over prevents relevant alerts from disappearing while still avoiding a Telegram firehose
 - markdown and CSV artifacts make manual QA simple during live trial periods
 

@@ -6,15 +6,15 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Sequence
 
 from .article_context import ArticleContextExtractor
 from .analyzer import CompetitorAlertAnalyzer, CompetitorAnalyzer
 from .config import TrackerConfig, TrackerRuntimeConfig
 from .digest import DigestBuilder
-from .models import RunSummary
-from .normalization import deduplicate_raw_articles
+from .models import CompetitorDigest, RunSummary
+from .normalization import deduplicate_raw_articles, parse_published_at
 from .notion_sync import CompetitorNotionMirrorSync
 from .providers import Provider, ProviderError, ProviderRequest, build_providers
 from .storage import JsonFileStorage, SQLiteTrackerStorage
@@ -22,6 +22,9 @@ from .telegram_sender import TelegramSender
 
 COMMAND_NAMES = {"run", "dry-run", "send-digest", "sync-notion", "backfill"}
 POST_RANKING_LLM_TOP_N = 15
+MAX_ARTICLE_AGE_DAYS = 7
+REFERENCE_TODAY = date.fromisoformat("2026-05-21")
+HIGH_SIGNAL_SCORE_THRESHOLD = 7
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -246,6 +249,95 @@ def select_telegram_delivery_payload(
     )
 
 
+def _resolve_alert_publication_date(alert, alert_schema) -> Optional[date]:
+    raw_date = parse_published_at(alert.candidate.published_date or "")
+    if raw_date:
+        return date.fromisoformat(raw_date)
+    schema_date = parse_published_at(str(alert_schema.get("published_date") or ""))
+    if schema_date:
+        return date.fromisoformat(schema_date)
+    return None
+
+
+def _is_alert_expired(
+    alert,
+    alert_schema,
+    *,
+    today: date = REFERENCE_TODAY,
+    max_age_days: int = MAX_ARTICLE_AGE_DAYS,
+    average_score: float = 0.0,
+) -> bool:
+    published_date = _resolve_alert_publication_date(alert, alert_schema)
+    if published_date is None:
+        return False
+    if published_date >= (today - timedelta(days=max_age_days)):
+        return False
+    if _has_fresh_high_signal_override(alert, average_score=average_score):
+        return False
+    return True
+
+
+def _has_fresh_high_signal_override(
+    alert,
+    *,
+    average_score: float,
+    score_threshold: int = HIGH_SIGNAL_SCORE_THRESHOLD,
+) -> bool:
+    if alert.candidate.raw_article.metadata.get("deferred_digest_key"):
+        return False
+    return alert.score >= score_threshold and alert.score > average_score
+
+
+def _apply_candidate_expired_flag(candidate, *, is_expired: bool) -> None:
+    candidate.raw_article.metadata["is_expired"] = is_expired
+
+
+def filter_expired_digest_items(
+    digest: CompetitorDigest,
+    alert_schemas,
+    article_contexts,
+    *,
+    today: date = REFERENCE_TODAY,
+    max_age_days: int = MAX_ARTICLE_AGE_DAYS,
+):
+    filtered_alerts = []
+    filtered_schemas = []
+    filtered_contexts = []
+    expired_alerts = []
+    average_score = (
+        sum(alert.score for alert in digest.alerts) / len(digest.alerts)
+        if digest.alerts
+        else 0.0
+    )
+
+    for alert, alert_schema, article_context in zip(
+        digest.alerts, alert_schemas, article_contexts
+    ):
+        is_expired = _is_alert_expired(
+            alert,
+            alert_schema,
+            today=today,
+            max_age_days=max_age_days,
+            average_score=average_score,
+        )
+        _apply_candidate_expired_flag(alert.candidate, is_expired=is_expired)
+        if is_expired:
+            expired_alerts.append(alert)
+            continue
+        filtered_alerts.append(alert)
+        filtered_schemas.append(alert_schema)
+        filtered_contexts.append(article_context)
+
+    filtered_digest = CompetitorDigest(
+        generated_at=digest.generated_at,
+        competitors=digest.competitors,
+        alerts=tuple(filtered_alerts),
+        highlights=digest.highlights,
+        regions=digest.regions,
+    )
+    return filtered_digest, filtered_schemas, filtered_contexts, expired_alerts
+
+
 def run_pipeline(
     *,
     days: int,
@@ -284,9 +376,19 @@ def run_pipeline(
         else "",
         include_deferred=telegram_mode in {"dry", "send"},
     )
-    sqlite_storage.insert_alerts(digest.alerts)
-
     alert_schemas, article_contexts = build_delivery_alert_schemas(digest.alerts)
+    digest, alert_schemas, article_contexts, expired_alerts = filter_expired_digest_items(
+        digest,
+        alert_schemas,
+        article_contexts,
+    )
+    for candidate in analysis.candidates:
+        candidate.raw_article.metadata.setdefault("is_expired", False)
+        sqlite_storage.merge_raw_article_metadata(
+            url=candidate.url,
+            metadata_updates={"is_expired": bool(candidate.raw_article.metadata.get("is_expired"))},
+        )
+    sqlite_storage.insert_alerts(digest.alerts)
 
     storage = JsonFileStorage(runtime.output_dir)
     candidates_path = storage.save_candidates(analysis.candidates)
@@ -353,6 +455,7 @@ def run_pipeline(
         "digest": digest,
         "alert_schemas": alert_schemas,
         "article_contexts": article_contexts,
+        "expired_alerts_count": len(expired_alerts),
         "query_count": len(config.queries_for_regions(selected_regions)),
         "candidates_path": candidates_path,
         "digest_path": digest_path,

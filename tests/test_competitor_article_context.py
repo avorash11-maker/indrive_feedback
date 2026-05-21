@@ -70,6 +70,54 @@ def test_article_context_extractor_returns_cleaned_article_body():
     assert context.source_url == "https://example.com/article"
     assert "driver support campaign in Manila" in context.article_body
     assert "public driver-care narrative" in context.article_body
+    assert context.published_at is None
+
+
+def test_article_context_extractor_extracts_published_date(monkeypatch):
+    html = """
+    <html>
+      <head>
+        <meta property="article:published_time" content="2026-05-19T08:30:00Z" />
+      </head>
+      <body>
+        <article>
+          <p>Grab launched a driver support campaign in Manila with fuel subsidies and bonuses.</p>
+          <p>The company framed the move as part of its public driver-care narrative.</p>
+        </article>
+      </body>
+    </html>
+    """
+    monkeypatch.setattr(
+        "competitor_tracker.article_context.extract_html_date",
+        lambda _html, **_kwargs: "2026-05-19T08:30:00Z",
+    )
+    extractor = ArticleContextExtractor(session=FakeSession(FakeResponse(html)))
+
+    context = extractor.extract(build_candidate())
+
+    assert context.published_at == "2026-05-19"
+
+
+def test_article_context_extractor_keeps_none_when_date_not_found(monkeypatch):
+    html = """
+    <html>
+      <body>
+        <article>
+          <p>Grab launched a driver support campaign in Manila with fuel subsidies and bonuses.</p>
+          <p>The company framed the move as part of its public driver-care narrative.</p>
+        </article>
+      </body>
+    </html>
+    """
+    monkeypatch.setattr(
+        "competitor_tracker.article_context.extract_html_date",
+        lambda _html, **_kwargs: None,
+    )
+    extractor = ArticleContextExtractor(session=FakeSession(FakeResponse(html)))
+
+    context = extractor.extract(build_candidate())
+
+    assert context.published_at is None
 
 
 def test_article_context_extractor_falls_back_without_crashing():
@@ -81,6 +129,7 @@ def test_article_context_extractor_falls_back_without_crashing():
     assert context.snippet == "Grab launches a new city campaign with driver messaging."
     assert context.source_url == "https://example.com/article"
     assert context.article_body == ""
+    assert context.published_at is None
 
 
 def test_build_delivery_alert_schemas_only_extracts_context_for_llm_top_n(monkeypatch):
@@ -98,6 +147,7 @@ def test_build_delivery_alert_schemas_only_extracts_context_for_llm_top_n(monkey
                     "snippet": candidate.raw_article.snippet,
                     "source_url": candidate.url,
                     "article_body": f"body for {candidate.title}",
+                    "published_at": "2026-05-20",
                 },
             )()
 
@@ -110,6 +160,7 @@ def test_build_delivery_alert_schemas_only_extracts_context_for_llm_top_n(monkey
                     "snippet": candidate.raw_article.snippet,
                     "source_url": candidate.url,
                     "article_body": "",
+                    "published_at": None,
                 },
             )()
 

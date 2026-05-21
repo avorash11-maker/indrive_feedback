@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 from competitor_tracker import cli
@@ -70,6 +71,28 @@ def article(
         region=region,
         language="en",
         competitor_hints=(competitor,),
+    )
+
+
+def low_signal_article(
+    *,
+    title: str,
+    url: str,
+    competitor: str,
+    published_at: str,
+    snippet: str = "",
+) -> RawArticle:
+    return RawArticle(
+        title=title,
+        url=url,
+        provider="mock_provider",
+        source="Example News",
+        published_at=published_at,
+        snippet=snippet or title,
+        query=f'"{competitor}" campaign',
+        region=None,
+        language=None,
+        competitor_hints=(),
     )
 
 
@@ -530,3 +553,123 @@ def test_unsent_telegram_alert_is_carried_over_on_next_run(tmp_path, monkeypatch
         max_age_days=2,
     )
     assert deferred_candidates == []
+
+
+def test_articles_older_than_seven_days_are_archived_but_filtered_from_digest_and_telegram(
+    tmp_path, monkeypatch
+):
+    config = build_config()
+    runtime = patch_runtime(monkeypatch, tmp_path, config)
+    old_article = article(
+        competitor="Grab",
+        title="Grab old campaign in Manila",
+        url="https://example.com/grab-old-campaign",
+        published_at="2026-05-13T09:00:00Z",
+    )
+    fresh_article = article(
+        competitor="Gojek",
+        title="Gojek launches women driver partnership program in Cebu",
+        url="https://example.com/gojek-fresh-campaign",
+        published_at="2026-05-20T09:00:00Z",
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [StaticProvider("mock_news", [old_article, fresh_article])],
+    )
+
+    sender_calls = {}
+
+    class FakeTelegramSender:
+        def __init__(self, storage, dry_run):
+            sender_calls["dry_run"] = dry_run
+
+        def send_daily_digest(self, alert_schemas, alerts, source_urls, generated_at):
+            sender_calls["alerts"] = len(alerts)
+            sender_calls["urls"] = list(source_urls)
+            return {"ok": True, "dry_run": True}
+
+    monkeypatch.setattr(cli, "TelegramSender", FakeTelegramSender)
+
+    result = cli.run_pipeline(
+        days=7,
+        min_score=5,
+        regions=["sea"],
+        telegram_mode="dry",
+        export_csv=True,
+    )
+
+    assert len(result["digest"].alerts) == 1
+    assert result["digest"].alerts[0].candidate.url == "https://example.com/gojek-fresh-campaign"
+    assert result["expired_alerts_count"] == 1
+    assert sender_calls == {
+        "dry_run": True,
+        "alerts": 1,
+        "urls": ["https://example.com/gojek-fresh-campaign"],
+    }
+
+    csv_text = result["candidates_csv_path"].read_text(encoding="utf-8")
+    assert "is_expired" in csv_text
+    assert "https://example.com/grab-old-campaign" in csv_text
+    assert "True" in csv_text
+
+    with sqlite3.connect(runtime.database_path) as connection:
+        row = connection.execute(
+            "SELECT metadata_json FROM articles_raw WHERE url = ?",
+            ("https://example.com/grab-old-campaign",),
+        ).fetchone()
+    metadata = json.loads(row[0])
+    assert metadata["is_expired"] is True
+
+
+def test_old_high_signal_article_gets_green_corridor_when_new_and_above_average(
+    tmp_path, monkeypatch
+):
+    config = build_config(
+        competitors_by_region={"sea": ["Grab", "Gojek", "Bolt"]},
+    )
+    patch_runtime(monkeypatch, tmp_path, config)
+    old_high_signal = article(
+        competitor="Grab",
+        title="Grab launches major campaign in Manila",
+        url="https://example.com/grab-major-campaign",
+        published_at="2026-05-10T09:00:00Z",
+    )
+    fresh_low_signal_one = low_signal_article(
+        competitor="Gojek",
+        title="Gojek campaign update",
+        url="https://example.com/gojek-campaign-update",
+        published_at="2026-05-20T09:00:00Z",
+    )
+    fresh_low_signal_two = low_signal_article(
+        competitor="Bolt",
+        title="Bolt campaign teaser",
+        url="https://example.com/bolt-campaign-teaser",
+        published_at="2026-05-20T10:00:00Z",
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [
+            StaticProvider(
+                "mock_news",
+                [old_high_signal, fresh_low_signal_one, fresh_low_signal_two],
+            )
+        ],
+    )
+
+    result = cli.run_pipeline(
+        days=7,
+        min_score=5,
+        regions=["sea"],
+        telegram_mode="dry",
+        export_csv=True,
+    )
+
+    delivered_urls = [alert.candidate.url for alert in result["digest"].alerts]
+    assert "https://example.com/grab-major-campaign" in delivered_urls
+    assert result["expired_alerts_count"] == 0
+
+    csv_text = result["candidates_csv_path"].read_text(encoding="utf-8")
+    assert "https://example.com/grab-major-campaign" in csv_text
+    assert "False" in csv_text

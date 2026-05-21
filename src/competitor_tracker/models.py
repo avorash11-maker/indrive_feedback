@@ -53,6 +53,7 @@ class ArticleContext:
     snippet: str
     source_url: str
     article_body: str = ""
+    published_at: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)

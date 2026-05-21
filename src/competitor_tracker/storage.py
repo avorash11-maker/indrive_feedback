@@ -101,6 +101,7 @@ class JsonFileStorage:
                     "competitor",
                     "topic_group",
                     "score",
+                    "is_expired",
                     "region",
                     "country_hint",
                     "language_hint",
@@ -120,6 +121,7 @@ class JsonFileStorage:
                         "competitor": candidate.competitor,
                         "topic_group": candidate.topic_group,
                         "score": candidate.score,
+                        "is_expired": bool(candidate.raw_article.metadata.get("is_expired")),
                         "region": candidate.region or "",
                         "country_hint": candidate.country_hint or "",
                         "language_hint": candidate.language_hint or "",
@@ -299,6 +301,26 @@ class SQLiteTrackerStorage:
 
     def insert_raw_articles(self, articles: Sequence[RawArticle]) -> list[int]:
         return [self.insert_raw_article(article) for article in articles]
+
+    def merge_raw_article_metadata(
+        self,
+        *,
+        url: str,
+        metadata_updates: dict[str, Any],
+    ) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM articles_raw WHERE url = ?",
+                (url,),
+            ).fetchone()
+            if row is None:
+                return
+            current_metadata = json.loads(row["metadata_json"] or "{}")
+            current_metadata.update(metadata_updates)
+            connection.execute(
+                "UPDATE articles_raw SET metadata_json = ? WHERE url = ?",
+                (_json_dumps(current_metadata), url),
+            )
 
     def insert_candidate(self, candidate: CandidateArticle) -> int:
         raw_article_id = self.insert_raw_article(candidate.raw_article)

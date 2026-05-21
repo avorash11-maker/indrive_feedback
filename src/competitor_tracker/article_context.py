@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import logging
+import re
+from datetime import datetime
 from typing import Optional
 from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    from htmldate import find_date as extract_html_date
+except ImportError:  # pragma: no cover - exercised via runtime fallback.
+    extract_html_date = None
 
 from .models import ArticleContext, CandidateArticle
 from .normalization import clean_text
@@ -46,6 +53,7 @@ class ArticleContextExtractor:
             snippet=clean_text(candidate.raw_article.snippet),
             source_url=candidate.url,
             article_body="",
+            published_at=None,
         )
 
     def extract(self, candidate: CandidateArticle) -> ArticleContext:
@@ -58,13 +66,21 @@ class ArticleContextExtractor:
             response = self.session.get(candidate.url, timeout=self.timeout_seconds)
             response.raise_for_status()
             article_body = self._extract_page_text(response.text)
+            published_at = self._extract_published_date(response.text)
             if not article_body:
-                return fallback
+                return ArticleContext(
+                    title=fallback.title,
+                    snippet=fallback.snippet,
+                    source_url=fallback.source_url,
+                    article_body=fallback.article_body,
+                    published_at=published_at,
+                )
             return ArticleContext(
                 title=fallback.title,
                 snippet=fallback.snippet,
                 source_url=fallback.source_url,
                 article_body=article_body[: self.max_chars],
+                published_at=published_at,
             )
         except Exception as exc:
             logger.info(
@@ -108,3 +124,45 @@ class ArticleContextExtractor:
 
         fallback_text = clean_text(soup.get_text(" ", strip=True))
         return fallback_text if len(fallback_text) >= 80 else ""
+
+    @staticmethod
+    def _extract_published_date(html: str) -> Optional[str]:
+        if not html or extract_html_date is None:
+            return None
+
+        extracted = None
+        for kwargs in (
+            {"extensive_search": True, "original_date": True, "outputformat": "%Y-%m-%d"},
+            {"extensive_search": True, "original_date": True},
+            {"extensive_search": True},
+            {},
+        ):
+            try:
+                extracted = extract_html_date(html, **kwargs)
+                if extracted:
+                    break
+            except TypeError:
+                continue
+            except Exception:
+                return None
+
+        if not extracted:
+            return None
+        return ArticleContextExtractor._normalize_published_date(str(extracted))
+
+    @staticmethod
+    def _normalize_published_date(value: str) -> Optional[str]:
+        if not value:
+            return None
+
+        candidate = value.strip()
+        match = re.search(r"\d{4}-\d{2}-\d{2}", candidate)
+        if match:
+            return match.group(0)
+
+        for parser in (datetime.fromisoformat,):
+            try:
+                return parser(candidate.replace("Z", "+00:00")).date().isoformat()
+            except ValueError:
+                continue
+        return None
