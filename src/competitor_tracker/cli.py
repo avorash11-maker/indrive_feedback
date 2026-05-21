@@ -23,8 +23,12 @@ from .telegram_sender import TelegramSender
 COMMAND_NAMES = {"run", "dry-run", "send-digest", "sync-notion", "backfill"}
 POST_RANKING_LLM_TOP_N = 15
 MAX_ARTICLE_AGE_DAYS = 7
-REFERENCE_TODAY = date.fromisoformat("2026-05-21")
 HIGH_SIGNAL_SCORE_THRESHOLD = 7
+
+
+def _today() -> date:
+    """Return the current local date for freshness filtering."""
+    return date.today()
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -270,14 +274,15 @@ def _is_alert_expired(
     alert,
     alert_schema,
     *,
-    today: date = REFERENCE_TODAY,
+    today: Optional[date] = None,
     max_age_days: int = MAX_ARTICLE_AGE_DAYS,
     average_score: float = 0.0,
 ) -> bool:
+    effective_today = today or _today()
     published_date = _resolve_alert_publication_date(alert, alert_schema)
     if published_date is None:
         return False
-    if published_date >= (today - timedelta(days=max_age_days)):
+    if published_date >= (effective_today - timedelta(days=max_age_days)):
         return False
     if _has_fresh_high_signal_override(alert, average_score=average_score):
         return False
@@ -304,9 +309,10 @@ def filter_expired_digest_items(
     alert_schemas,
     article_contexts,
     *,
-    today: date = REFERENCE_TODAY,
+    today: Optional[date] = None,
     max_age_days: int = MAX_ARTICLE_AGE_DAYS,
 ):
+    effective_today = today or _today()
     filtered_alerts = []
     filtered_schemas = []
     filtered_contexts = []
@@ -323,7 +329,7 @@ def filter_expired_digest_items(
         is_expired = _is_alert_expired(
             alert,
             alert_schema,
-            today=today,
+            today=effective_today,
             max_age_days=max_age_days,
             average_score=average_score,
         )

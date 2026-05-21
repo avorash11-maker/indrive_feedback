@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,10 @@ from competitor_tracker.config import TrackerConfig, TrackerRuntimeConfig
 from competitor_tracker.models import ArticleContext, RawArticle
 from competitor_tracker.providers import ProviderError
 from competitor_tracker.storage import SQLiteTrackerStorage
+
+
+def freeze_cli_today(monkeypatch, *, iso_date: str = "2026-05-21") -> None:
+    monkeypatch.setattr(cli, "_today", lambda: date.fromisoformat(iso_date))
 
 
 def build_config(
@@ -722,6 +727,7 @@ def test_unsent_telegram_alert_is_carried_over_on_next_run(tmp_path, monkeypatch
 def test_articles_older_than_seven_days_are_archived_but_filtered_from_digest_and_telegram(
     tmp_path, monkeypatch
 ):
+    freeze_cli_today(monkeypatch)
     config = build_config()
     runtime = patch_runtime(monkeypatch, tmp_path, config)
     old_article = article(
@@ -789,6 +795,7 @@ def test_articles_older_than_seven_days_are_archived_but_filtered_from_digest_an
 def test_old_high_signal_article_gets_green_corridor_when_new_and_above_average(
     tmp_path, monkeypatch
 ):
+    freeze_cli_today(monkeypatch)
     config = build_config(
         competitors_by_region={"sea": ["Grab", "Gojek", "Bolt"]},
     )

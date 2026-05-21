@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Iterable, List, Optional, Sequence
 
 import openai
@@ -501,8 +501,6 @@ class CompetitorAlertAnalyzer:
     INSUFFICIENT_SOURCE_DATA_MESSAGE = (
         "Недостаточно данных для анализа, так как сайт источника недоступен"
     )
-    LLM_REFERENCE_DATE = "2026-05-21"
-
     def __init__(
         self,
         use_llm: bool = True,
@@ -524,6 +522,14 @@ class CompetitorAlertAnalyzer:
                 )
                 self.client = None
                 self.use_llm = False
+
+    @staticmethod
+    def _reference_today() -> date:
+        """Return the current local date for prompt-relative date resolution."""
+        return date.today()
+
+    def _reference_today_iso(self) -> str:
+        return self._reference_today().isoformat()
 
     def analyze_candidate(
         self,
@@ -573,6 +579,7 @@ class CompetitorAlertAnalyzer:
         *,
         article_context: Optional[ArticleContext] = None,
     ) -> Optional[dict[str, Any]]:
+        reference_today = self._reference_today_iso()
         system_prompt = """You are a senior international marketing strategist for inDrive with deep experience in ride-hailing, mobility marketplaces, regional go-to-market, growth, brand strategy, and competitor response.
 
 Your task is to analyze a competitor article and produce a sharp, practical alert for the inDrive Marcom and growth team.
@@ -593,7 +600,7 @@ Rules:
 - Treat `competitor` and `region` from candidate metadata as pre-detected pipeline signals, not as free fields for guesswork.
 - Do not override the provided `competitor` or `region` unless the article contains explicit evidence that the pipeline signal is wrong.
 - If the signal is ambiguous, mixed, or weak, preserve the provided pipeline `competitor` and `region`.
-- If the article metadata field `published_at` is None or missing, carefully inspect the article body for publication dates or temporal markers such as "last Thursday", "yesterday", or "two days ago". Resolve them relative to today's date: 2026-05-21. Write the final date into `published_date` using YYYY-MM-DD format.
+- If the article metadata field `published_at` is None or missing, carefully inspect the article body for publication dates or temporal markers such as "last Thursday", "yesterday", or "two days ago". Resolve them relative to today's date: {reference_today}. Write the final date into `published_date` using YYYY-MM-DD format.
 - Think like a high-level international marketer, not a generic summarizer.
 - Recommended actions must be concrete and useful for brand, growth, communications, partnerships, creative strategy, regional GTM, or driver/rider messaging.
 - Recommended actions must be applicable to inDrive, not generic advice for "a company".
@@ -618,7 +625,7 @@ Return this schema:
   "potential_impact": "string",
   "recommended_action": "string",
   "confidence": 0.0
-}"""
+}""".replace("{reference_today}", reference_today)
 
         user_prompt = """Candidate metadata:
 {candidate_payload}
@@ -630,7 +637,7 @@ Article published_at metadata: {published_at}
 Source query: {query}
 Source URL: {url}
 
-Today's date for reference: 2026-05-21. Если точной даты нет, используй контекст текста для вычисления.
+Today's date for reference: {reference_today}. Если точной даты нет, используй контекст текста для вычисления.
 
 Write the alert for the inDrive Marcom / growth team.
 
@@ -648,7 +655,9 @@ When writing:
 - "what_happened" should state the event clearly and concretely
 - "why_it_matters" should explain the strategic meaning, not just restate the article
 - "potential_impact" should focus on likely effects on trust, perception, positioning, growth, or supply-demand narrative
-- "recommended_action" should give specific next moves for inDrive, ideally in messaging, creative, partnerships, GTM, driver/rider value proposition, or local communications"""
+- "recommended_action" should give specific next moves for inDrive, ideally in messaging, creative, partnerships, GTM, driver/rider value proposition, or local communications""".replace(
+            "{reference_today}", reference_today
+        )
 
         candidate_payload = {
             "competitor": candidate.competitor,

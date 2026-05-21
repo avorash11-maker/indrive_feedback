@@ -1,8 +1,18 @@
+from datetime import date
 from types import SimpleNamespace
 
 from competitor_tracker.analyzer import CompetitorAlertAnalyzer, CompetitorAnalyzer
 from competitor_tracker.config import TrackerConfig
 from competitor_tracker.models import ArticleContext, CandidateArticle, RawArticle
+
+
+def freeze_analyzer_today(monkeypatch, *, iso_date: str = "2026-05-21") -> None:
+    frozen_date = date.fromisoformat(iso_date)
+    monkeypatch.setattr(
+        CompetitorAlertAnalyzer,
+        "_reference_today",
+        staticmethod(lambda: frozen_date),
+    )
 
 
 def build_config() -> TrackerConfig:
@@ -203,7 +213,8 @@ def test_competitor_alert_analyzer_returns_fallback_schema_without_llm():
     assert alert["recommended_action"]
 
 
-def test_competitor_alert_analyzer_uses_openai_response_shape():
+def test_competitor_alert_analyzer_uses_openai_response_shape(monkeypatch):
+    freeze_analyzer_today(monkeypatch)
     captured = {}
 
     def fake_create(**kwargs):
