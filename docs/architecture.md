@@ -42,6 +42,8 @@ The tracker first applies normalization, deduplication, topic detection, region 
 
 Regions, competitors, topic groups, query templates, provider list, and digest limits come from config, not hardcoded flows.
 
+The `competitors_by_region` matrix is also the source of truth for validating allowed `competitor + region` combinations after detection, not just for generating provider queries.
+
 ### Digest-first delivery
 
 The system is designed to decide “what is worth showing today”, not just “what was found”.
@@ -123,6 +125,7 @@ Responsibilities:
 - define regions and competitors
 - define topic groups and keyword templates
 - expand search queries for providers
+- provide the strict competitor-by-region validation matrix for downstream checks
 - keep runtime settings separate from domain config
 
 Default monitoring themes currently encoded in config:
@@ -168,6 +171,7 @@ Responsibilities:
 
 - rule-based prefilter before any optional LLM usage
 - preserve publication-date provenance for downstream freshness checks
+- validate `competitor + region` pairs against the config matrix before candidates move downstream
 - detect:
   - competitor
   - topic group
@@ -175,6 +179,8 @@ Responsibilities:
   - country hint
   - language hint
 - assign baseline score and reasons
+- treat detected `competitor` and `region` as pipeline-owned signals during LLM enrichment
+- prevent free-form LLM overrides of `competitor` and `region` unless article evidence clearly disproves the pipeline signal
 - produce alert-ready schema for readable delivery
 
 ### Ranking and Suppression
@@ -270,6 +276,8 @@ At this stage, provider dates are normalized where possible. Later, article HTML
 
 The rule-based analyzer converts valid raw articles into `CandidateArticle` objects and drops weak or irrelevant items early.
 
+At this stage, the analyzer also enforces the config truth layer for `competitor + region`. If article evidence points to a region where the detected competitor is not allowed by config, the candidate is dropped instead of being passed downstream.
+
 ### 5. History-Aware Digesting
 
 Candidates become alerts, then the digest builder:
@@ -279,6 +287,8 @@ Candidates become alerts, then the digest builder:
 - suppresses repeats
 - trims the result to a daily cap
 - optionally merges the Telegram `deferred` pool back into the next ranking pass
+
+Before final alert delivery, LLM enrichment is allowed to improve narrative fields, but `competitor` and `region` remain constrained by pipeline-detected values and config validation.
 
 ### 6. Artifacts and Delivery
 
@@ -308,6 +318,7 @@ The MVP is intentionally optimized for low-cost daily operation:
 - `SQLite` keeps history local and cheap
 - digest cap prevents operational overload
 - metadata publication dates are trusted first; LLM date inference is fallback-only
+- `competitor` and `region` remain pipeline-owned fields; the LLM may enrich explanation, but it should not freely rewrite these identifiers
 - a `7-day` anti-echo filter removes stale low-value content from delivery
 - strong newly detected stale signals can still pass via override instead of being silently lost
 - deferred carry-over prevents relevant alerts from disappearing while still avoiding a Telegram firehose

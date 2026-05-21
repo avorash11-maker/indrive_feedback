@@ -100,8 +100,25 @@ def test_prefilter_drops_articles_without_competitor_or_topic_match():
     assert result.dropped_count == 1
 
 
+def test_prefilter_drops_articles_with_competitor_region_matrix_mismatch():
+    analyzer = CompetitorAnalyzer(min_score=5, config=build_config())
+    raw_article = RawArticle(
+        title="Grab launches new pricing campaign in Mexico",
+        url="https://example.com/grab-mexico",
+        provider="google_news_rss",
+        snippet="Grab promotes discount fare options in Mexico.",
+        query='"Grab" pricing Latin America es',
+        competitor_hints=("Grab",),
+    )
+
+    result = analyzer.prefilter_raw_articles([raw_article], regions=("latam", "sea"))
+
+    assert result.candidates == []
+    assert result.dropped_count == 1
+
+
 def test_competitor_alert_analyzer_returns_fallback_schema_without_llm():
-    analyzer = CompetitorAlertAnalyzer(use_llm=False)
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
     candidate = CandidateArticle(
         raw_article=RawArticle(
             title="Grab expands driver fuel support program in the Philippines",
@@ -164,7 +181,7 @@ def test_competitor_alert_analyzer_uses_openai_response_shape():
             ]
         )
 
-    analyzer = CompetitorAlertAnalyzer(use_llm=False)
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
     analyzer.use_llm = True
     analyzer.model = "gpt-4o-mini"
     analyzer.client = SimpleNamespace(
@@ -201,6 +218,9 @@ def test_competitor_alert_analyzer_uses_openai_response_shape():
     assert "senior international marketing strategist for inDrive" in captured["messages"][0]["content"]
     assert "Think like a senior operator responsible for competitor response" in captured["messages"][0]["content"]
     assert "Do not invent facts, metrics, partnerships, timelines, internal intent, or campaign performance." in captured["messages"][0]["content"]
+    assert "Treat `competitor` and `region` from candidate metadata as pre-detected pipeline signals" in captured["messages"][0]["content"]
+    assert "Do not override the provided `competitor` or `region` unless the article contains explicit evidence" in captured["messages"][0]["content"]
+    assert "If the signal is ambiguous, mixed, or weak, preserve the provided pipeline `competitor` and `region`." in captured["messages"][0]["content"]
     assert "If the article metadata field `published_at` is None or missing" in captured["messages"][0]["content"]
     assert 'Recommended actions must be applicable to inDrive, not generic advice for "a company".' in captured["messages"][0]["content"]
     assert '"published_date": "YYYY-MM-DD"' in captured["messages"][0]["content"]
@@ -211,12 +231,15 @@ def test_competitor_alert_analyzer_uses_openai_response_shape():
     assert "Write the alert for the inDrive Marcom / growth team." in captured["messages"][1]["content"]
     assert "competitor strategy" in captured["messages"][1]["content"]
     assert "what inDrive can do better or differently" in captured["messages"][1]["content"]
+    assert "treat candidate `competitor` and `region` as pipeline-detected inputs that should stay unchanged by default" in captured["messages"][1]["content"]
+    assert "change `competitor` or `region` only if the article explicitly proves the pipeline signal is wrong" in captured["messages"][1]["content"]
+    assert "if the article is ambiguous, preserve the provided pipeline `competitor` and `region`" in captured["messages"][1]["content"]
     assert '"why_it_matters" should explain the strategic meaning, not just restate the article' in captured["messages"][1]["content"]
     assert '"recommended_action" should give specific next moves for inDrive' in captured["messages"][1]["content"]
 
 
 def test_competitor_alert_analyzer_skips_llm_when_article_body_is_unavailable():
-    analyzer = CompetitorAlertAnalyzer(use_llm=False)
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
     analyzer.use_llm = True
     analyzer.model = "gpt-4o-mini"
 
@@ -263,7 +286,7 @@ def test_competitor_alert_analyzer_skips_llm_when_article_body_is_unavailable():
 
 
 def test_competitor_alert_analyzer_marks_metadata_date_source_for_fallback():
-    analyzer = CompetitorAlertAnalyzer(use_llm=False)
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
     candidate = CandidateArticle(
         raw_article=RawArticle(
             title="Grab expands driver fuel support program in the Philippines",
@@ -315,7 +338,7 @@ def test_competitor_alert_analyzer_prefers_metadata_date_over_conflicting_llm_da
             ]
         )
 
-    analyzer = CompetitorAlertAnalyzer(use_llm=False)
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
     analyzer.use_llm = True
     analyzer.model = "gpt-4o-mini"
     analyzer.client = SimpleNamespace(
@@ -352,3 +375,69 @@ def test_competitor_alert_analyzer_prefers_metadata_date_over_conflicting_llm_da
 
     assert alert["published_date"] == "2026-05-20"
     assert alert["published_date_source"] == "metadata"
+
+
+def test_competitor_alert_analyzer_rejects_llm_competitor_region_mismatch():
+    def fake_create(**kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="""
+                        {
+                          "competitor": "Uber",
+                          "region": "latam",
+                          "country": "Mexico",
+                          "topic": "Marketing + Policy Narrative",
+                          "priority": "MEDIUM",
+                          "published_date": "2026-05-19",
+                          "published_date_source": "llm",
+                          "what_happened": "Uber launched a new campaign.",
+                          "why_it_matters": "It may shift market perception.",
+                          "potential_impact": "Potential trust and growth impact.",
+                          "recommended_action": "Respond with local messaging.",
+                          "confidence": 0.86
+                        }
+                        """
+                    )
+                )
+            ]
+        )
+
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
+    analyzer.use_llm = True
+    analyzer.model = "gpt-4o-mini"
+    analyzer.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fake_create)
+        )
+    )
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Grab offers support programs to drivers as fuel prices soar",
+            url="https://example.com/grab-fuel",
+            provider="google_news_rss",
+            snippet="Driver support programs gain public attention in the Philippines.",
+        ),
+        competitor="Grab / Move It",
+        topic_group="marketing + policy narrative",
+        score=8,
+        region="sea",
+        country_hint="Philippines",
+        language_hint="en",
+    )
+
+    alert = analyzer.analyze_candidate(
+        candidate,
+        article_context=ArticleContext(
+            title=candidate.title,
+            snippet=candidate.raw_article.snippet,
+            source_url=candidate.url,
+            article_body="A full article body is available for analysis.",
+            published_at="2026-05-20",
+        ),
+    )
+
+    assert alert["competitor"] == "Grab / Move It"
+    assert alert["region"] == "sea"
+    assert alert["country"] == "Philippines"

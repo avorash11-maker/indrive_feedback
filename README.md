@@ -13,8 +13,10 @@ The current MVP is optimized for a practical daily monitoring loop:
 
 - `SQLite` is the operational source of truth for raw articles, candidates, alerts, runs, and delivery history.
 - Regions, competitors, topic groups, keyword templates, provider list, and digest limit are driven by config.
+- `competitors_by_region` is the strict source-of-truth matrix for both query generation and downstream validation of `competitor + region` pairs.
 - News collection uses low-cost public sources: `Google News RSS` and `GDELT`.
 - A rule-based prefilter detects competitor, topic, region, country/language hints, and baseline score before any LLM call.
+- `competitor` and `region` are treated as pipeline-detected signals during alert enrichment; the LLM should preserve them unless the article contains explicit evidence that the pipeline signal is wrong.
 - Digest ranking prioritizes `priority -> freshness -> confidence/score`.
 - Duplicate suppression works both within one run and across history.
 - Publication date is resolved in layers:
@@ -43,6 +45,7 @@ The design goal is not “use AI everywhere”, but “use AI only where it help
 - `SQLite first`: the system keeps local operational history and does not depend on Notion to run.
 - `Cheap before smart`: rule-based filtering reduces unnecessary LLM usage and lowers daily cost.
 - `Config over code`: new regions, competitors, and topic groups can be adjusted without rewriting pipeline logic.
+- `Truth before rewrite`: the LLM is not allowed to freely reinterpret `competitor` and `region`; config and pipeline detections stay primary unless the article clearly disproves them.
 - `Digest, not firehose`: suppression and ranking keep the daily output readable for humans.
 - `Carry-over, not loss`: relevant alerts that miss today's Telegram window can re-enter the next run, but only for a limited time.
 - `Dates with guardrails`: metadata dates win, LLM dates are fallback-only, and very old articles are archived unless they qualify as strong newly detected signals.
@@ -153,6 +156,12 @@ It defines:
 - `keyword_templates`
 - `daily_digest_limit`
 - `enabled_providers`
+
+Important config contract:
+
+- `competitors_by_region` is not only a query-expansion helper.
+- It is the validation matrix for allowed `competitor + region` combinations in the new tracker flow.
+- If a detected or LLM-returned pair conflicts with this matrix, the pipeline should reject or normalize it instead of trusting free-form model output.
 
 The default MVP config is now aligned to these monitoring themes:
 

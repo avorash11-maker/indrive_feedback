@@ -32,6 +32,31 @@ def test_load_default_competitor_tracker_config():
     assert "bidding model" in config.topic_groups["product_features_innovation"]
     assert config.daily_digest_limit == 12
     assert config.enabled_providers == ("newsapi", "gdelt", "google_news_rss")
+    assert config.competitors_for_region("latam") == ("Uber", "DiDi", "Cabify", "99")
+    assert config.competitors_for_region("sea") == ("Grab", "Gojek", "Maxim", "Bolt")
+    assert config.competitors_for_region("africa") == ("Bolt", "Uber", "Careem", "Yassir", "Heetch")
+    assert config.competitors_for_region("mea") == ("Bolt", "Uber", "Careem", "Yassir", "Heetch")
+    assert config.competitors_for_region("cis_central_asia") == ("Yandex Go", "Bolt", "Maxim")
+    assert config.region_for_competitor("99") == ("latam",)
+    assert config.region_for_competitor("Grab") == ("sea",)
+    assert config.region_for_competitor("Careem") == ("africa", "mea")
+    assert config.region_for_competitor("Yandex Go") == ("cis_central_asia",)
+    assert config.is_competitor_allowed_in_region("Grab", "sea") is True
+    assert config.is_competitor_allowed_in_region("Grab", "latam") is False
+    assert config.is_competitor_allowed_in_region("99", "latam") is True
+    assert config.is_competitor_allowed_in_region("99", "sea") is False
+
+
+def test_competitor_truth_layer_helpers_reject_unknown_or_empty_values():
+    config = TrackerConfig.load_default()
+
+    with pytest.raises(ValueError, match="Unknown region 'unknown_region'"):
+        config.competitors_for_region("unknown_region")
+
+    assert config.region_for_competitor("") == ()
+    assert config.region_for_competitor("Unknown Brand") == ()
+    assert config.is_competitor_allowed_in_region("", "sea") is False
+    assert config.is_competitor_allowed_in_region("Grab", "unknown_region") is False
 
 
 def test_from_dict_rejects_unknown_region_reference():

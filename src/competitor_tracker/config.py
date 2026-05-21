@@ -176,6 +176,32 @@ class TrackerConfig:
             for competitor in competitors
         )
 
+    def competitors_for_region(self, region: str) -> Tuple[str, ...]:
+        """Return the configured competitor set for one region."""
+        if region not in self.competitors_by_region:
+            raise ValueError(f"Unknown region '{region}'")
+        return self.competitors_by_region[region]
+
+    def region_for_competitor(self, competitor: str) -> Tuple[str, ...]:
+        """Return every configured region where this competitor is allowed."""
+        normalized = competitor.strip()
+        if not normalized:
+            return ()
+        return tuple(
+            region
+            for region, competitors in self.competitors_by_region.items()
+            if normalized in competitors
+        )
+
+    def is_competitor_allowed_in_region(self, competitor: str, region: str) -> bool:
+        """Check whether a competitor is valid for a region according to config."""
+        if region not in self.competitors_by_region:
+            return False
+        normalized = competitor.strip()
+        if not normalized:
+            return False
+        return normalized in self.competitors_by_region[region]
+
     def queries_for_region(
         self,
         region: str,

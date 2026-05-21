@@ -197,16 +197,23 @@ def resolve_targets(
 def build_delivery_alert_schemas(
     digest_alerts,
     *,
+    config: Optional[TrackerConfig] = None,
     llm_top_n: int = POST_RANKING_LLM_TOP_N,
 ):
     """Enrich only the strongest post-ranking alerts with LLM output."""
-    fallback_analyzer = CompetitorAlertAnalyzer(use_llm=False)
+    def make_alert_analyzer(*, use_llm: bool):
+        try:
+            return CompetitorAlertAnalyzer(use_llm=use_llm, config=config)
+        except TypeError:
+            return CompetitorAlertAnalyzer(use_llm=use_llm)
+
+    fallback_analyzer = make_alert_analyzer(use_llm=False)
     if not digest_alerts:
         return [], []
 
     llm_limit = max(0, llm_top_n)
     llm_analyzer = (
-        CompetitorAlertAnalyzer(use_llm=True) if llm_limit > 0 else fallback_analyzer
+        make_alert_analyzer(use_llm=True) if llm_limit > 0 else fallback_analyzer
     )
     fallback_context_extractor = ArticleContextExtractor()
     context_extractor = (
@@ -376,7 +383,10 @@ def run_pipeline(
         else "",
         include_deferred=telegram_mode in {"dry", "send"},
     )
-    alert_schemas, article_contexts = build_delivery_alert_schemas(digest.alerts)
+    alert_schemas, article_contexts = build_delivery_alert_schemas(
+        digest.alerts,
+        config=config,
+    )
     digest, alert_schemas, article_contexts, expired_alerts = filter_expired_digest_items(
         digest,
         alert_schemas,

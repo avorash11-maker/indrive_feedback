@@ -94,6 +94,19 @@ class CompetitorAnalyzer:
             return None
 
         region_key, country_hint = self._detect_region(article, text_blob, selected_regions)
+        region_key, country_hint = self._validate_candidate_region(
+            competitor=competitor,
+            region_key=region_key,
+            country_hint=country_hint,
+            selected_regions=selected_regions,
+        )
+        if region_key is None and country_hint is None and self._is_region_mismatch(
+            competitor=competitor,
+            article=article,
+            text_blob=text_blob,
+            selected_regions=selected_regions,
+        ):
+            return None
         language_hint = self._detect_language(article, text_blob, region_key)
         score, reasons = self._score_candidate(
             article=article,
@@ -155,6 +168,51 @@ class CompetitorAnalyzer:
             if competitor.casefold() in text_blob:
                 return competitor
         return None
+
+    def _validate_candidate_region(
+        self,
+        *,
+        competitor: str,
+        region_key: Optional[str],
+        country_hint: Optional[str],
+        selected_regions: Sequence[str],
+    ) -> tuple[Optional[str], Optional[str]]:
+        if self.config is None:
+            return region_key, country_hint
+
+        if region_key and self.config.is_competitor_allowed_in_region(competitor, region_key):
+            return region_key, country_hint
+        if region_key:
+            return None, None
+
+        return None, None
+
+    def _is_region_mismatch(
+        self,
+        *,
+        competitor: str,
+        article: RawArticle,
+        text_blob: str,
+        selected_regions: Sequence[str],
+    ) -> bool:
+        if self.config is None:
+            return False
+
+        region_markers = []
+        if article.region and article.region in self.config.regions:
+            region_markers.append(article.region)
+        for region in selected_regions:
+            region_config = self.config.regions[region]
+            for geo_term in region_config.geo_terms:
+                if geo_term.casefold() in text_blob:
+                    region_markers.append(region)
+                    break
+
+        unique_markers = tuple(dict.fromkeys(region_markers))
+        return any(
+            not self.config.is_competitor_allowed_in_region(competitor, region)
+            for region in unique_markers
+        )
 
     def _detect_topic(self, text_blob: str) -> tuple[Optional[str], tuple[str, ...]]:
         if self.config is None:
@@ -347,10 +405,12 @@ class CompetitorAlertAnalyzer:
         self,
         use_llm: bool = True,
         model: Optional[str] = None,
+        config: Optional[TrackerConfig] = None,
     ) -> None:
         self.use_llm = use_llm and bool(os.getenv("OPENAI_API_KEY"))
         self.client = None
         self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.config = config
 
         if self.use_llm:
             try:
@@ -392,7 +452,7 @@ class CompetitorAlertAnalyzer:
             metadata_published_at=metadata_published_at,
             requested_source=merged.get("published_date_source"),
         )
-        return self._normalize_alert(merged)
+        return self._normalize_alert(merged, candidate=candidate)
 
     def analyze_candidates(
         self,
@@ -428,6 +488,9 @@ Rules:
 - Do not invent facts, metrics, partnerships, timelines, internal intent, or campaign performance.
 - If evidence is limited, be explicit and stay cautious.
 - Do not overstate strategic meaning when the source signal is weak.
+- Treat `competitor` and `region` from candidate metadata as pre-detected pipeline signals, not as free fields for guesswork.
+- Do not override the provided `competitor` or `region` unless the article contains explicit evidence that the pipeline signal is wrong.
+- If the signal is ambiguous, mixed, or weak, preserve the provided pipeline `competitor` and `region`.
 - If the article metadata field `published_at` is None or missing, carefully inspect the article body for publication dates or temporal markers such as "last Thursday", "yesterday", or "two days ago". Resolve them relative to today's date: 2026-05-21. Write the final date into `published_date` using YYYY-MM-DD format.
 - Think like a high-level international marketer, not a generic summarizer.
 - Recommended actions must be concrete and useful for brand, growth, communications, partnerships, creative strategy, regional GTM, or driver/rider messaging.
@@ -477,6 +540,9 @@ Focus especially on:
 - what inDrive can do better or differently
 
 When writing:
+- treat candidate `competitor` and `region` as pipeline-detected inputs that should stay unchanged by default
+- change `competitor` or `region` only if the article explicitly proves the pipeline signal is wrong
+- if the article is ambiguous, preserve the provided pipeline `competitor` and `region`
 - "what_happened" should state the event clearly and concretely
 - "why_it_matters" should explain the strategic meaning, not just restate the article
 - "potential_impact" should focus on likely effects on trust, perception, positioning, growth, or supply-demand narrative
@@ -522,7 +588,8 @@ When writing:
                     "potential_impact": "Potential impact remains unclear and needs validation.",
                     "recommended_action": self.INSUFFICIENT_SOURCE_DATA_MESSAGE,
                     "confidence": 0.0,
-                }
+                },
+                candidate=candidate,
             )
         try:
             response = self.client.chat.completions.create(
@@ -549,7 +616,7 @@ When writing:
             )
             content = response.choices[0].message.content.strip()
             content = re.sub(r"^```json\s*|\s*```$", "", content, flags=re.I | re.S)
-            return self._normalize_alert(json.loads(content))
+            return self._normalize_alert(json.loads(content), candidate=candidate)
         except Exception as exc:
             logger.warning(
                 "Competitor alert LLM analysis failed; falling back to rule-based alert. title=%r url=%r error=%s",
@@ -600,7 +667,8 @@ When writing:
                 "potential_impact": potential_impact,
                 "recommended_action": recommended_action,
                 "confidence": confidence,
-            }
+            },
+            candidate=candidate,
         )
 
     @staticmethod
@@ -611,8 +679,12 @@ When writing:
             return "MEDIUM"
         return "LOW"
 
-    @staticmethod
-    def _normalize_alert(alert: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_alert(
+        self,
+        alert: dict[str, Any],
+        *,
+        candidate: Optional[CandidateArticle] = None,
+    ) -> dict[str, Any]:
         normalized = dict(alert)
         normalized["competitor"] = CompetitorAlertAnalyzer._clean_text(
             normalized.get("competitor") or "Unknown competitor"
@@ -661,6 +733,46 @@ When writing:
         except Exception:
             confidence = 0.0
         normalized["confidence"] = max(0.0, min(1.0, confidence))
+        return self._enforce_competitor_region_truth(normalized, candidate=candidate)
+
+    def _enforce_competitor_region_truth(
+        self,
+        alert: dict[str, Any],
+        *,
+        candidate: Optional[CandidateArticle] = None,
+    ) -> dict[str, Any]:
+        if self.config is None:
+            return alert
+
+        normalized = dict(alert)
+        fallback_competitor = candidate.competitor if candidate is not None else ""
+        fallback_region = candidate.region if candidate is not None else ""
+        fallback_country = candidate.country_hint if candidate is not None else ""
+
+        competitor = normalized.get("competitor", "")
+        region = normalized.get("region", "")
+
+        if fallback_competitor and competitor != fallback_competitor:
+            allowed_regions = self.config.region_for_competitor(competitor)
+            if not allowed_regions or (fallback_region and fallback_region not in allowed_regions):
+                normalized["competitor"] = fallback_competitor
+                competitor = fallback_competitor
+
+        if region and not self.config.is_competitor_allowed_in_region(competitor, region):
+            if fallback_region and self.config.is_competitor_allowed_in_region(competitor, fallback_region):
+                normalized["region"] = fallback_region
+                region = fallback_region
+            else:
+                valid_regions = self.config.region_for_competitor(competitor)
+                normalized["region"] = valid_regions[0] if len(valid_regions) == 1 else ""
+                region = normalized["region"]
+
+        if not normalized.get("region") and fallback_region:
+            normalized["region"] = fallback_region
+
+        if fallback_country and normalized.get("region") == fallback_region:
+            normalized["country"] = fallback_country
+
         return normalized
 
     @staticmethod
