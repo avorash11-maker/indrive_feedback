@@ -44,6 +44,33 @@ def test_notion_sync_maps_alert_to_properties():
     assert properties["Status"]["select"]["name"] == "NEW"
 
 
+def test_notion_sync_uses_business_region_name_for_africa_and_mea():
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Careem launches driver support campaign in Jordan",
+            url="https://example.com/careem-jordan",
+            provider="google_news_rss",
+            source="Example News",
+            published_at="2026-05-19",
+            snippet="Driver support programs become part of public messaging in Jordan.",
+        ),
+        competitor="Careem",
+        topic_group="campaign launches",
+        score=8,
+        region="mea",
+        country_hint="Jordan",
+        language_hint="en",
+        summary="Driver support is becoming part of brand communication.",
+    )
+    alert = candidate.to_alert(priority="MEDIUM", confidence=0.82)
+    schema = CompetitorAlertAnalyzer(use_llm=False).analyze_candidate(candidate)
+    sync = CompetitorNotionMirrorSync(token="token", database_id="db")
+
+    properties = sync.map_alert_to_properties(alert, schema)
+
+    assert properties["Region"]["rich_text"][0]["text"]["content"] == "Africa & MEA"
+
+
 def test_notion_sync_uses_resolved_publication_date_from_schema_without_rerunning_resolver(monkeypatch):
     alert, schema = build_alert_and_schema()
     sync = CompetitorNotionMirrorSync(token="token", database_id="db")

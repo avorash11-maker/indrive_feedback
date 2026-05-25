@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Optional, Protocol, Sequence
 
 from .formatter import format_daily_digest_markdown
-from .models import Alert, CandidateArticle, CompetitorDigest, DeliveryRecord, RawArticle, RunSummary
+from .models import Alert, CandidateArticle, CompetitorDigest, DeliveryRecord, DroppedArticle, RawArticle, RunSummary
 
 
 class StorageBackend(Protocol):
@@ -18,6 +18,9 @@ class StorageBackend(Protocol):
 
     def save_candidates(self, candidates: Sequence[CandidateArticle]) -> Path:
         """Persist normalized candidates and return the output path."""
+
+    def save_dropped_articles(self, dropped_articles: Sequence[DroppedArticle]) -> Path:
+        """Persist rejected raw-article audit records and return the output path."""
 
     def save_digest(self, digest: CompetitorDigest) -> Path:
         """Persist digest artifact and return the output path."""
@@ -49,6 +52,15 @@ class JsonFileStorage:
     def save_candidates(self, candidates: Sequence[CandidateArticle]) -> Path:
         output_path = self.base_dir / "candidates.json"
         payload = [asdict(candidate) for candidate in candidates]
+        output_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return output_path
+
+    def save_dropped_articles(self, dropped_articles: Sequence[DroppedArticle]) -> Path:
+        output_path = self.base_dir / "dropped_articles.json"
+        payload = [asdict(item) for item in dropped_articles]
         output_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",

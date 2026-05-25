@@ -101,3 +101,14 @@ def test_format_daily_digest_markdown_renders_russian_review_view():
     assert "### Что произошло" in digest
     assert "### Почему это важно" in digest
     assert "### Источник" in digest
+
+
+def test_format_alert_card_uses_business_region_name_when_country_is_missing():
+    alert = build_alert_payload()
+    alert["country"] = ""
+    alert["region"] = "Africa & MEA"
+
+    card = format_alert_card(alert, source_url="https://example.com/careem-mea")
+
+    assert "Where: Africa & MEA" in card
+    assert "Competitor Alert — Africa & MEA" in card

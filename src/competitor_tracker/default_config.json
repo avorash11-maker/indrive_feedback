@@ -110,6 +110,7 @@
     "\"{competitor}\" {topic_keywords} {geo_terms}",
     "\"{competitor}\" {topic_name} {region_label} {language_hints}"
   ],
+  "ignored_geo_terms": ["USA", "United States", "North America", "Europe", "UK"],
   "daily_digest_limit": 12,
   "enabled_providers": ["newsapi", "gdelt", "google_news_rss"]
 }

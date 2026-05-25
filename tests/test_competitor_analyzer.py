@@ -47,6 +47,7 @@ def build_config() -> TrackerConfig:
                 "product_launch": ["launch", "rollout", "expansion", "partnership"],
             },
             "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "ignored_geo_terms": ["USA", "United States", "North America", "Europe", "UK"],
             "daily_digest_limit": 10,
             "enabled_providers": ["gdelt", "google_news_rss"],
         }
@@ -201,6 +202,46 @@ def test_prefilter_does_not_use_query_geo_terms_to_fabricate_country_hint():
     candidate = result.candidates[0]
     assert candidate.region is None
     assert candidate.country_hint is None
+
+
+def test_prefilter_drops_ignored_geo_article_and_records_reason():
+    analyzer = CompetitorAnalyzer(min_score=5, config=build_config())
+    raw_article = RawArticle(
+        title="Grab launches new airport pricing program in the United States",
+        url="https://example.com/grab-us-pricing",
+        provider="google_news_rss",
+        snippet="Grab is piloting discount airport rides across the USA market.",
+        query='"Grab" pricing Southeast Asia',
+        competitor_hints=("Grab",),
+    )
+
+    result = analyzer.prefilter_raw_articles([raw_article], regions=("sea",))
+
+    assert result.candidates == []
+    assert result.dropped_count == 1
+    assert len(result.dropped_articles) == 1
+    assert result.dropped_articles[0].reason == "ignored_geo_without_target_confirmation"
+    assert result.dropped_articles[0].details["ignored_geo_terms"] == "USA | United States"
+
+
+def test_prefilter_keeps_target_article_when_ignored_geo_and_target_geo_coexist():
+    analyzer = CompetitorAnalyzer(min_score=5, config=build_config())
+    raw_article = RawArticle(
+        title="Grab expands Singapore airport partnership after Europe travel rebound",
+        url="https://example.com/grab-singapore-europe-airport",
+        provider="google_news_rss",
+        snippet="Grab launched a discount airport program in Singapore for travelers returning from Europe.",
+        query='"Grab" pricing Southeast Asia',
+        competitor_hints=("Grab",),
+    )
+
+    result = analyzer.prefilter_raw_articles([raw_article], regions=("sea",))
+
+    assert len(result.candidates) == 1
+    candidate = result.candidates[0]
+    assert candidate.competitor == "Grab"
+    assert candidate.topic_group == "pricing"
+    assert result.dropped_articles == []
 
 
 def test_competitor_alert_analyzer_returns_fallback_schema_without_llm():
@@ -1250,11 +1291,36 @@ def test_competitor_alert_analyzer_resolves_shared_region_from_unique_country_hi
         ),
     )
 
-    assert alert["region"] == "mea"
+    assert alert["region"] == "Africa & MEA"
     assert alert["region_source"] == "geo_country_override"
     assert alert["country"] == "Saudi Arabia"
     assert alert["country_source"] == "llm"
     assert alert["geo_validation_fallback"] is True
+
+
+def test_competitor_alert_analyzer_maps_africa_and_mea_to_business_region_name():
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_africa_mea_shared_config())
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Careem launches new driver campaign in Jordan",
+            url="https://example.com/careem-jordan-campaign",
+            provider="google_news_rss",
+            snippet="Careem announced a new driver campaign in Jordan.",
+        ),
+        competitor="Careem",
+        topic_group="campaign_launches",
+        score=8,
+        region="mea",
+        country_hint="Jordan",
+        language_hint="en",
+        matched_keywords=("campaign", "driver"),
+        reasons=("priority_signal", "region_match:mea"),
+    )
+
+    alert = analyzer.analyze_candidate(candidate)
+
+    assert alert["region"] == "Africa & MEA"
+    assert alert["region_source"] == "pipeline"
 
 
 def test_competitor_alert_analyzer_keeps_region_empty_for_ambiguous_shared_country():

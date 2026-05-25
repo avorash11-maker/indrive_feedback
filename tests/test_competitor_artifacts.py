@@ -1,7 +1,7 @@
 import csv
 import json
 
-from competitor_tracker.models import CandidateArticle, RawArticle
+from competitor_tracker.models import CandidateArticle, DroppedArticle, RawArticle
 from competitor_tracker.storage import JsonFileStorage
 
 
@@ -102,6 +102,7 @@ def test_json_file_storage_keeps_run_summary_json_readable(tmp_path):
             candidates_kept=4,
             alerts_created=2,
             daily_digest_limit=10,
+            drop_reasons={"ignored_geo_without_target_confirmation": 1},
             provider_errors={"gdelt": "timeout"},
         )
     )
@@ -109,4 +110,36 @@ def test_json_file_storage_keeps_run_summary_json_readable(tmp_path):
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["queries_generated"] == 12
     assert payload["alerts_created"] == 2
+    assert payload["drop_reasons"] == {"ignored_geo_without_target_confirmation": 1}
     assert payload["provider_errors"]["gdelt"] == "timeout"
+
+
+def test_json_file_storage_saves_dropped_articles_json(tmp_path):
+    storage = JsonFileStorage(tmp_path)
+
+    path = storage.save_dropped_articles(
+        [
+            DroppedArticle(
+                url="https://example.com/grab-us-pricing",
+                title="Grab launches new airport pricing program in the United States",
+                reason="ignored_geo_without_target_confirmation",
+                details={
+                    "ignored_geo_terms": "USA | United States",
+                    "selected_regions": "sea",
+                },
+            )
+        ]
+    )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload == [
+        {
+            "url": "https://example.com/grab-us-pricing",
+            "title": "Grab launches new airport pricing program in the United States",
+            "reason": "ignored_geo_without_target_confirmation",
+            "details": {
+                "ignored_geo_terms": "USA | United States",
+                "selected_regions": "sea",
+            },
+        }
+    ]

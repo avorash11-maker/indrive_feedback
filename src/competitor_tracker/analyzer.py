@@ -14,10 +14,12 @@ import openai
 
 from .config import TrackerConfig
 from .formatter import format_alert_card
+from .geo_policy import GeoPolicy
 from .models import (
     AlertSchema,
     ArticleContext,
     CandidateArticle,
+    DroppedArticle,
     RawArticle,
     ResolvedPublicationDateSource,
 )
@@ -26,6 +28,10 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 UNDATED_FALLBACK_PUBLICATION_DATE = date.min
+BUSINESS_REGION_NAMES = {
+    "africa": "Africa & MEA",
+    "mea": "Africa & MEA",
+}
 
 
 COUNTRY_ALIAS_MAP = {
@@ -192,6 +198,7 @@ class AnalysisResult:
 
     candidates: List[CandidateArticle] = field(default_factory=list)
     dropped_count: int = 0
+    dropped_articles: List[DroppedArticle] = field(default_factory=list)
 
 
 class CompetitorAnalyzer:
@@ -204,6 +211,7 @@ class CompetitorAnalyzer:
     ) -> None:
         self.min_score = min_score
         self.config = config
+        self.geo_policy = GeoPolicy(config) if config is not None else None
 
     def analyze(
         self, candidates: Iterable[CandidateArticle]
@@ -228,37 +236,76 @@ class CompetitorAnalyzer:
             raise ValueError("TrackerConfig is required for raw article prefiltering")
 
         candidates: List[CandidateArticle] = []
+        dropped_articles: List[DroppedArticle] = []
         dropped = 0
         for article in raw_articles:
-            candidate = self._build_candidate(article, regions=regions)
+            candidate, drop_record = self._build_candidate(article, regions=regions)
             if candidate is None:
                 dropped += 1
+                if drop_record is not None:
+                    dropped_articles.append(drop_record)
                 continue
             if candidate.score >= self.min_score:
                 candidates.append(candidate)
             else:
                 dropped += 1
-        return AnalysisResult(candidates=candidates, dropped_count=dropped)
+                dropped_articles.append(
+                    DroppedArticle(
+                        url=article.url,
+                        title=article.title,
+                        reason="score_below_threshold",
+                        details={
+                            "score": str(candidate.score),
+                            "min_score": str(self.min_score),
+                        },
+                    )
+                )
+        return AnalysisResult(
+            candidates=candidates,
+            dropped_count=dropped,
+            dropped_articles=dropped_articles,
+        )
 
     def _build_candidate(
         self,
         article: RawArticle,
         *,
         regions: Optional[Sequence[str]] = None,
-    ) -> Optional[CandidateArticle]:
+    ) -> tuple[Optional[CandidateArticle], Optional[DroppedArticle]]:
         if self.config is None:
-            return None
+            return None, None
 
         text_blob = self._article_text_blob(article)
         geo_text_blob = self._geo_text_blob(article)
         selected_regions = tuple(regions or self.config.regions.keys())
         competitor = self._detect_competitor(article, text_blob, selected_regions)
         if not competitor:
-            return None
+            return None, DroppedArticle(
+                url=article.url,
+                title=article.title,
+                reason="no_competitor_match",
+            )
 
         topic_group, matched_keywords = self._detect_topic(text_blob)
         if not topic_group:
-            return None
+            return None, DroppedArticle(
+                url=article.url,
+                title=article.title,
+                reason="no_topic_match",
+                details={"competitor": competitor},
+            )
+
+        ignored_geo_decision = self._ignored_geo_decision(
+            geo_text_blob=geo_text_blob,
+            selected_regions=selected_regions,
+        )
+        if ignored_geo_decision is not None:
+            return None, DroppedArticle(
+                url=article.url,
+                title=article.title,
+                reason="ignored_geo_without_target_confirmation",
+                details=ignored_geo_decision,
+            )
 
         region_key, country_hint = self._detect_region(article, geo_text_blob, selected_regions)
         region_key, country_hint = self._validate_candidate_region(
@@ -270,10 +317,15 @@ class CompetitorAnalyzer:
         if region_key is None and country_hint is None and self._is_region_mismatch(
             competitor=competitor,
             article=article,
-            text_blob=geo_text_blob,
+            geo_text_blob=geo_text_blob,
             selected_regions=selected_regions,
         ):
-            return None
+            return None, DroppedArticle(
+                url=article.url,
+                title=article.title,
+                reason="competitor_region_mismatch",
+                details={"competitor": competitor},
+            )
         language_hint = self._detect_language(article, text_blob, region_key)
         score, reasons = self._score_candidate(
             article=article,
@@ -296,7 +348,7 @@ class CompetitorAnalyzer:
             language_hint=language_hint,
             reasons=tuple(reasons),
             summary=self._build_summary(competitor, topic_group, article.title, country_hint),
-        )
+        ), None
 
     @staticmethod
     def _article_text_blob(article: RawArticle) -> str:
@@ -315,6 +367,7 @@ class CompetitorAnalyzer:
 
     @staticmethod
     def _geo_text_blob(article: RawArticle) -> str:
+        # Region detection must rely only on article content, not the originating search query.
         return " ".join(
             value.casefold()
             for value in (
@@ -366,28 +419,37 @@ class CompetitorAnalyzer:
 
         return None, None
 
+    def _ignored_geo_decision(
+        self,
+        *,
+        geo_text_blob: str,
+        selected_regions: Sequence[str],
+    ) -> Optional[dict[str, str]]:
+        if self.geo_policy is None:
+            return None
+        return self.geo_policy.ignored_geo_decision(
+            geo_text_blob=geo_text_blob,
+            selected_regions=selected_regions,
+        )
+
     def _is_region_mismatch(
         self,
         *,
         competitor: str,
         article: RawArticle,
-        text_blob: str,
+        geo_text_blob: str,
         selected_regions: Sequence[str],
     ) -> bool:
         if self.config is None:
             return False
 
-        region_markers = []
-        if article.region and article.region in self.config.regions:
-            region_markers.append(article.region)
-        for region in selected_regions:
-            region_config = self.config.regions[region]
-            for geo_term in region_config.geo_terms:
-                if geo_term.casefold() in text_blob:
-                    region_markers.append(region)
-                    break
-
-        unique_markers = tuple(dict.fromkeys(region_markers))
+        if self.geo_policy is None:
+            return False
+        unique_markers = self.geo_policy.region_markers(
+            article_region=article.region,
+            geo_text_blob=geo_text_blob,
+            selected_regions=selected_regions,
+        )
         return any(
             not self.config.is_competitor_allowed_in_region(competitor, region)
             for region in unique_markers
@@ -411,25 +473,18 @@ class CompetitorAnalyzer:
     def _detect_region(
         self,
         article: RawArticle,
-        text_blob: str,
+        geo_text_blob: str,
         regions: Sequence[str],
     ) -> tuple[Optional[str], Optional[str]]:
         if self.config is None:
             return None, None
-
-        if article.region and article.region in self.config.regions:
-            region_config = self.config.regions[article.region]
-            for geo_term in region_config.geo_terms:
-                if geo_term.casefold() in text_blob:
-                    return article.region, geo_term
-            return article.region, None
-
-        for region in regions:
-            region_config = self.config.regions[region]
-            for geo_term in region_config.geo_terms:
-                if geo_term.casefold() in text_blob:
-                    return region, geo_term
-        return None, None
+        if self.geo_policy is None:
+            return None, None
+        return self.geo_policy.detect_region(
+            article_region=article.region,
+            geo_text_blob=geo_text_blob,
+            regions=regions,
+        )
 
     def _detect_language(
         self,
@@ -825,7 +880,7 @@ When writing:
         priority = self._priority_from_score(candidate.score)
         topic = candidate.topic_group.replace("_", " ")
         country = candidate.country_hint or ""
-        region = candidate.region or ""
+        region = self._presentable_region(candidate.region or "")
         matched = ", ".join(candidate.matched_keywords) or topic
         what_happened = (
             f"{candidate.competitor} appears in coverage related to {topic}. "
@@ -946,9 +1001,12 @@ When writing:
                 else resolved_publication_date.isoformat()
             )
             normalized["published_date_source"] = resolved_publication_date_source
+        normalized["region"] = self._presentable_region(normalized.get("region") or "")
         if not apply_truth_validation:
             return normalized  # type: ignore[return-value]
-        return self._enforce_competitor_region_truth(normalized, candidate=candidate)
+        normalized = self._enforce_competitor_region_truth(normalized, candidate=candidate)
+        normalized["region"] = self._presentable_region(normalized.get("region") or "")
+        return normalized
 
     def _enforce_competitor_region_truth(
         self,
@@ -1004,6 +1062,11 @@ When writing:
         normalized["geo_validation_fallback"] = geo_validation_fallback
 
         return normalized
+
+    @staticmethod
+    def _presentable_region(region: str) -> str:
+        cleaned_region = CompetitorAlertAnalyzer._clean_text(region)
+        return BUSINESS_REGION_NAMES.get(cleaned_region, cleaned_region)
 
     def _resolve_safe_region(
         self,

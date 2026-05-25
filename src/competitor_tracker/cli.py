@@ -516,6 +516,7 @@ def run_pipeline(
 
     storage = JsonFileStorage(runtime.output_dir)
     candidates_path = storage.save_candidates(analysis.candidates)
+    dropped_articles_path = storage.save_dropped_articles(analysis.dropped_articles)
     digest_path = storage.save_digest(digest)
     preview_path = storage.save_markdown_preview(
         digest.alerts,
@@ -537,6 +538,10 @@ def run_pipeline(
         candidates_kept=len(analysis.candidates),
         alerts_created=len(digest.alerts),
         daily_digest_limit=config.daily_digest_limit,
+        drop_reasons={
+            reason: sum(1 for item in analysis.dropped_articles if item.reason == reason)
+            for reason in sorted({item.reason for item in analysis.dropped_articles})
+        },
         provider_errors=provider_errors,
     )
     summary_path = storage.save_run_summary(run_summary)
@@ -586,6 +591,7 @@ def run_pipeline(
         "expired_alerts_count": len(expired_alerts),
         "query_count": len(config.queries_for_regions(selected_regions)),
         "candidates_path": candidates_path,
+        "dropped_articles_path": dropped_articles_path,
         "digest_path": digest_path,
         "preview_path": preview_path,
         "candidates_csv_path": candidates_csv_path,

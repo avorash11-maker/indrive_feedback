@@ -44,6 +44,7 @@ class TrackerConfig:
     keyword_templates: Tuple[str, ...]
     daily_digest_limit: int
     enabled_providers: Tuple[str, ...]
+    ignored_geo_terms: Tuple[str, ...] = ()
 
     @classmethod
     def load_default(cls) -> "TrackerConfig":
@@ -88,6 +89,7 @@ class TrackerConfig:
             keyword_templates=_dedupe_keep_order(payload["keyword_templates"]),
             daily_digest_limit=payload["daily_digest_limit"],
             enabled_providers=_dedupe_keep_order(payload["enabled_providers"]),
+            ignored_geo_terms=_dedupe_keep_order(payload.get("ignored_geo_terms", ())),
         )
 
     @staticmethod
@@ -117,6 +119,8 @@ class TrackerConfig:
             raise ValueError("'enabled_providers' must be a non-empty list")
         if not isinstance(payload["daily_digest_limit"], int) or payload["daily_digest_limit"] <= 0:
             raise ValueError("'daily_digest_limit' must be a positive integer")
+        if "ignored_geo_terms" in payload and not isinstance(payload["ignored_geo_terms"], list):
+            raise ValueError("'ignored_geo_terms' must be a list when provided")
 
         region_keys = set(payload["regions"])
         for region_key, region_data in payload["regions"].items():

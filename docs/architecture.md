@@ -126,6 +126,7 @@ Responsibilities:
 - expand search queries for providers
 - provide the strict competitor-by-region validation matrix for downstream checks
 - allow broader `country_validation_terms` for post-LLM country safety checks
+- allow global `ignored_geo_terms` so obvious non-target geographies can be dropped early
 - keep runtime settings separate from domain config
 
 Default monitoring themes currently encoded in config:
@@ -166,6 +167,7 @@ Responsibilities:
 ### Analysis
 
 - [src/competitor_tracker/analyzer.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/analyzer.py)
+- [src/competitor_tracker/geo_policy.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/geo_policy.py)
 
 Responsibilities:
 
@@ -173,6 +175,9 @@ Responsibilities:
 - preserve publication-date provenance for downstream freshness checks
 - build or reuse the canonical `resolved_publication_date` before freshness-sensitive ranking
 - validate `competitor + region` pairs against the config matrix before candidates move downstream
+- use article-only geo text for region detection, without mixing in the originating search query
+- drop articles that clearly match configured global ignored geographies unless the same article text also contains explicit target-region confirmation
+- emit structured prefilter drop reasons so operations can audit why articles were rejected
 - detect:
   - competitor
   - topic group
@@ -187,9 +192,11 @@ Responsibilities:
 - validate final `country` values against `candidate.country_hint` plus region-level `country_validation_terms`
 - when a competitor is valid in multiple regions, resolve region from detected geo/country evidence first; if that evidence is missing or ambiguous, keep the pipeline-detected region when available or leave region empty instead of trusting an LLM guess
 - if the pipeline region is missing but validated country evidence maps cleanly to one allowed region, restore that region through config-backed logic rather than from the LLM region field itself
+- map final outward-facing `africa` and `mea` region values into the single business label `Africa & MEA` for downstream delivery and analytics
 - emit internal provenance flags so downstream QA can see whether final `competitor`, `region`, and `country` came from pipeline or survived LLM enrichment
 - expose `resolved_publication_date` and `resolved_publication_date_source` so every downstream consumer uses the same canonical date
 - produce alert-ready schema for readable delivery
+- keep geo matching and ignored-geo policy isolated in a dedicated helper so region logic can evolve without bloating the analyzer orchestration
 
 ### Ranking and Suppression
 
@@ -343,6 +350,7 @@ The run produces:
 
 - `run_summary.json`
 - `candidates.json`
+- `dropped_articles.json`
 - `digest.json`
 - `digest_preview.md`
 - optional `candidates_review.csv`

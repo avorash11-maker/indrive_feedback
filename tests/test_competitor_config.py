@@ -42,6 +42,13 @@ def test_load_default_competitor_tracker_config():
     assert "bidding model" in config.topic_groups["product_features_innovation"]
     assert config.daily_digest_limit == 12
     assert config.enabled_providers == ("newsapi", "gdelt", "google_news_rss")
+    assert config.ignored_geo_terms == (
+        "USA",
+        "United States",
+        "North America",
+        "Europe",
+        "UK",
+    )
     assert config.competitors_for_region("latam") == ("Uber", "DiDi", "Cabify", "99")
     assert config.competitors_for_region("sea") == ("Grab", "Gojek", "Maxim", "Bolt")
     assert config.competitors_for_region("africa") == ("Bolt", "Uber", "Careem", "Yassir", "Heetch")
@@ -167,6 +174,28 @@ def test_from_dict_accepts_explicit_country_validation_terms():
         "Singapore",
         "Malaysia",
     )
+
+
+def test_from_dict_accepts_ignored_geo_terms():
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "sea": {
+                    "label": "Southeast Asia",
+                    "geo_terms": ["Indonesia", "Thailand"],
+                    "language_hints": ["en", "id", "th"],
+                }
+            },
+            "competitors_by_region": {"sea": ["Grab", "Gojek"]},
+            "topic_groups": {"pricing": ["price", "fare"]},
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "ignored_geo_terms": ["USA", "Europe", "USA"],
+            "daily_digest_limit": 7,
+            "enabled_providers": ["newsapi", "gdelt"],
+        }
+    )
+
+    assert config.ignored_geo_terms == ("USA", "Europe")
 
 
 def test_queries_for_region_rejects_unknown_topic_group():

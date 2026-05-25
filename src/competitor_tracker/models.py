@@ -179,6 +179,16 @@ class Alert:
 
 
 @dataclass(frozen=True, slots=True)
+class DroppedArticle:
+    """Audit record for a raw article rejected during lightweight prefiltering."""
+
+    url: str
+    title: str
+    reason: str
+    details: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class RunSummary:
     """Structured summary of one tracker execution."""
 
@@ -191,6 +201,7 @@ class RunSummary:
     candidates_kept: int
     alerts_created: int
     daily_digest_limit: int
+    drop_reasons: Dict[str, int] = field(default_factory=dict)
     provider_errors: Dict[str, str] = field(default_factory=dict)
 
 

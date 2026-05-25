@@ -164,6 +164,7 @@ It defines:
 - `competitors_by_region`
 - `topic_groups`
 - `keyword_templates`
+- `ignored_geo_terms`
 - `daily_digest_limit`
 - `enabled_providers`
 
@@ -174,7 +175,11 @@ Important config contract:
 - If a detected or LLM-returned pair conflicts with this matrix, the pipeline should reject or normalize it instead of trusting free-form model output.
 - Regions can also define `country_validation_terms` as a broader vocabulary for safe `country` validation in final alert schemas.
 - This allows the tracker to accept valid country values that are broader than the query-oriented `geo_terms`, without weakening the fallback rules.
+- `ignored_geo_terms` defines global non-target geo markers such as `USA` or `Europe`. If article text clearly matches one of these markers and does not also contain explicit target-region confirmation, the prefilter drops the article before it can reach the digest.
+- `run_summary.json` now includes aggregated `drop_reasons` so geo-policy rejections and other prefilter losses are auditable after each run.
+- `dropped_articles.json` stores article-level rejection records with structured reasons and details for manual QA of the prefilter.
 - For competitors that are valid in multiple regions, region is not inferred from competitor alone. The tracker uses detected geo/country hints first; if those hints are missing or ambiguous, it preserves the pipeline-detected region when available or leaves region empty rather than trusting an LLM guess.
+- Final outward-facing alert schemas map internal `africa` and `mea` region keys to the shared business label `Africa & MEA`, so Telegram and Notion stay aligned to one macro-region.
 - Final alert schemas can include internal provenance flags such as `competitor_source`, `region_source`, `country_source`, `published_date_source`, and `geo_validation_fallback` for QA and downstream validation.
 - Final alert schemas also include `resolved_publication_date` and `resolved_publication_date_source` as the canonical date pair used by ranking and freshness logic.
 - `region_source` may also expose `geo_country_override` when the pipeline had no trusted region, but config-backed country validation was sufficient to restore one safely.
@@ -228,6 +233,7 @@ Each run can generate a review-friendly set of artifacts in `output/competitor_t
 
 - `run_summary.json`
 - `candidates.json`
+- `dropped_articles.json`
 - `digest.json`
 - `digest_preview.md`
 - `candidates_review.csv` when `--export-csv` is enabled

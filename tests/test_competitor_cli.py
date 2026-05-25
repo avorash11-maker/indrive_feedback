@@ -13,6 +13,7 @@ def make_result():
         "article_contexts": [],
         "query_count": 0,
         "candidates_path": Path("output/competitor_tracker/candidates.json"),
+        "dropped_articles_path": Path("output/competitor_tracker/dropped_articles.json"),
         "digest_path": Path("output/competitor_tracker/digest.json"),
         "preview_path": Path("output/competitor_tracker/digest_preview.md"),
         "candidates_csv_path": None,

@@ -21,6 +21,7 @@ def build_config(
     daily_digest_limit: int = 10,
     extra_topics: dict | None = None,
     competitors_by_region: dict | None = None,
+    ignored_geo_terms: list[str] | None = None,
 ) -> TrackerConfig:
     topic_groups = {
         "market_entry": ["launch", "new city", "entering market"],
@@ -54,6 +55,13 @@ def build_config(
             "competitors_by_region": competitors_by_region or {"sea": ["Grab", "Gojek", "Bolt"]},
             "topic_groups": topic_groups,
             "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "ignored_geo_terms": ignored_geo_terms or [
+                "USA",
+                "United States",
+                "North America",
+                "Europe",
+                "UK",
+            ],
             "daily_digest_limit": daily_digest_limit,
             "enabled_providers": ["google_news_rss", "gdelt"],
         }
@@ -258,6 +266,41 @@ def test_duplicate_suppression_across_runs_uses_sqlite_history(tmp_path, monkeyp
 
     assert len(first["digest"].alerts) == 1
     assert len(second["digest"].alerts) == 0
+
+
+def test_pipeline_filters_out_grab_article_from_usa_even_when_found_by_sea_query(tmp_path, monkeypatch):
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config)
+    providers = [
+        StaticProvider(
+            "mock_news",
+            [
+                article(
+                    competitor="Grab",
+                    title="Grab launches new airport pricing program in the United States",
+                    url="https://example.com/grab-united-states-airport-pricing",
+                    query='"Grab" pricing Southeast Asia',
+                    snippet="Grab is piloting discount airport rides across the USA market.",
+                    region="sea",
+                )
+            ],
+        )
+    ]
+    monkeypatch.setattr(cli, "build_providers", lambda names: providers)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
+
+    assert result["digest"].alerts == ()
+    assert result["analysis"].candidates == []
+    assert result["analysis"].dropped_count == 1
+    assert result["analysis"].dropped_articles[0].reason == "ignored_geo_without_target_confirmation"
+    candidates_payload = json.loads(result["candidates_path"].read_text(encoding="utf-8"))
+    assert candidates_payload == []
+    dropped_payload = json.loads(result["dropped_articles_path"].read_text(encoding="utf-8"))
+    assert dropped_payload[0]["reason"] == "ignored_geo_without_target_confirmation"
+    assert dropped_payload[0]["details"]["ignored_geo_terms"] == "USA | United States"
+    summary_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
+    assert summary_payload["drop_reasons"] == {"ignored_geo_without_target_confirmation": 1}
 
 
 def test_already_sent_suppression_filters_next_run(tmp_path, monkeypatch):
