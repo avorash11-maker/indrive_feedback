@@ -10,7 +10,11 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Sequence
 
 from .article_context import ArticleContextExtractor
-from .analyzer import CompetitorAlertAnalyzer, CompetitorAnalyzer
+from .analyzer import (
+    CompetitorAlertAnalyzer,
+    CompetitorAnalyzer,
+    resolve_final_publication_date,
+)
 from .config import TrackerConfig, TrackerRuntimeConfig
 from .digest import DigestBuilder
 from .models import CompetitorDigest, RunSummary
@@ -203,6 +207,7 @@ def build_delivery_alert_schemas(
     *,
     config: Optional[TrackerConfig] = None,
     llm_top_n: int = POST_RANKING_LLM_TOP_N,
+    prefetched_contexts: Optional[dict[str, object]] = None,
 ):
     """Enrich only the strongest post-ranking alerts with LLM output."""
     def make_alert_analyzer(*, use_llm: bool):
@@ -226,11 +231,17 @@ def build_delivery_alert_schemas(
 
     alert_schemas = []
     article_contexts = []
+    reusable_contexts = prefetched_contexts or {}
     for index, alert in enumerate(digest_alerts):
-        article_context = None
+        article_context = reusable_contexts.get(alert.candidate.url)
         analyzer = llm_analyzer if index < llm_limit else fallback_analyzer
-        if context_extractor is not None and index < llm_limit:
+        if (
+            article_context is None
+            and context_extractor is not None
+            and index < llm_limit
+        ):
             article_context = context_extractor.extract(alert.candidate)
+            reusable_contexts[alert.candidate.url] = article_context
         article_contexts.append(
             article_context
             or fallback_context_extractor.build_fallback_context(alert.candidate)
@@ -242,6 +253,73 @@ def build_delivery_alert_schemas(
             )
         )
     return alert_schemas, article_contexts
+
+
+def _candidate_needs_preranking_context(
+    candidate,
+    *,
+    today: Optional[date] = None,
+    max_age_days: int = MAX_ARTICLE_AGE_DAYS,
+) -> bool:
+    provider_date = parse_published_at(candidate.published_date or "")
+    if provider_date is None:
+        return True
+
+    effective_today = today or _today()
+    provider_day = date.fromisoformat(provider_date)
+    if provider_day > effective_today:
+        return True
+    return provider_day < (effective_today - timedelta(days=max_age_days))
+
+
+def build_preranking_alert_schemas(
+    alerts,
+    *,
+    config: Optional[TrackerConfig] = None,
+    today: Optional[date] = None,
+    max_age_days: int = MAX_ARTICLE_AGE_DAYS,
+):
+    """Resolve canonical publication dates before digest ranking."""
+
+    context_extractor = ArticleContextExtractor()
+    alert_schemas = []
+    prefetched_contexts = {}
+    analyzer = None
+    effective_today = today or _today()
+    for alert in alerts:
+        provider_date = parse_published_at(alert.candidate.published_date or "")
+        needs_context = _candidate_needs_preranking_context(
+            alert.candidate,
+            today=effective_today,
+            max_age_days=max_age_days,
+        )
+        if provider_date is not None and not needs_context:
+            resolved_date = date.fromisoformat(provider_date)
+            alert_schemas.append(
+                {
+                    "published_date": resolved_date.isoformat(),
+                    "published_date_source": "provider",
+                    "resolved_publication_date": resolved_date,
+                    "resolved_publication_date_source": "provider",
+                }
+            )
+            continue
+        article_context = None
+        if needs_context:
+            article_context = context_extractor.extract(alert.candidate)
+            prefetched_contexts[alert.candidate.url] = article_context
+        if analyzer is None:
+            try:
+                analyzer = CompetitorAlertAnalyzer(use_llm=False, config=config)
+            except TypeError:
+                analyzer = CompetitorAlertAnalyzer(use_llm=False)
+        alert_schemas.append(
+            analyzer.analyze_candidate(
+                alert.candidate,
+                article_context=article_context,
+            )
+        )
+    return alert_schemas, prefetched_contexts
 
 
 def select_telegram_delivery_payload(
@@ -261,12 +339,30 @@ def select_telegram_delivery_payload(
 
 
 def _resolve_alert_publication_date(alert, alert_schema) -> Optional[date]:
-    raw_date = parse_published_at(alert.candidate.published_date or "")
+    resolved_value = alert_schema.get("resolved_publication_date")
+    resolved_source = str(
+        alert_schema.get("resolved_publication_date_source") or ""
+    ).strip().lower()
+    if isinstance(resolved_value, datetime):
+        return None if resolved_source == "undated_fallback" else resolved_value.date()
+    if isinstance(resolved_value, date):
+        return None if resolved_source == "undated_fallback" else resolved_value
+
+    resolved_date, resolved_date_source = resolve_final_publication_date(
+        alert_schema,
+        alert.candidate.raw_article,
+    )
+    if resolved_date_source != "undated_fallback":
+        alert_schema["resolved_publication_date"] = resolved_date
+        alert_schema["resolved_publication_date_source"] = resolved_date_source
+        return resolved_date
+
+    raw_date = parse_published_at(alert.candidate.raw_article.published_at or "")
     if raw_date:
-        return date.fromisoformat(raw_date)
-    schema_date = parse_published_at(str(alert_schema.get("published_date") or ""))
-    if schema_date:
-        return date.fromisoformat(schema_date)
+        fallback_date = date.fromisoformat(raw_date)
+        alert_schema["resolved_publication_date"] = fallback_date
+        alert_schema["resolved_publication_date_source"] = "provider"
+        return fallback_date
     return None
 
 
@@ -281,7 +377,7 @@ def _is_alert_expired(
     effective_today = today or _today()
     published_date = _resolve_alert_publication_date(alert, alert_schema)
     if published_date is None:
-        return False
+        return not bool(alert.candidate.raw_article.metadata.get("allow_undated"))
     if published_date >= (effective_today - timedelta(days=max_age_days)):
         return False
     if _has_fresh_high_signal_override(alert, average_score=average_score):
@@ -377,6 +473,16 @@ def run_pipeline(
 
     analyzer = CompetitorAnalyzer(min_score=min_score, config=config)
     analysis = analyzer.prefilter_raw_articles(raw_articles, regions=selected_regions)
+    prefetched_contexts: dict[str, object] = {}
+
+    def ranking_alert_schemas_builder(alerts):
+        nonlocal prefetched_contexts
+        ranking_alert_schemas, prefetched_contexts = build_preranking_alert_schemas(
+            alerts,
+            config=config,
+        )
+        return ranking_alert_schemas
+
     digest = DigestBuilder().build(
         competitors=selected_competitors,
         candidates=analysis.candidates,
@@ -388,10 +494,12 @@ def run_pipeline(
         if telegram_mode in {"dry", "send"}
         else "",
         include_deferred=telegram_mode in {"dry", "send"},
+        ranking_alert_schemas_builder=ranking_alert_schemas_builder,
     )
     alert_schemas, article_contexts = build_delivery_alert_schemas(
         digest.alerts,
         config=config,
+        prefetched_contexts=prefetched_contexts,
     )
     digest, alert_schemas, article_contexts, expired_alerts = filter_expired_digest_items(
         digest,

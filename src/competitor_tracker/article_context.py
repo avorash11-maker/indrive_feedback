@@ -54,6 +54,7 @@ class ArticleContextExtractor:
             source_url=candidate.url,
             article_body="",
             published_at=None,
+            published_at_source=None,
         )
 
     def extract(self, candidate: CandidateArticle) -> ArticleContext:
@@ -74,6 +75,7 @@ class ArticleContextExtractor:
                     source_url=fallback.source_url,
                     article_body=fallback.article_body,
                     published_at=published_at,
+                    published_at_source="html_scraped" if published_at else None,
                 )
             return ArticleContext(
                 title=fallback.title,
@@ -81,6 +83,7 @@ class ArticleContextExtractor:
                 source_url=fallback.source_url,
                 article_body=article_body[: self.max_chars],
                 published_at=published_at,
+                published_at_source="html_scraped" if published_at else None,
             )
         except Exception as exc:
             logger.info(

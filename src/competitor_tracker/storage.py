@@ -114,6 +114,8 @@ class JsonFileStorage:
                     "final_country",
                     "published_date",
                     "published_date_source",
+                    "resolved_publication_date",
+                    "resolved_publication_date_source",
                     "competitor_source",
                     "region_source",
                     "country_source",
@@ -148,6 +150,12 @@ class JsonFileStorage:
                         "final_country": alert_schema.get("country", ""),
                         "published_date": alert_schema.get("published_date", ""),
                         "published_date_source": alert_schema.get("published_date_source", ""),
+                        "resolved_publication_date": alert_schema.get(
+                            "resolved_publication_date", ""
+                        ),
+                        "resolved_publication_date_source": alert_schema.get(
+                            "resolved_publication_date_source", ""
+                        ),
                         "competitor_source": alert_schema.get("competitor_source", ""),
                         "region_source": alert_schema.get("region_source", ""),
                         "country_source": alert_schema.get("country_source", ""),

@@ -1,3 +1,6 @@
+from datetime import date
+
+import competitor_tracker.notion_sync as notion_sync
 from competitor_tracker.analyzer import CompetitorAlertAnalyzer
 from competitor_tracker.models import CandidateArticle, RawArticle
 from competitor_tracker.notion_sync import CompetitorNotionMirrorSync
@@ -39,6 +42,39 @@ def test_notion_sync_maps_alert_to_properties():
     assert properties["Confidence"]["number"] == 0.82
     assert properties["Source URL"]["url"] == "https://example.com/grab-ph"
     assert properties["Status"]["select"]["name"] == "NEW"
+
+
+def test_notion_sync_uses_resolved_publication_date_from_schema_without_rerunning_resolver(monkeypatch):
+    alert, schema = build_alert_and_schema()
+    sync = CompetitorNotionMirrorSync(token="token", database_id="db")
+    schema["resolved_publication_date"] = date(2026, 5, 18)
+    schema["resolved_publication_date_source"] = "html_scraped"
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("resolver should not be called when resolved date is already present")
+
+    monkeypatch.setattr(notion_sync, "resolve_final_publication_date", fail_if_called)
+
+    properties = sync.map_alert_to_properties(alert, schema)
+
+    assert properties["Published Date"]["date"]["start"] == "2026-05-18"
+
+
+def test_notion_sync_falls_back_to_resolver_when_resolved_date_missing(monkeypatch):
+    alert, schema = build_alert_and_schema()
+    sync = CompetitorNotionMirrorSync(token="token", database_id="db")
+    schema.pop("resolved_publication_date", None)
+    schema.pop("resolved_publication_date_source", None)
+
+    monkeypatch.setattr(
+        notion_sync,
+        "resolve_final_publication_date",
+        lambda alert_schema, candidate_raw: (date(2026, 5, 17), "provider"),
+    )
+
+    properties = sync.map_alert_to_properties(alert, schema)
+
+    assert properties["Published Date"]["date"]["start"] == "2026-05-17"
 
 
 def test_notion_sync_skips_cleanly_when_env_missing(caplog, monkeypatch):

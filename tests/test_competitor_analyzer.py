@@ -1,7 +1,11 @@
 from datetime import date
 from types import SimpleNamespace
 
-from competitor_tracker.analyzer import CompetitorAlertAnalyzer, CompetitorAnalyzer
+from competitor_tracker.analyzer import (
+    CompetitorAlertAnalyzer,
+    CompetitorAnalyzer,
+    _coerce_publication_date,
+)
 from competitor_tracker.config import TrackerConfig
 from competitor_tracker.models import ArticleContext, CandidateArticle, RawArticle
 
@@ -180,6 +184,25 @@ def test_prefilter_keeps_detected_region_without_fabricating_country_hint():
     assert candidate.country_hint is None
 
 
+def test_prefilter_does_not_use_query_geo_terms_to_fabricate_country_hint():
+    analyzer = CompetitorAnalyzer(min_score=5, config=build_config())
+    raw_article = RawArticle(
+        title="Grab launches new airport pricing program",
+        url="https://example.com/grab-generic-airport-pricing",
+        provider="google_news_rss",
+        snippet="The launch includes discount fare options for airport riders.",
+        query='"Grab" pricing Indonesia',
+        competitor_hints=("Grab",),
+    )
+
+    result = analyzer.prefilter_raw_articles([raw_article], regions=("sea",))
+
+    assert len(result.candidates) == 1
+    candidate = result.candidates[0]
+    assert candidate.region is None
+    assert candidate.country_hint is None
+
+
 def test_competitor_alert_analyzer_returns_fallback_schema_without_llm():
     analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
     candidate = CandidateArticle(
@@ -211,6 +234,11 @@ def test_competitor_alert_analyzer_returns_fallback_schema_without_llm():
     assert alert["why_it_matters"]
     assert alert["potential_impact"]
     assert alert["recommended_action"]
+
+
+def test_coerce_publication_date_returns_none_for_invalid_calendar_date():
+    assert _coerce_publication_date("2026-02-31") is None
+    assert _coerce_publication_date("published on 2026-02-31 by provider") is None
 
 
 def test_competitor_alert_analyzer_uses_openai_response_shape(monkeypatch):
@@ -278,6 +306,8 @@ def test_competitor_alert_analyzer_uses_openai_response_shape(monkeypatch):
     assert alert["confidence"] == 0.86
     assert alert["published_date"] == "2026-05-19"
     assert alert["published_date_source"] == "llm"
+    assert alert["resolved_publication_date"].isoformat() == "2026-05-19"
+    assert alert["resolved_publication_date_source"] == "llm"
     assert "driver support" in alert["what_happened"].lower()
     assert "senior international marketing strategist for inDrive" in captured["messages"][0]["content"]
     assert "Think like a senior operator responsible for competitor response" in captured["messages"][0]["content"]
@@ -285,10 +315,11 @@ def test_competitor_alert_analyzer_uses_openai_response_shape(monkeypatch):
     assert "Treat `competitor` and `region` from candidate metadata as pre-detected pipeline signals" in captured["messages"][0]["content"]
     assert "Do not override the provided `competitor` or `region` unless the article contains explicit evidence" in captured["messages"][0]["content"]
     assert "If the signal is ambiguous, mixed, or weak, preserve the provided pipeline `competitor` and `region`." in captured["messages"][0]["content"]
-    assert "If the article metadata field `published_at` is None or missing" in captured["messages"][0]["content"]
+    assert "Resolve the final publication date with this priority" in captured["messages"][0]["content"]
+    assert "If the provider `published_at` field is None or missing" in captured["messages"][0]["content"]
     assert 'Recommended actions must be applicable to inDrive, not generic advice for "a company".' in captured["messages"][0]["content"]
     assert '"published_date": "YYYY-MM-DD"' in captured["messages"][0]["content"]
-    assert '"published_date_source": "metadata|llm|unknown"' in captured["messages"][0]["content"]
+    assert '"published_date_source": "provider|html_scraped|llm|undated_fallback"' in captured["messages"][0]["content"]
     assert '"recommended_action": "string"' in captured["messages"][0]["content"]
     assert "Today's date for reference: 2026-05-21." in captured["messages"][1]["content"]
     assert "Article published_at metadata:" in captured["messages"][1]["content"]
@@ -343,13 +374,14 @@ def test_competitor_alert_analyzer_skips_llm_when_article_body_is_unavailable():
     assert alert["competitor"] == "Grab / Move It"
     assert alert["country"] == "Philippines"
     assert alert["published_date"] == ""
-    assert alert["published_date_source"] == "unknown"
+    assert alert["published_date_source"] == "undated_fallback"
+    assert alert["resolved_publication_date_source"] == "undated_fallback"
     assert alert["why_it_matters"] == analyzer.INSUFFICIENT_SOURCE_DATA_MESSAGE
     assert alert["recommended_action"] == analyzer.INSUFFICIENT_SOURCE_DATA_MESSAGE
     assert alert["confidence"] == 0.0
 
 
-def test_competitor_alert_analyzer_marks_metadata_date_source_for_fallback():
+def test_competitor_alert_analyzer_marks_provider_date_source_for_fallback():
     analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
     candidate = CandidateArticle(
         raw_article=RawArticle(
@@ -372,10 +404,152 @@ def test_competitor_alert_analyzer_marks_metadata_date_source_for_fallback():
     alert = analyzer.analyze_candidate(candidate)
 
     assert alert["published_date"] == "2026-05-20"
-    assert alert["published_date_source"] == "metadata"
+    assert alert["published_date_source"] == "provider"
+    assert alert["resolved_publication_date"].isoformat() == "2026-05-20"
+    assert alert["resolved_publication_date_source"] == "provider"
 
 
-def test_competitor_alert_analyzer_prefers_metadata_date_over_conflicting_llm_date():
+def test_competitor_alert_analyzer_prefers_llm_date_when_provider_is_missing_even_if_html_exists():
+    def fake_create(**kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="""
+                        {
+                          "competitor": "Grab / Move It",
+                          "region": "sea",
+                          "country": "Philippines",
+                          "topic": "Marketing + Policy Narrative",
+                          "priority": "MEDIUM",
+                          "published_date": "2026-05-18",
+                          "published_date_source": "llm",
+                          "what_happened": "Platforms are promoting driver support programs as part of public messaging.",
+                          "why_it_matters": "Driver support is becoming part of brand communication, not just operations.",
+                          "potential_impact": "Improved driver perception and stronger trust narrative.",
+                          "recommended_action": "Highlight driver benefits in campaigns and test driver care messaging.",
+                          "confidence": 0.86
+                        }
+                        """
+                    )
+                )
+            ]
+        )
+
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
+    analyzer.use_llm = True
+    analyzer.model = "gpt-4o-mini"
+    analyzer.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fake_create)
+        )
+    )
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Grab expands driver fuel support program in the Philippines",
+            url="https://example.com/grab-ph-html-date",
+            provider="google_news_rss",
+            snippet="Grab promotes driver support and subsidies in the Philippines.",
+            published_at=None,
+        ),
+        competitor="Grab / Move It",
+        topic_group="marketing + policy narrative",
+        score=7,
+        region="sea",
+        country_hint="Philippines",
+        language_hint="en",
+        matched_keywords=("support", "subsidies"),
+        reasons=("priority_signal", "region_match:sea"),
+    )
+
+    alert = analyzer.analyze_candidate(
+        candidate,
+        article_context=ArticleContext(
+            title=candidate.title,
+            snippet=candidate.raw_article.snippet,
+            source_url=candidate.url,
+            article_body="A full article body is available for analysis.",
+            published_at="2026-05-19",
+            published_at_source="html_scraped",
+        ),
+    )
+
+    assert alert["published_date"] == "2026-05-18"
+    assert alert["published_date_source"] == "llm"
+    assert alert["resolved_publication_date_source"] == "llm"
+
+
+def test_competitor_alert_analyzer_prefers_llm_date_over_html_scraped_and_provider_dates():
+    def fake_create(**kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="""
+                        {
+                          "competitor": "Grab / Move It",
+                          "region": "sea",
+                          "country": "Philippines",
+                          "topic": "Marketing + Policy Narrative",
+                          "priority": "MEDIUM",
+                          "published_date": "2026-05-18",
+                          "published_date_source": "llm",
+                          "what_happened": "Platforms are promoting driver support programs as part of public messaging.",
+                          "why_it_matters": "Driver support is becoming part of brand communication, not just operations.",
+                          "potential_impact": "Improved driver perception and stronger trust narrative.",
+                          "recommended_action": "Highlight driver benefits in campaigns and test driver care messaging.",
+                          "confidence": 0.86
+                        }
+                        """
+                    )
+                )
+            ]
+        )
+
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
+    analyzer.use_llm = True
+    analyzer.model = "gpt-4o-mini"
+    analyzer.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fake_create)
+        )
+    )
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Grab expands driver fuel support program in the Philippines",
+            url="https://example.com/grab-ph-provider-date",
+            provider="google_news_rss",
+            snippet="Grab promotes driver support and subsidies in the Philippines.",
+            published_at="2026-05-20T09:00:00Z",
+        ),
+        competitor="Grab / Move It",
+        topic_group="marketing + policy narrative",
+        score=7,
+        region="sea",
+        country_hint="Philippines",
+        language_hint="en",
+        matched_keywords=("support", "subsidies"),
+        reasons=("priority_signal", "region_match:sea"),
+    )
+
+    alert = analyzer.analyze_candidate(
+        candidate,
+        article_context=ArticleContext(
+            title=candidate.title,
+            snippet=candidate.raw_article.snippet,
+            source_url=candidate.url,
+            article_body="A full article body is available for analysis.",
+            published_at="2026-05-19",
+            published_at_source="html_scraped",
+        ),
+    )
+
+    assert alert["published_date"] == "2026-05-18"
+    assert alert["published_date_source"] == "llm"
+    assert alert["resolved_publication_date_source"] == "llm"
+
+
+def test_competitor_alert_analyzer_prefers_llm_date_over_conflicting_provider_date():
     def fake_create(**kwargs):
         return SimpleNamespace(
             choices=[
@@ -437,8 +611,8 @@ def test_competitor_alert_analyzer_prefers_metadata_date_over_conflicting_llm_da
         ),
     )
 
-    assert alert["published_date"] == "2026-05-20"
-    assert alert["published_date_source"] == "metadata"
+    assert alert["published_date"] == "2026-05-18"
+    assert alert["published_date_source"] == "llm"
 
 
 def test_competitor_alert_analyzer_rejects_llm_competitor_region_mismatch():

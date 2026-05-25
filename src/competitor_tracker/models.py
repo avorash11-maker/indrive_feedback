@@ -3,8 +3,39 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
-from typing import Dict, List, Optional, Tuple
+from datetime import date, datetime
+from typing import Dict, List, Literal, Optional, Tuple, TypedDict
+
+
+ResolvedPublicationDateSource = Literal[
+    "provider",
+    "html_scraped",
+    "llm",
+    "undated_fallback",
+]
+
+
+class AlertSchema(TypedDict, total=False):
+    """Readable alert payload enriched with publication-date provenance."""
+
+    competitor: str
+    competitor_source: str
+    region: str
+    region_source: str
+    country: str
+    country_source: str
+    topic: str
+    priority: str
+    published_date: str
+    published_date_source: ResolvedPublicationDateSource
+    resolved_publication_date: date | datetime
+    resolved_publication_date_source: ResolvedPublicationDateSource
+    what_happened: str
+    why_it_matters: str
+    potential_impact: str
+    recommended_action: str
+    confidence: float
+    geo_validation_fallback: bool
 
 
 def _normalize_tags(values: List[str] | Tuple[str, ...]) -> Tuple[str, ...]:
@@ -54,6 +85,7 @@ class ArticleContext:
     source_url: str
     article_body: str = ""
     published_at: Optional[str] = None
+    published_at_source: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)

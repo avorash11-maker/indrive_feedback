@@ -50,22 +50,19 @@ The system is designed to decide “what is worth showing today”, not just “
 
 ### Dates with layered confidence
 
-Publication date is not taken from one source blindly. The tracker resolves it in layers:
+Publication date is not taken from one source blindly. The tracker resolves one canonical date for the whole pipeline through:
 
-- provider-level or normalized `published_at`
-- HTML extraction via `htmldate`
-- optional LLM inference only when metadata date is missing
+- `resolved_publication_date`
+- `resolved_publication_date_source`
 
-The final trust priority is:
+The canonical trust priority is:
 
-- `metadata`
 - `llm`
-- `unknown`
+- `html_scraped`
+- `provider`
+- `undated_fallback`
 
-This is surfaced through:
-
-- `published_date`
-- `published_date_source`
+This canonical pair is computed before final digest ranking. User-facing `published_date` mirrors it for dated articles, while undated fallback stays internal and is exposed outward as an empty string instead of `0001-01-01`.
 
 ### Managed carry-over
 
@@ -79,10 +76,11 @@ The Telegram path is not a blind retry queue. The tracker keeps a bounded carry-
 
 ### Anti-echo freshness filter
 
-The tracker does not send obviously stale articles into the main digest by default. Final delivery applies a `7-day` gate:
+The tracker does not send obviously stale articles into the main digest by default. Freshness logic uses the canonical resolved date, not a raw provider string. Final delivery applies a `7-day` gate:
 
 - articles newer than `7 days` can proceed normally
 - clearly stale alerts are archived and marked `is_expired = True`
+- alerts with no trustworthy date are treated as suspicious and filtered out by default
 - stale articles can still pass if they are newly detected and materially stronger than the average alert score in the current run
 
 This prevents noisy “echoes” from old stories while still allowing late-breaking pickups or major rewrites from large publishers to reach the team.
@@ -95,21 +93,22 @@ graph TD
     B --> C[Providers]
     C --> D[Normalization + Raw Dedup]
     D --> E[Rule-Based Prefilter]
-    E --> F[SQLite History]
-    F --> G[Ranking + Suppression]
-    G --> H[Alert Schemas]
-    H --> I[Local Artifacts]
-    H --> J[Telegram Delivery]
-    H --> K[Optional Notion Mirror]
+    E --> F[Pre-Ranking Date Resolution]
+    F --> G[SQLite History]
+    G --> H[Ranking + Suppression]
+    H --> I[Final Alert Schemas]
+    I --> J[Local Artifacts]
+    I --> K[Telegram Delivery]
+    I --> L[Optional Notion Mirror]
 
     C --> C1[Google News RSS]
     C --> C2[GDELT]
 
-    I --> I1[run_summary.json]
-    I --> I2[digest.json]
-    I --> I3[digest_preview.md]
-    I --> I4[candidates_review.csv]
-    I --> I5[tracker.db]
+    J --> J1[run_summary.json]
+    J --> J2[digest.json]
+    J --> J3[digest_preview.md]
+    J --> J4[candidates_review.csv]
+    J --> J5[tracker.db]
 ```
 
 ## Main Modules
@@ -172,6 +171,7 @@ Responsibilities:
 
 - rule-based prefilter before any optional LLM usage
 - preserve publication-date provenance for downstream freshness checks
+- build or reuse the canonical `resolved_publication_date` before freshness-sensitive ranking
 - validate `competitor + region` pairs against the config matrix before candidates move downstream
 - detect:
   - competitor
@@ -182,9 +182,13 @@ Responsibilities:
 - assign baseline score and reasons
 - treat detected `competitor` and `region` as pipeline-owned signals during LLM enrichment
 - prevent free-form LLM overrides of `competitor` and `region` unless article evidence clearly disproves the pipeline signal
+- make `candidate.competitor` authoritative over conflicting LLM output
+- make `candidate.region` authoritative when the pipeline already detected a region
 - validate final `country` values against `candidate.country_hint` plus region-level `country_validation_terms`
 - when a competitor is valid in multiple regions, resolve region from detected geo/country evidence first; if that evidence is missing or ambiguous, keep the pipeline-detected region when available or leave region empty instead of trusting an LLM guess
+- if the pipeline region is missing but validated country evidence maps cleanly to one allowed region, restore that region through config-backed logic rather than from the LLM region field itself
 - emit internal provenance flags so downstream QA can see whether final `competitor`, `region`, and `country` came from pipeline or survived LLM enrichment
+- expose `resolved_publication_date` and `resolved_publication_date_source` so every downstream consumer uses the same canonical date
 - produce alert-ready schema for readable delivery
 
 ### Ranking and Suppression
@@ -206,6 +210,12 @@ Responsibilities:
 - apply top-N digest limit
 - re-introduce fresh `deferred` Telegram alerts for the next run without keeping them forever
 
+Important date behavior:
+
+- digest freshness sorting now reads `resolved_publication_date` from prebuilt alert schemas
+- articles with missing or suspicious provider dates can receive cheap HTML date extraction before ranking
+- `undated_fallback` is represented internally by `date.min`, which intentionally sorts to the very end
+
 ### Storage
 
 - [src/competitor_tracker/storage.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/storage.py)
@@ -215,6 +225,7 @@ Responsibilities:
 - persist local JSON / CSV / Markdown artifacts
 - maintain `SQLite` operational history
 - keep archived stale articles available for QA through metadata and artifacts
+- store canonical resolved publication-date fields in review CSV for debugging and auditability
 
 Current `SQLite` tables:
 
@@ -274,7 +285,7 @@ Providers fetch raw public articles and map them into `RawArticle`.
 
 Raw articles are normalized and deduplicated before scoring.
 
-At this stage, provider dates are normalized where possible. Later, article HTML can enrich publication date detection through `htmldate`, and the LLM may infer a date only when metadata is missing.
+At this stage, provider dates are normalized where possible. Region and country detection come from article-facing fields, not from the search query. Publication date may later be enriched from article HTML or LLM evidence, but all sources converge into one canonical resolved date.
 
 ### 4. Prefilter
 
@@ -282,9 +293,22 @@ The rule-based analyzer converts valid raw articles into `CandidateArticle` obje
 
 At this stage, the analyzer also enforces the config truth layer for `competitor + region`. If article evidence points to a region where the detected competitor is not allowed by config, the candidate is dropped instead of being passed downstream.
 
-### 5. History-Aware Digesting
+For geo detection specifically, the search `query` is no longer treated as location evidence. Region and `country_hint` are derived only from article-facing text such as title, snippet/body, and source metadata.
 
-Candidates become alerts, then the digest builder:
+### 5. Pre-Ranking Date Resolution
+
+Before final ranking, the pipeline builds alert schemas early enough to compute `resolved_publication_date` in advance.
+
+- normal provider dates can stay on the cheap path
+- missing provider dates can trigger early HTML extraction
+- suspicious provider dates such as stale or future dates can also trigger early HTML extraction
+- all of those paths converge through the same `resolve_final_publication_date(...)` helper
+
+This removes the old architectural skew where ranking happened before final date resolution.
+
+### 6. History-Aware Digesting
+
+Candidates become alerts, and the digest builder ranks them using precomputed canonical dates:
 
 - ranks them
 - compares against history
@@ -292,12 +316,28 @@ Candidates become alerts, then the digest builder:
 - trims the result to a daily cap
 - optionally merges the Telegram `deferred` pool back into the next ranking pass
 
-Before final alert delivery, LLM enrichment is allowed to improve narrative fields, but `competitor` and `region` remain constrained by pipeline-detected values and config validation.
-The same principle applies to `country`: a detected `candidate.country_hint` stays primary, while region-level `country_validation_terms` improve recall for otherwise safe LLM country values.
-The tracker also keeps internal provenance markers such as `competitor_source`, `region_source`, `country_source`, and `geo_validation_fallback` so validation outcomes remain inspectable without changing the human-readable formatter.
-Those validation markers should be visible in local review artifacts like markdown preview and CSV export, but they should not clutter the Telegram delivery card.
+Before final alert delivery, LLM enrichment is allowed to improve narrative fields, but it is not treated as the authority for core identity fields.
+In the current implementation:
 
-### 6. Artifacts and Delivery
+- conflicting LLM `competitor` values fall back to `candidate.competitor`
+- `candidate.region` stays primary when it already exists
+- if `candidate.region` is missing, region may still be restored from validated country evidence and the config truth layer
+- conflicting or weak `country` values fall back to `candidate.country_hint` or become empty
+
+The tracker keeps internal provenance markers such as:
+
+- `competitor_source`
+- `region_source`
+- `country_source`
+- `published_date_source`
+- `resolved_publication_date_source`
+- `geo_validation_fallback`
+
+`region_source` can also become `geo_country_override` when the final region was restored from validated country evidence rather than preserved from the incoming pipeline field.
+
+Those validation markers are visible in local review artifacts like markdown preview and CSV export, but they are intentionally kept out of the Telegram card.
+
+### 7. Artifacts and Delivery
 
 The run produces:
 
@@ -316,6 +356,12 @@ And optionally:
 Telegram-specific carry-over only applies to the delivery path. Local-only runs still produce artifacts and history, but they do not keep building an endless retry queue.
 Stale alerts that fail the final `7-day` gate do not reach Telegram or the main digest, but they remain visible in archive artifacts and `SQLite` metadata for auditability.
 
+Downstream consumers now follow the canonical date contract:
+
+- Telegram receives user-facing `published_date`, which stays empty for undated fallback cases
+- CSV review artifacts include both outward `published_date` and technical `resolved_publication_date`
+- Notion reads the already computed resolved date from the final schema and only falls back to the resolver if that field is unexpectedly absent
+
 ## Low-Cost Daily Digest Strategy
 
 The MVP is intentionally optimized for low-cost daily operation:
@@ -324,7 +370,7 @@ The MVP is intentionally optimized for low-cost daily operation:
 - most filtering happens before any richer analysis step
 - `SQLite` keeps history local and cheap
 - digest cap prevents operational overload
-- metadata publication dates are trusted first; LLM date inference is fallback-only
+- ranking, stale gate, CSV, and Notion all use the same canonical resolved publication date
 - `competitor` and `region` remain pipeline-owned fields; the LLM may enrich explanation, but it should not freely rewrite these identifiers
 - a `7-day` anti-echo filter removes stale low-value content from delivery
 - strong newly detected stale signals can still pass via override instead of being silently lost

@@ -80,6 +80,7 @@ def article(
     snippet: str = "",
     source: str = "Example News",
     region: str = "sea",
+    metadata: dict | None = None,
 ) -> RawArticle:
     return RawArticle(
         title=title,
@@ -92,6 +93,7 @@ def article(
         region=region,
         language="en",
         competitor_hints=(competitor,),
+        metadata=metadata or {},
     )
 
 
@@ -286,6 +288,7 @@ def test_already_sent_suppression_filters_next_run(tmp_path, monkeypatch):
 
 
 def test_top_digest_cap_limits_integration_output_to_ten(tmp_path, monkeypatch):
+    freeze_cli_today(monkeypatch)
     articles = build_capped_articles(12)
     config = build_config(
         daily_digest_limit=10,
@@ -844,3 +847,225 @@ def test_old_high_signal_article_gets_green_corridor_when_new_and_above_average(
     csv_text = result["candidates_csv_path"].read_text(encoding="utf-8")
     assert "https://example.com/grab-major-campaign" in csv_text
     assert "False" in csv_text
+
+
+def test_undated_articles_are_expired_by_default_when_no_date_can_be_resolved(
+    tmp_path, monkeypatch
+):
+    freeze_cli_today(monkeypatch)
+    config = build_config()
+    runtime = patch_runtime(monkeypatch, tmp_path, config)
+    undated_article = article(
+        competitor="Grab",
+        title="Grab launches driver program in Manila",
+        url="https://example.com/grab-undated-driver-program",
+        published_at=None,
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [StaticProvider("mock_news", [undated_article])],
+    )
+
+    result = cli.run_pipeline(
+        days=7,
+        min_score=5,
+        regions=["sea"],
+        telegram_mode="dry",
+        export_csv=True,
+    )
+
+    assert len(result["digest"].alerts) == 0
+    assert result["expired_alerts_count"] == 1
+
+    csv_text = result["candidates_csv_path"].read_text(encoding="utf-8")
+    assert "https://example.com/grab-undated-driver-program" in csv_text
+    assert "True" in csv_text
+
+    with sqlite3.connect(runtime.database_path) as connection:
+        row = connection.execute(
+            "SELECT metadata_json FROM articles_raw WHERE url = ?",
+            ("https://example.com/grab-undated-driver-program",),
+        ).fetchone()
+    metadata = json.loads(row[0])
+    assert metadata["is_expired"] is True
+
+
+def test_undated_articles_can_pass_only_with_explicit_allow_flag(
+    tmp_path, monkeypatch
+):
+    freeze_cli_today(monkeypatch)
+    config = build_config()
+    runtime = patch_runtime(monkeypatch, tmp_path, config)
+    undated_article = article(
+        competitor="Grab",
+        title="Grab launches driver program in Manila",
+        url="https://example.com/grab-undated-driver-program-allowed",
+        published_at=None,
+        metadata={"allow_undated": True},
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [StaticProvider("mock_news", [undated_article])],
+    )
+
+    result = cli.run_pipeline(
+        days=7,
+        min_score=5,
+        regions=["sea"],
+        telegram_mode="dry",
+        export_csv=True,
+    )
+
+    assert len(result["digest"].alerts) == 1
+    assert result["expired_alerts_count"] == 0
+    assert result["digest"].alerts[0].candidate.url == "https://example.com/grab-undated-driver-program-allowed"
+
+    with sqlite3.connect(runtime.database_path) as connection:
+        row = connection.execute(
+            "SELECT metadata_json FROM articles_raw WHERE url = ?",
+            ("https://example.com/grab-undated-driver-program-allowed",),
+        ).fetchone()
+    metadata = json.loads(row[0])
+    assert metadata["is_expired"] is False
+
+
+@pytest.mark.parametrize(
+    ("resolved_source", "resolved_date"),
+    [
+        ("html_scraped", "2026-05-20"),
+        ("llm", "2026-05-20"),
+    ],
+)
+def test_freshness_gate_prefers_resolved_schema_date_over_stale_provider_date(
+    tmp_path,
+    monkeypatch,
+    resolved_source,
+    resolved_date,
+):
+    freeze_cli_today(monkeypatch)
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config)
+    stale_provider_article = article(
+        competitor="Grab",
+        title="Grab campaign with corrected final publication date",
+        url=f"https://example.com/grab-resolved-{resolved_source}",
+        published_at="2026-05-10T09:00:00Z",
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [StaticProvider("mock_news", [stale_provider_article])],
+    )
+
+    class FakeAlertAnalyzer:
+        def __init__(self, use_llm, model=None, config=None):
+            self.use_llm = use_llm
+
+        def analyze_candidate(self, candidate, *, article_context=None):
+            resolved = date.fromisoformat(resolved_date)
+            return {
+                "competitor": candidate.competitor,
+                "region": candidate.region or "",
+                "country": candidate.country_hint or "",
+                "topic": candidate.topic_group,
+                "priority": "MEDIUM",
+                "published_date": resolved.isoformat(),
+                "published_date_source": resolved_source,
+                "resolved_publication_date": resolved,
+                "resolved_publication_date_source": resolved_source,
+                "what_happened": candidate.title,
+                "why_it_matters": "resolved date should control freshness",
+                "potential_impact": "impact",
+                "recommended_action": "act",
+                "confidence": 0.7,
+            }
+
+    monkeypatch.setattr(cli, "CompetitorAlertAnalyzer", FakeAlertAnalyzer)
+
+    result = cli.run_pipeline(
+        days=7,
+        min_score=5,
+        regions=["sea"],
+        telegram_mode="dry",
+    )
+
+    assert len(result["digest"].alerts) == 1
+    assert result["expired_alerts_count"] == 0
+    assert result["alert_schemas"][0]["resolved_publication_date"].isoformat() == resolved_date
+    assert result["alert_schemas"][0]["resolved_publication_date_source"] == resolved_source
+
+
+def test_preranking_html_date_overrides_stale_provider_date_and_changes_digest_order(
+    tmp_path, monkeypatch
+):
+    freeze_cli_today(monkeypatch)
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config)
+    stale_provider_article = article(
+        competitor="Grab",
+        title="Grab launches campaign with stale provider date",
+        url="https://example.com/grab-stale-provider-date",
+        published_at="2026-05-10T09:00:00Z",
+    )
+    fresh_provider_article = article(
+        competitor="Gojek",
+        title="Gojek launches campaign with fresh provider date",
+        url="https://example.com/gojek-fresh-provider-date",
+        published_at="2026-05-19T09:00:00Z",
+    )
+    monkeypatch.setattr(
+        cli,
+        "collect_raw_articles",
+        lambda **kwargs: (
+            [fresh_provider_article, stale_provider_article],
+            ["mock_news"],
+            {},
+        ),
+    )
+
+    extractor_calls = []
+
+    class FakeContextExtractor:
+        def extract(self, candidate):
+            extractor_calls.append(candidate.url)
+            published_at = (
+                "2026-05-20"
+                if candidate.url == "https://example.com/grab-stale-provider-date"
+                else None
+            )
+            return ArticleContext(
+                title=candidate.title,
+                snippet=candidate.raw_article.snippet,
+                source_url=candidate.url,
+                article_body=f"body for {candidate.title}",
+                published_at=published_at,
+                published_at_source="html_scraped" if published_at else None,
+            )
+
+        def build_fallback_context(self, candidate):
+            return ArticleContext(
+                title=candidate.title,
+                snippet=candidate.raw_article.snippet,
+                source_url=candidate.url,
+                article_body="",
+                published_at=None,
+                published_at_source=None,
+            )
+
+    monkeypatch.setattr(cli, "ArticleContextExtractor", FakeContextExtractor)
+
+    result = cli.run_pipeline(
+        days=30,
+        min_score=5,
+        regions=["sea"],
+    )
+
+    assert extractor_calls == ["https://example.com/grab-stale-provider-date"]
+    assert [alert.candidate.url for alert in result["digest"].alerts[:2]] == [
+        "https://example.com/grab-stale-provider-date",
+        "https://example.com/gojek-fresh-provider-date",
+    ]
+    assert result["alert_schemas"][0]["resolved_publication_date"].isoformat() == "2026-05-20"
+    assert result["alert_schemas"][0]["resolved_publication_date_source"] == "html_scraped"

@@ -8,16 +8,24 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Iterable, List, Optional, Sequence
+from typing import Any, Iterable, List, Mapping, Optional, Sequence
 
 import openai
 
 from .config import TrackerConfig
 from .formatter import format_alert_card
-from .models import ArticleContext, CandidateArticle, RawArticle
+from .models import (
+    AlertSchema,
+    ArticleContext,
+    CandidateArticle,
+    RawArticle,
+    ResolvedPublicationDateSource,
+)
 
 
 logger = logging.getLogger(__name__)
+
+UNDATED_FALLBACK_PUBLICATION_DATE = date.min
 
 
 COUNTRY_ALIAS_MAP = {
@@ -119,6 +127,65 @@ COUNTRY_ALIAS_MAP = {
 }
 
 
+def _coerce_publication_date(value: Any) -> Optional[date]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    candidate = str(value).strip()
+    match = re.search(r"\d{4}-\d{2}-\d{2}", candidate)
+    if match:
+        try:
+            return date.fromisoformat(match.group(0))
+        except Exception:
+            return None
+
+    try:
+        return datetime.fromisoformat(candidate.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def resolve_final_publication_date(
+    alert_schema: Mapping[str, Any],
+    candidate_raw: RawArticle,
+) -> tuple[date, ResolvedPublicationDateSource]:
+    """Resolve one canonical publication date for the whole tracker."""
+    resolved_value = _coerce_publication_date(alert_schema.get("resolved_publication_date"))
+    resolved_source = str(
+        alert_schema.get("resolved_publication_date_source") or ""
+    ).strip().lower()
+    if (
+        resolved_value is not None
+        and resolved_source in {"provider", "html_scraped", "llm", "undated_fallback"}
+    ):
+        return resolved_value, resolved_source
+
+    llm_date = _coerce_publication_date(
+        alert_schema.get("_llm_publication_date")
+        or (
+            alert_schema.get("published_date")
+            if str(alert_schema.get("published_date_source") or "").strip().lower() == "llm"
+            else None
+        )
+    )
+    if llm_date is not None:
+        return llm_date, "llm"
+
+    html_date = _coerce_publication_date(alert_schema.get("_html_scraped_publication_date"))
+    if html_date is not None:
+        return html_date, "html_scraped"
+
+    provider_date = _coerce_publication_date(candidate_raw.published_at)
+    if provider_date is not None:
+        return provider_date, "provider"
+
+    return UNDATED_FALLBACK_PUBLICATION_DATE, "undated_fallback"
+
+
 @dataclass(slots=True)
 class AnalysisResult:
     """Analyzer output for a batch of mentions."""
@@ -183,6 +250,7 @@ class CompetitorAnalyzer:
             return None
 
         text_blob = self._article_text_blob(article)
+        geo_text_blob = self._geo_text_blob(article)
         selected_regions = tuple(regions or self.config.regions.keys())
         competitor = self._detect_competitor(article, text_blob, selected_regions)
         if not competitor:
@@ -192,7 +260,7 @@ class CompetitorAnalyzer:
         if not topic_group:
             return None
 
-        region_key, country_hint = self._detect_region(article, text_blob, selected_regions)
+        region_key, country_hint = self._detect_region(article, geo_text_blob, selected_regions)
         region_key, country_hint = self._validate_candidate_region(
             competitor=competitor,
             region_key=region_key,
@@ -202,7 +270,7 @@ class CompetitorAnalyzer:
         if region_key is None and country_hint is None and self._is_region_mismatch(
             competitor=competitor,
             article=article,
-            text_blob=text_blob,
+            text_blob=geo_text_blob,
             selected_regions=selected_regions,
         ):
             return None
@@ -241,6 +309,18 @@ class CompetitorAnalyzer:
                 article.source,
                 article.region or "",
                 article.language or "",
+            )
+            if value
+        )
+
+    @staticmethod
+    def _geo_text_blob(article: RawArticle) -> str:
+        return " ".join(
+            value.casefold()
+            for value in (
+                article.title,
+                article.snippet,
+                article.source,
             )
             if value
         )
@@ -536,40 +616,38 @@ class CompetitorAlertAnalyzer:
         candidate: CandidateArticle,
         *,
         article_context: Optional[ArticleContext] = None,
-    ) -> dict[str, Any]:
+    ) -> AlertSchema:
         """Return normalized competitor alert schema for one candidate."""
-        fallback = self._fallback_alert(candidate)
+        fallback = self._fallback_alert(candidate, article_context=article_context)
         if not self.use_llm or self.client is None:
             return fallback
 
         llm_result = self._llm_alert_analysis(candidate, article_context=article_context)
         if not llm_result:
             return fallback
-        metadata_published_at = (
-            article_context.published_at if article_context is not None else None
-        ) or candidate.raw_article.published_at
         merged = {**fallback, **llm_result}
-        normalized_metadata_published_date = self._normalize_published_date(
-            metadata_published_at
+        merged.pop("resolved_publication_date", None)
+        merged.pop("resolved_publication_date_source", None)
+        llm_publication_date = self._normalize_published_date(
+            llm_result.get("published_date") or llm_result.get("published_at")
         )
-        if normalized_metadata_published_date:
-            merged["published_date"] = normalized_metadata_published_date
-            merged["published_date_source"] = "metadata"
-        merged["published_date_source"] = self._infer_published_date_source(
-            published_date=merged.get("published_date") or merged.get("published_at"),
-            metadata_published_at=metadata_published_at,
-            requested_source=merged.get("published_date_source"),
-        )
+        if llm_publication_date:
+            merged["_llm_publication_date"] = llm_publication_date
+        if (
+            article_context is not None
+            and article_context.published_at_source == "html_scraped"
+        ):
+            merged["_html_scraped_publication_date"] = article_context.published_at
         return self._normalize_alert(merged, candidate=candidate)
 
     def analyze_candidates(
         self,
         candidates: Iterable[CandidateArticle],
-    ) -> list[dict[str, Any]]:
+    ) -> list[AlertSchema]:
         """Return alert schema objects for multiple candidates."""
         return [self.analyze_candidate(candidate) for candidate in candidates]
 
-    def format_alert(self, alert: dict[str, Any], *, source_url: str = "") -> str:
+    def format_alert(self, alert: Mapping[str, Any], *, source_url: str = "") -> str:
         """Render a readable alert text block from the analyzer schema."""
         return format_alert_card(alert, source_url=source_url)
 
@@ -600,7 +678,8 @@ Rules:
 - Treat `competitor` and `region` from candidate metadata as pre-detected pipeline signals, not as free fields for guesswork.
 - Do not override the provided `competitor` or `region` unless the article contains explicit evidence that the pipeline signal is wrong.
 - If the signal is ambiguous, mixed, or weak, preserve the provided pipeline `competitor` and `region`.
-- If the article metadata field `published_at` is None or missing, carefully inspect the article body for publication dates or temporal markers such as "last Thursday", "yesterday", or "two days ago". Resolve them relative to today's date: {reference_today}. Write the final date into `published_date` using YYYY-MM-DD format.
+- Resolve the final publication date with this priority: LLM inference from article evidence, then HTML-scraped date, then provider-normalized metadata, then undated fallback when nothing trustworthy exists.
+- If the provider `published_at` field is None or missing, carefully inspect the article body for publication dates or temporal markers such as "last Thursday", "yesterday", or "two days ago". Resolve them relative to today's date: {reference_today}. Write the final date into `published_date` using YYYY-MM-DD format.
 - Think like a high-level international marketer, not a generic summarizer.
 - Recommended actions must be concrete and useful for brand, growth, communications, partnerships, creative strategy, regional GTM, or driver/rider messaging.
 - Recommended actions must be applicable to inDrive, not generic advice for "a company".
@@ -609,7 +688,7 @@ Rules:
 - Return only strict JSON without markdown.
 - `priority` must be one of LOW, MEDIUM, HIGH.
 - `confidence` must be a number from 0 to 1.
-- `published_date_source` must be one of metadata, llm, unknown.
+- `published_date_source` must be one of provider, html_scraped, llm, undated_fallback.
 
 Return this schema:
 {
@@ -619,7 +698,7 @@ Return this schema:
   "topic": "string",
   "priority": "LOW|MEDIUM|HIGH",
   "published_date": "YYYY-MM-DD",
-  "published_date_source": "metadata|llm|unknown",
+  "published_date_source": "provider|html_scraped|llm|undated_fallback",
   "what_happened": "string",
   "why_it_matters": "string",
   "potential_impact": "string",
@@ -680,28 +759,24 @@ When writing:
         if article_context is not None and (
             not context.article_body or context.article_body == "Unavailable"
         ):
-            return self._normalize_alert(
-                {
-                    "competitor": candidate.competitor,
-                    "region": candidate.region or "",
-                    "country": candidate.country_hint or "",
-                    "topic": candidate.topic_group.replace("_", " "),
-                    "priority": self._priority_from_score(candidate.score),
-                    "published_date": self._normalize_published_date(
-                        context.published_at or candidate.raw_article.published_at
-                    ),
-                    "published_date_source": self._infer_published_date_source(
-                        published_date=context.published_at or candidate.raw_article.published_at,
-                        metadata_published_at=context.published_at or candidate.raw_article.published_at,
-                    ),
-                    "what_happened": candidate.summary or candidate.title,
-                    "why_it_matters": self.INSUFFICIENT_SOURCE_DATA_MESSAGE,
-                    "potential_impact": "Potential impact remains unclear and needs validation.",
-                    "recommended_action": self.INSUFFICIENT_SOURCE_DATA_MESSAGE,
-                    "confidence": 0.0,
-                },
-                candidate=candidate,
-            )
+            undeliverable_alert: dict[str, Any] = {
+                "competitor": candidate.competitor,
+                "region": candidate.region or "",
+                "country": candidate.country_hint or "",
+                "topic": candidate.topic_group.replace("_", " "),
+                "priority": self._priority_from_score(candidate.score),
+                "published_date": self._normalize_published_date(
+                    context.published_at or candidate.raw_article.published_at
+                ),
+                "what_happened": candidate.summary or candidate.title,
+                "why_it_matters": self.INSUFFICIENT_SOURCE_DATA_MESSAGE,
+                "potential_impact": "Potential impact remains unclear and needs validation.",
+                "recommended_action": self.INSUFFICIENT_SOURCE_DATA_MESSAGE,
+                "confidence": 0.0,
+            }
+            if context.published_at_source == "html_scraped":
+                undeliverable_alert["_html_scraped_publication_date"] = context.published_at
+            return self._normalize_alert(undeliverable_alert, candidate=candidate)
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -741,7 +816,12 @@ When writing:
             )
             return None
 
-    def _fallback_alert(self, candidate: CandidateArticle) -> dict[str, Any]:
+    def _fallback_alert(
+        self,
+        candidate: CandidateArticle,
+        *,
+        article_context: Optional[ArticleContext] = None,
+    ) -> AlertSchema:
         priority = self._priority_from_score(candidate.score)
         topic = candidate.topic_group.replace("_", " ")
         country = candidate.country_hint or ""
@@ -764,26 +844,25 @@ When writing:
             "in messaging, product, pricing, or operations."
         )
         confidence = min(0.95, max(0.35, candidate.score / 10))
-        return self._normalize_alert(
-            {
-                "competitor": candidate.competitor,
-                "region": region,
-                "country": country,
-                "topic": topic,
-                "priority": priority,
-                "published_date": self._normalize_published_date(candidate.published_date),
-                "published_date_source": self._infer_published_date_source(
-                    published_date=candidate.published_date,
-                    metadata_published_at=candidate.raw_article.published_at,
-                ),
-                "what_happened": what_happened,
-                "why_it_matters": why_it_matters,
-                "potential_impact": potential_impact,
-                "recommended_action": recommended_action,
-                "confidence": confidence,
-            },
-            candidate=candidate,
-        )
+        fallback_alert: dict[str, Any] = {
+            "competitor": candidate.competitor,
+            "region": region,
+            "country": country,
+            "topic": topic,
+            "priority": priority,
+            "published_date": self._normalize_published_date(candidate.published_date),
+            "what_happened": what_happened,
+            "why_it_matters": why_it_matters,
+            "potential_impact": potential_impact,
+            "recommended_action": recommended_action,
+            "confidence": confidence,
+        }
+        if (
+            article_context is not None
+            and article_context.published_at_source == "html_scraped"
+        ):
+            fallback_alert["_html_scraped_publication_date"] = article_context.published_at
+        return self._normalize_alert(fallback_alert, candidate=candidate)
 
     @staticmethod
     def _priority_from_score(score: int) -> str:
@@ -799,7 +878,7 @@ When writing:
         *,
         candidate: Optional[CandidateArticle] = None,
         apply_truth_validation: bool = True,
-    ) -> dict[str, Any]:
+    ) -> AlertSchema:
         normalized = dict(alert)
         normalized["competitor"] = CompetitorAlertAnalyzer._clean_text(
             normalized.get("competitor") or "Unknown competitor"
@@ -817,17 +896,10 @@ When writing:
         if priority not in {"LOW", "MEDIUM", "HIGH"}:
             priority = "LOW"
         normalized["priority"] = priority
-        normalized["published_date"] = CompetitorAlertAnalyzer._normalize_published_date(
+        normalized_published_date = CompetitorAlertAnalyzer._normalize_published_date(
             normalized.get("published_date") or normalized.get("published_at")
         )
-        published_date_source = str(
-            normalized.get("published_date_source") or "unknown"
-        ).strip().lower()
-        if published_date_source not in {"metadata", "llm", "unknown"}:
-            published_date_source = "unknown"
-        if not normalized["published_date"]:
-            published_date_source = "unknown"
-        normalized["published_date_source"] = published_date_source
+        normalized["published_date"] = normalized_published_date
         normalized["what_happened"] = CompetitorAlertAnalyzer._clean_text(
             normalized.get("what_happened") or "No clear event description available."
         )
@@ -848,8 +920,34 @@ When writing:
         except Exception:
             confidence = 0.0
         normalized["confidence"] = max(0.0, min(1.0, confidence))
+        if candidate is None:
+            requested_publication_source = str(
+                normalized.get("published_date_source") or ""
+            ).strip().lower()
+            if requested_publication_source not in {
+                "provider",
+                "html_scraped",
+                "llm",
+                "undated_fallback",
+            }:
+                requested_publication_source = (
+                    "llm" if normalized_published_date else "undated_fallback"
+                )
+            normalized["published_date_source"] = requested_publication_source
+        else:
+            resolved_publication_date, resolved_publication_date_source = (
+                resolve_final_publication_date(normalized, candidate.raw_article)
+            )
+            normalized["resolved_publication_date"] = resolved_publication_date
+            normalized["resolved_publication_date_source"] = resolved_publication_date_source
+            normalized["published_date"] = (
+                ""
+                if resolved_publication_date_source == "undated_fallback"
+                else resolved_publication_date.isoformat()
+            )
+            normalized["published_date_source"] = resolved_publication_date_source
         if not apply_truth_validation:
-            return normalized
+            return normalized  # type: ignore[return-value]
         return self._enforce_competitor_region_truth(normalized, candidate=candidate)
 
     def _enforce_competitor_region_truth(
@@ -1059,24 +1157,3 @@ When writing:
             return datetime.fromisoformat(candidate.replace("Z", "+00:00")).date().isoformat()
         except ValueError:
             return ""
-
-    @staticmethod
-    def _infer_published_date_source(
-        *,
-        published_date: Any,
-        metadata_published_at: Any,
-        requested_source: Any = None,
-    ) -> str:
-        normalized_date = CompetitorAlertAnalyzer._normalize_published_date(published_date)
-        if not normalized_date:
-            return "unknown"
-
-        normalized_metadata = CompetitorAlertAnalyzer._normalize_published_date(
-            metadata_published_at
-        )
-        requested = str(requested_source or "").strip().lower()
-        if requested in {"metadata", "llm"}:
-            return requested
-        if normalized_metadata and normalized_date == normalized_metadata:
-            return "metadata"
-        return "llm"

@@ -17,16 +17,25 @@ The current MVP is optimized for a practical daily monitoring loop:
 - News collection uses low-cost public sources: `Google News RSS` and `GDELT`.
 - A rule-based prefilter detects competitor, topic, region, country/language hints, and baseline score before any LLM call.
 - `competitor` and `region` are treated as pipeline-detected signals during alert enrichment; the LLM should preserve them unless the article contains explicit evidence that the pipeline signal is wrong.
+- In practice, final identity resolution is conservative:
+  - `candidate.competitor` always wins over a conflicting LLM competitor
+  - `candidate.region` wins when the pipeline already detected a region
+  - if the pipeline region is missing, the system may still restore a region from validated country evidence and config, but not from a free LLM guess alone
 - Digest ranking prioritizes `priority -> freshness -> confidence/score`.
 - Duplicate suppression works both within one run and across history.
-- Publication date is resolved in layers:
-  - provider / normalized `published_at`
-  - HTML extraction via `htmldate`
-  - optional LLM fallback only when metadata date is missing
-  - final priority is `metadata > llm > unknown`
+- Publication date is resolved into one canonical field before final digest ranking:
+  - the internal source of truth is `resolved_publication_date`
+  - provider / normalized `published_at`, HTML extraction, and optional LLM inference all feed the same resolver
+  - final priority is `llm > html_scraped > provider > undated_fallback`
+  - undated items keep a technical sentinel internally, but user-facing `published_date` stays empty for those cases
+- Pre-ranking date enrichment is no longer limited to fully undated articles:
+  - missing provider dates can trigger early HTML extraction
+  - clearly suspicious provider dates such as stale or future dates can also trigger early HTML extraction before ranking
+  - this prevents a good HTML date from being ignored during digest freshness sorting
 - Final digest delivery applies a `7-day` freshness gate:
   - clearly stale alerts are excluded from the main digest and Telegram
   - stale-but-important newly detected alerts can still pass through a high-signal override
+  - undated alerts are treated as suspicious by default and are filtered out unless explicitly allowed
   - archived stale articles are kept with `is_expired = True` for QA and debugging
 - Telegram delivery uses a bounded carry-over queue:
   - `delivered` alerts are not retried
@@ -48,7 +57,7 @@ The design goal is not “use AI everywhere”, but “use AI only where it help
 - `Truth before rewrite`: the LLM is not allowed to freely reinterpret `competitor` and `region`; config and pipeline detections stay primary unless the article clearly disproves them.
 - `Digest, not firehose`: suppression and ranking keep the daily output readable for humans.
 - `Carry-over, not loss`: relevant alerts that miss today's Telegram window can re-enter the next run, but only for a limited time.
-- `Dates with guardrails`: metadata dates win, LLM dates are fallback-only, and very old articles are archived unless they qualify as strong newly detected signals.
+- `Dates with guardrails`: the pipeline resolves one canonical publication date before ranking, stale gating, Telegram, Notion, and CSV export, and very old articles are archived unless they qualify as strong newly detected signals.
 - `Optional integrations`: Telegram and Notion are delivery layers, not core state.
 
 ## Current Stack
@@ -70,8 +79,9 @@ Config
   -> Normalization + Raw Deduplication
   -> Rule-Based Prefilter
   -> SQLite History Checks
+  -> Pre-Ranking Date Resolution
   -> Ranking + Suppression
-  -> Alert Formatting
+  -> Final Alert Formatting
   -> Telegram / Notion / Local Artifacts
 ```
 
@@ -165,7 +175,9 @@ Important config contract:
 - Regions can also define `country_validation_terms` as a broader vocabulary for safe `country` validation in final alert schemas.
 - This allows the tracker to accept valid country values that are broader than the query-oriented `geo_terms`, without weakening the fallback rules.
 - For competitors that are valid in multiple regions, region is not inferred from competitor alone. The tracker uses detected geo/country hints first; if those hints are missing or ambiguous, it preserves the pipeline-detected region when available or leaves region empty rather than trusting an LLM guess.
-- Final alert schemas can include internal provenance flags such as `competitor_source`, `region_source`, `country_source`, and `geo_validation_fallback` for QA and downstream validation.
+- Final alert schemas can include internal provenance flags such as `competitor_source`, `region_source`, `country_source`, `published_date_source`, and `geo_validation_fallback` for QA and downstream validation.
+- Final alert schemas also include `resolved_publication_date` and `resolved_publication_date_source` as the canonical date pair used by ranking and freshness logic.
+- `region_source` may also expose `geo_country_override` when the pipeline had no trusted region, but config-backed country validation was sufficient to restore one safely.
 - `country` validation understands configured country vocabulary plus common aliases and ISO-style country codes.
 - Local review artifacts such as markdown preview and review CSV should expose geo/date validation outcomes for manual QA, while the Telegram card should stay concise and human-readable.
 
@@ -233,6 +245,8 @@ This makes it easier to validate false positives and signal quality over a 1-2 w
 Important QA detail:
 
 - `candidates_review.csv` now includes `is_expired`
+- `digest_preview.md` and `candidates_review.csv` also include geo/date validation outcomes such as `competitor_source`, `region_source`, `country_source`, `published_date_source`, and `geo_validation_fallback`
+- `candidates_review.csv` also stores `resolved_publication_date` and `resolved_publication_date_source` for technical QA and debugging
 - old articles that miss the `7-day` freshness gate stay in the archive for review
 - late-discovered but high-signal articles can still surface in the digest when they clearly outrank the average signal level
 
@@ -257,6 +271,7 @@ Telegram is the main delivery channel for the MVP.
 Notion is an optional mirror, not the database of record.
 
 - final alerts can be archived to a separate competitor tracker database
+- Notion reads already computed `resolved_publication_date` from the final schema and only falls back to the resolver if that field is unexpectedly missing
 - dry-run is supported
 - if env is missing, sync is skipped safely
 

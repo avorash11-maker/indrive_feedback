@@ -1,3 +1,5 @@
+from datetime import date
+
 from competitor_tracker.digest import DigestBuilder
 from competitor_tracker.models import CandidateArticle, DeliveryRecord, RawArticle
 from competitor_tracker.storage import SQLiteTrackerStorage
@@ -142,3 +144,58 @@ def test_digest_limit_and_suppression_of_sent_and_similar_alerts(tmp_path):
     assert len(digest.alerts) == 1
     assert digest.alerts[0].competitor == "Gojek"
     assert digest.alerts[0].headline == "Gojek: Gojek expands courier rewards in Indonesia"
+
+
+def test_digest_ranking_prefers_resolved_publication_date_from_schema():
+    builder = DigestBuilder()
+    missing_provider_date = build_candidate(
+        title="Grab undated provider article with scraped date",
+        url="https://example.com/grab-undated",
+        competitor="Grab",
+        topic_group="product_launch",
+        score=9,
+        published_at="",
+        country_hint="Philippines",
+    ).to_alert()
+    stale_provider_date = build_candidate(
+        title="Grab provider dated article",
+        url="https://example.com/grab-stale",
+        competitor="Grab",
+        topic_group="product_launch",
+        score=9,
+        published_at="2026-05-18",
+        country_hint="Philippines",
+    ).to_alert()
+    undated_fallback = build_candidate(
+        title="Grab truly undated article",
+        url="https://example.com/grab-no-date",
+        competitor="Grab",
+        topic_group="product_launch",
+        score=9,
+        published_at="",
+        country_hint="Philippines",
+    ).to_alert()
+
+    ranked = builder._rank_alerts(
+        [undated_fallback, stale_provider_date, missing_provider_date],
+        alert_schemas=[
+            {
+                "resolved_publication_date": date.min,
+                "resolved_publication_date_source": "undated_fallback",
+            },
+            {
+                "resolved_publication_date": date(2026, 5, 18),
+                "resolved_publication_date_source": "provider",
+            },
+            {
+                "resolved_publication_date": date(2026, 5, 20),
+                "resolved_publication_date_source": "html_scraped",
+            },
+        ],
+    )
+
+    assert [alert.headline for alert in ranked] == [
+        "Grab: Grab undated provider article with scraped date",
+        "Grab: Grab provider dated article",
+        "Grab: Grab truly undated article",
+    ]

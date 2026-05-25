@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime
+from datetime import date, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, Mapping, Optional, Sequence
 
 import requests
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from .analyzer import resolve_final_publication_date
 from .models import Alert
 
 
@@ -115,7 +116,26 @@ class CompetitorNotionMirrorSync:
     ) -> dict[str, Any]:
         """Map new alert entity plus readable schema into Notion properties."""
         names = self.property_names
-        published_date = self.parse_date(alert.candidate.published_date or "")
+        resolved_publication_date = alert_schema.get("resolved_publication_date")
+        resolved_publication_date_source = str(
+            alert_schema.get("resolved_publication_date_source") or ""
+        ).strip().lower()
+        if isinstance(resolved_publication_date, datetime):
+            resolved_publication_date = resolved_publication_date.date()
+        if not isinstance(resolved_publication_date, date) or resolved_publication_date_source not in {
+            "provider",
+            "html_scraped",
+            "llm",
+            "undated_fallback",
+        }:
+            resolved_publication_date, resolved_publication_date_source = (
+                resolve_final_publication_date(alert_schema, alert.candidate.raw_article)
+            )
+        published_date = (
+            None
+            if resolved_publication_date_source == "undated_fallback"
+            else resolved_publication_date.isoformat()
+        )
         title = self._trim(alert.headline, 2000)
         properties = {
             names["title"]: {"title": [{"text": {"content": title}}]},

@@ -71,6 +71,7 @@ def test_article_context_extractor_returns_cleaned_article_body():
     assert "driver support campaign in Manila" in context.article_body
     assert "public driver-care narrative" in context.article_body
     assert context.published_at is None
+    assert context.published_at_source is None
 
 
 def test_article_context_extractor_extracts_published_date(monkeypatch):
@@ -96,6 +97,7 @@ def test_article_context_extractor_extracts_published_date(monkeypatch):
     context = extractor.extract(build_candidate())
 
     assert context.published_at == "2026-05-19"
+    assert context.published_at_source == "html_scraped"
 
 
 def test_article_context_extractor_keeps_none_when_date_not_found(monkeypatch):
@@ -118,6 +120,7 @@ def test_article_context_extractor_keeps_none_when_date_not_found(monkeypatch):
     context = extractor.extract(build_candidate())
 
     assert context.published_at is None
+    assert context.published_at_source is None
 
 
 def test_article_context_extractor_falls_back_without_crashing():
@@ -130,6 +133,7 @@ def test_article_context_extractor_falls_back_without_crashing():
     assert context.source_url == "https://example.com/article"
     assert context.article_body == ""
     assert context.published_at is None
+    assert context.published_at_source is None
 
 
 def test_build_delivery_alert_schemas_only_extracts_context_for_llm_top_n(monkeypatch):
@@ -148,6 +152,7 @@ def test_build_delivery_alert_schemas_only_extracts_context_for_llm_top_n(monkey
                     "source_url": candidate.url,
                     "article_body": f"body for {candidate.title}",
                     "published_at": "2026-05-20",
+                    "published_at_source": "html_scraped",
                 },
             )()
 
@@ -161,6 +166,7 @@ def test_build_delivery_alert_schemas_only_extracts_context_for_llm_top_n(monkey
                     "source_url": candidate.url,
                     "article_body": "",
                     "published_at": None,
+                    "published_at_source": None,
                 },
             )()
 
@@ -195,3 +201,87 @@ def test_build_delivery_alert_schemas_only_extracts_context_for_llm_top_n(monkey
     assert contexts[3].article_body == ""
     assert alert_schemas[0]["what_happened"] == "body for Grab signal 0"
     assert alert_schemas[2]["what_happened"] == "fallback"
+
+
+def test_build_delivery_alert_schemas_reuses_prefetched_contexts(monkeypatch):
+    alerts = [
+        build_candidate(title="Grab signal prefetched", url="https://example.com/prefetched").to_alert(),
+        build_candidate(title="Grab signal fetched", url="https://example.com/fetched").to_alert(),
+    ]
+    extractor_calls = []
+
+    class FakeExtractor:
+        def extract(self, candidate):
+            extractor_calls.append(candidate.title)
+            return type(
+                "Context",
+                (),
+                {
+                    "title": candidate.title,
+                    "snippet": candidate.raw_article.snippet,
+                    "source_url": candidate.url,
+                    "article_body": f"body for {candidate.title}",
+                    "published_at": "2026-05-20",
+                    "published_at_source": "html_scraped",
+                },
+            )()
+
+        def build_fallback_context(self, candidate):
+            return type(
+                "Context",
+                (),
+                {
+                    "title": candidate.title,
+                    "snippet": candidate.raw_article.snippet,
+                    "source_url": candidate.url,
+                    "article_body": "",
+                    "published_at": None,
+                    "published_at_source": None,
+                },
+            )()
+
+    class FakeAnalyzer:
+        def __init__(self, use_llm, model=None):
+            self.use_llm = use_llm
+
+        def analyze_candidate(self, candidate, *, article_context=None):
+            return {
+                "competitor": candidate.competitor,
+                "region": candidate.region or "",
+                "country": candidate.country_hint or "",
+                "topic": candidate.topic_group,
+                "priority": "MEDIUM",
+                "what_happened": article_context.article_body if article_context else "fallback",
+                "why_it_matters": "ok",
+                "potential_impact": "ok",
+                "recommended_action": "ok",
+                "confidence": 0.7,
+            }
+
+    prefetched_context = type(
+        "Context",
+        (),
+        {
+            "title": alerts[0].candidate.title,
+            "snippet": alerts[0].candidate.raw_article.snippet,
+            "source_url": alerts[0].candidate.url,
+            "article_body": "prefetched body",
+            "published_at": "2026-05-19",
+            "published_at_source": "html_scraped",
+        },
+    )()
+
+    monkeypatch.setattr(cli, "ArticleContextExtractor", FakeExtractor)
+    monkeypatch.setattr(cli, "CompetitorAlertAnalyzer", FakeAnalyzer)
+
+    alert_schemas, contexts = cli.build_delivery_alert_schemas(
+        alerts,
+        llm_top_n=2,
+        prefetched_contexts={alerts[0].candidate.url: prefetched_context},
+    )
+
+    assert extractor_calls == ["Grab signal fetched"]
+    assert contexts[0].article_body == "prefetched body"
+    assert contexts[1].article_body == "body for Grab signal fetched"
+    assert alert_schemas[0]["what_happened"] == "prefetched body"
+    assert alert_schemas[1]["what_happened"] == "body for Grab signal fetched"

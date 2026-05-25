@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from difflib import SequenceMatcher
-from typing import Iterable, List, Optional, Sequence
+from typing import Any, Callable, Iterable, List, Mapping, Optional, Sequence
 
-from .models import CandidateArticle, CompetitorDigest
+from .models import AlertSchema, CandidateArticle, CompetitorDigest
 from .normalization import (
     is_semantic_title_duplicate,
     is_title_contained_duplicate,
     normalize_title,
+    parse_published_at,
 )
 from .storage import SQLiteTrackerStorage
 
@@ -32,6 +33,9 @@ class DigestBuilder:
         delivery_channel: str = "daily_digest",
         delivery_destination: str = "",
         include_deferred: bool = False,
+        ranking_alert_schemas_builder: Optional[
+            Callable[[Sequence], Sequence[AlertSchema]]
+        ] = None,
     ) -> CompetitorDigest:
         candidate_list = list(candidates)
         if storage is not None and include_deferred:
@@ -42,7 +46,12 @@ class DigestBuilder:
                 delivery_destination=delivery_destination,
             )
         alerts = [candidate.to_alert() for candidate in candidate_list]
-        alerts = self._rank_alerts(alerts)
+        ranking_alert_schemas = (
+            list(ranking_alert_schemas_builder(alerts))
+            if ranking_alert_schemas_builder is not None
+            else None
+        )
+        alerts = self._rank_alerts(alerts, alert_schemas=ranking_alert_schemas)
         if storage is not None:
             alerts = self._suppress_history(
                 alerts,
@@ -61,18 +70,31 @@ class DigestBuilder:
             regions=tuple(regions or ()),
         )
 
-    def _rank_alerts(self, alerts: Sequence) -> list:
-        return sorted(
-            alerts,
-            key=lambda alert: (
-                self.PRIORITY_ORDER.get(alert.priority.upper(), 0),
-                self._freshness_sort_key(alert.candidate.published_date),
-                self._deferred_sort_key(alert),
-                alert.confidence,
-                alert.score,
+    def _rank_alerts(
+        self,
+        alerts: Sequence,
+        *,
+        alert_schemas: Optional[Sequence[AlertSchema]] = None,
+    ) -> list:
+        alert_schema_pairs = (
+            list(zip(alerts, alert_schemas))
+            if alert_schemas is not None and len(alert_schemas) == len(alerts)
+            else [(alert, None) for alert in alerts]
+        )
+        ranked_pairs = sorted(
+            alert_schema_pairs,
+            key=lambda pair: (
+                self.PRIORITY_ORDER.get(pair[0].priority.upper(), 0),
+                self._freshness_sort_key(
+                    pair[1] if pair[1] is not None else pair[0].candidate.published_date
+                ),
+                self._deferred_sort_key(pair[0]),
+                pair[0].confidence,
+                pair[0].score,
             ),
             reverse=True,
         )
+        return [alert for alert, _ in ranked_pairs]
 
     def _merge_deferred_candidates(
         self,
@@ -166,8 +188,16 @@ class DigestBuilder:
         )
 
     @staticmethod
-    def _freshness_sort_key(value: Optional[str]) -> str:
-        return value or ""
+    def _freshness_sort_key(value: Mapping[str, Any] | Optional[str]) -> date:
+        if isinstance(value, Mapping):
+            resolved_value = value.get("resolved_publication_date")
+            if isinstance(resolved_value, datetime):
+                return resolved_value.date()
+            if isinstance(resolved_value, date):
+                return resolved_value
+            return date.min
+        normalized = parse_published_at(value or "")
+        return date.fromisoformat(normalized) if normalized else date.min
 
     @staticmethod
     def _deferred_sort_key(alert) -> int:
