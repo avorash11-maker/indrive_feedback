@@ -201,8 +201,14 @@ class RunSummary:
     candidates_kept: int
     alerts_created: int
     daily_digest_limit: int
+    raw_articles_fetched: int = 0
+    raw_articles_deduplicated: int = 0
+    articles_filtered_out: int = 0
+    alerts_sent: int = 0
+    status: str = "success"
     drop_reasons: Dict[str, int] = field(default_factory=dict)
     provider_errors: Dict[str, str] = field(default_factory=dict)
+    provider_diagnostics: Dict[str, Dict[str, object]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import sqlite3
 import sys
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
@@ -31,14 +33,21 @@ from .providers import Provider, ProviderError, ProviderRequest, build_providers
 from .storage import JsonFileStorage, SQLiteTrackerStorage
 from .telegram_sender import TelegramSender
 
-COMMAND_NAMES = {"run", "dry-run", "send-digest", "sync-notion", "backfill"}
+COMMAND_NAMES = {"run", "dry-run", "send-digest", "sync-notion", "backfill", "test-provider"}
 MAX_ARTICLE_AGE_DAYS = 7
 HIGH_SIGNAL_SCORE_THRESHOLD = 7
+logger = logging.getLogger(__name__)
 
 
 def _today() -> date:
     """Return the current local date for freshness filtering."""
     return date.today()
+
+
+def _utc_now_iso() -> str:
+    """Return a timezone-aware UTC timestamp in ISO 8601 format."""
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -143,6 +152,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_common_args(backfill_parser)
 
+    test_provider_parser = subparsers.add_parser(
+        "test-provider",
+        help="Run a direct provider diagnostics check for one or more queries.",
+    )
+    test_provider_parser.add_argument(
+        "--provider",
+        required=True,
+        help="Provider name to test, for example google_news_rss or gdelt.",
+    )
+    test_provider_parser.add_argument(
+        "--query",
+        action="append",
+        required=True,
+        dest="queries",
+        help="Raw query to test. Can be passed multiple times.",
+    )
+    test_provider_parser.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="Lookback window passed to the provider request.",
+    )
+    test_provider_parser.add_argument(
+        "--competitor",
+        action="append",
+        dest="competitors",
+        help="Optional competitor hints attached to the provider request.",
+    )
+
     return parser
 
 
@@ -154,7 +192,7 @@ def collect_raw_articles(
     competitors: Sequence[str],
     days: Optional[int] = None,
     providers: Optional[Sequence[Provider]] = None,
-) -> tuple[list, tuple[str, ...], dict[str, str]]:
+) -> tuple[list, tuple[str, ...], dict[str, str], int, dict[str, dict[str, object]]]:
     """Generate queries, fetch raw articles, deduplicate, and store in SQLite."""
     query_days = days if days is not None else runtime.lookback_days
     query_specs = []
@@ -185,11 +223,60 @@ def collect_raw_articles(
 
     raw_articles = []
     provider_errors: dict[str, str] = {}
+    provider_diagnostics: dict[str, dict[str, object]] = {}
     for provider in active_providers:
         try:
-            fetched = provider.fetch(request)
+            if hasattr(provider, "fetch_with_diagnostics"):
+                fetched, diagnostics = provider.fetch_with_diagnostics(request)
+            else:
+                fetched = provider.fetch(request)
+                diagnostics = {
+                    "provider": provider.name,
+                    "status": "ok",
+                    "queries": [
+                        {
+                            "provider": provider.name,
+                            "query": query,
+                            "request_url": "",
+                            "http_status": None,
+                            "exception": "",
+                            "items_found": 0,
+                            "items_after_filter": 0,
+                            "status": "ok",
+                        }
+                        for query in queries
+                    ],
+                    "items_found": len(fetched),
+                    "items_after_filter": len(fetched),
+                    "items_after_global_dedup": 0,
+                }
+            provider_diagnostics[provider.name] = diagnostics
         except ProviderError as exc:
             provider_errors[provider.name] = str(exc)
+            provider_diagnostics[provider.name] = (
+                exc.diagnostics
+                if getattr(exc, "diagnostics", None)
+                else {
+                    "provider": provider.name,
+                    "status": "error",
+                    "queries": [
+                        {
+                            "provider": provider.name,
+                            "query": query,
+                            "request_url": "",
+                            "http_status": None,
+                            "exception": str(exc),
+                            "items_found": 0,
+                            "items_after_filter": 0,
+                            "status": "error",
+                        }
+                        for query in queries
+                    ],
+                    "items_found": 0,
+                    "items_after_filter": 0,
+                    "items_after_global_dedup": 0,
+                }
+            )
             continue
         raw_articles.extend(
             replace(
@@ -202,10 +289,114 @@ def collect_raw_articles(
             for article in fetched
         )
 
+    fetched_articles_count = len(raw_articles)
     raw_articles = deduplicate_raw_articles(raw_articles)
+    deduped_provider_counts: dict[str, int] = {}
+    for article in raw_articles:
+        deduped_provider_counts[article.provider] = deduped_provider_counts.get(article.provider, 0) + 1
+    for provider_name, diagnostics in provider_diagnostics.items():
+        diagnostics["items_after_global_dedup"] = deduped_provider_counts.get(provider_name, 0)
     sqlite_storage = SQLiteTrackerStorage(runtime.database_path)
     sqlite_storage.insert_raw_articles(raw_articles)
-    return raw_articles, tuple(provider.name for provider in active_providers), provider_errors
+    return (
+        raw_articles,
+        tuple(provider.name for provider in active_providers),
+        provider_errors,
+        fetched_articles_count,
+        provider_diagnostics,
+    )
+
+
+def test_provider(
+    *,
+    provider_name: str,
+    queries: Sequence[str],
+    days: int,
+    competitors: Optional[Sequence[str]] = None,
+) -> dict[str, object]:
+    """Run one provider directly and return structured diagnostics."""
+
+    providers = build_providers([provider_name])
+    provider = providers[0]
+    request = ProviderRequest(
+        competitors=tuple(competitors or ()),
+        days=days,
+        queries=list(queries),
+        query_competitor_hints={
+            query: tuple(competitors or ())
+            for query in queries
+        },
+    )
+    try:
+        if hasattr(provider, "fetch_with_diagnostics"):
+            articles, diagnostics = provider.fetch_with_diagnostics(request)
+        else:
+            articles = provider.fetch(request)
+            diagnostics = {
+                "provider": provider.name,
+                "status": "ok",
+                "queries": [
+                    {
+                        "provider": provider.name,
+                        "query": query,
+                        "request_url": "",
+                        "http_status": None,
+                        "exception": "",
+                        "items_found": 0,
+                        "items_after_filter": 0,
+                        "status": "ok",
+                    }
+                    for query in queries
+                ],
+                "items_found": len(articles),
+                "items_after_filter": len(articles),
+                "items_after_global_dedup": len(articles),
+            }
+        diagnostics["items_after_global_dedup"] = len(deduplicate_raw_articles(articles))
+        return {
+            "ok": True,
+            "provider": provider.name,
+            "query_count": len(queries),
+            "raw_articles_fetched": len(articles),
+            "raw_articles_after_global_dedup": diagnostics["items_after_global_dedup"],
+            "diagnostics": diagnostics,
+            "sample_urls": [article.url for article in articles[:5]],
+        }
+    except ProviderError as exc:
+        diagnostics = (
+            exc.diagnostics
+            if getattr(exc, "diagnostics", None)
+            else {
+                "provider": provider.name,
+                "status": "error",
+                "queries": [
+                    {
+                        "provider": provider.name,
+                        "query": query,
+                        "request_url": "",
+                        "http_status": None,
+                        "exception": str(exc),
+                        "items_found": 0,
+                        "items_after_filter": 0,
+                        "status": "error",
+                    }
+                    for query in queries
+                ],
+                "items_found": 0,
+                "items_after_filter": 0,
+                "items_after_global_dedup": 0,
+            }
+        )
+        return {
+            "ok": False,
+            "provider": provider.name,
+            "query_count": len(queries),
+            "raw_articles_fetched": 0,
+            "raw_articles_after_global_dedup": 0,
+            "error": str(exc),
+            "diagnostics": diagnostics,
+            "sample_urls": [],
+        }
 
 
 def resolve_targets(
@@ -654,6 +845,7 @@ def run_pipeline(
     article_context_max_chars: Optional[int] = None,
 ) -> dict[str, object]:
     """Execute the competitor tracker pipeline for one CLI command."""
+    run_started_at = _utc_now_iso()
     runtime = TrackerRuntimeConfig.from_env()
     config = TrackerConfig.load(runtime.config_path)
     (
@@ -670,13 +862,27 @@ def run_pipeline(
     selected_regions, selected_competitors = resolve_targets(config, regions, competitors)
     sqlite_storage = SQLiteTrackerStorage(runtime.database_path)
 
-    raw_articles, provider_names, provider_errors = collect_raw_articles(
+    collect_result = collect_raw_articles(
         config=config,
         runtime=runtime,
         regions=selected_regions,
         competitors=selected_competitors,
         days=days,
     )
+    provider_diagnostics: dict[str, dict[str, object]] = {}
+    if len(collect_result) == 5:
+        (
+            raw_articles,
+            provider_names,
+            provider_errors,
+            fetched_articles_count,
+            provider_diagnostics,
+        ) = collect_result
+    elif len(collect_result) == 4:
+        raw_articles, provider_names, provider_errors, fetched_articles_count = collect_result
+    else:
+        raw_articles, provider_names, provider_errors = collect_result
+        fetched_articles_count = len(raw_articles)
 
     analyzer = CompetitorAnalyzer(min_score=min_score, config=config)
     analysis = analyzer.prefilter_raw_articles(raw_articles, regions=selected_regions)
@@ -712,7 +918,7 @@ def run_pipeline(
     all_alert_schemas = []
     all_article_contexts = []
     expired_alerts = []
-    digest_generated_at = datetime.now(timezone.utc).isoformat()
+    digest_generated_at = _utc_now_iso()
     for region in selected_regions:
         prefetched_contexts: dict[str, object] = {}
 
@@ -790,26 +996,10 @@ def run_pipeline(
         if export_csv
         else None
     )
-    run_summary = RunSummary(
-        started_at=datetime.now(timezone.utc).isoformat(),
-        finished_at=datetime.now(timezone.utc).isoformat(),
-        regions=tuple(selected_regions),
-        providers=provider_names,
-        queries_generated=len(config.queries_for_regions(selected_regions)),
-        raw_articles_collected=len(raw_articles),
-        candidates_kept=len(analysis.candidates),
-        alerts_created=len(digest.alerts),
-        daily_digest_limit=config.daily_digest_limit,
-        drop_reasons={
-            reason: sum(1 for item in analysis.dropped_articles if item.reason == reason)
-            for reason in sorted({item.reason for item in analysis.dropped_articles})
-        },
-        provider_errors=provider_errors,
-    )
-    summary_path = storage.save_run_summary(run_summary)
 
     telegram_result = None
     notion_result = None
+    telegram_alerts = []
     if telegram_mode in {"dry", "send"}:
         telegram_alerts, telegram_schemas, _ = select_telegram_delivery_payload(
             digest.alerts,
@@ -846,6 +1036,40 @@ def run_pipeline(
             dry_run=notion_mode == "dry",
         )
 
+    run_status = "success_with_provider_errors" if provider_errors else "success"
+    run_finished_at = _utc_now_iso()
+    run_summary = RunSummary(
+        started_at=run_started_at,
+        finished_at=run_finished_at,
+        regions=tuple(selected_regions),
+        providers=provider_names,
+        queries_generated=len(config.queries_for_regions(selected_regions)),
+        raw_articles_collected=len(raw_articles),
+        candidates_kept=len(analysis.candidates),
+        alerts_created=len(digest.alerts),
+        daily_digest_limit=config.daily_digest_limit,
+        raw_articles_fetched=fetched_articles_count,
+        raw_articles_deduplicated=len(raw_articles),
+        articles_filtered_out=analysis.dropped_count,
+        alerts_sent=len(telegram_alerts) if telegram_mode == "send" and telegram_result else 0,
+        status=run_status,
+        drop_reasons={
+            reason: sum(1 for item in analysis.dropped_articles if item.reason == reason)
+            for reason in sorted({item.reason for item in analysis.dropped_articles})
+        },
+        provider_errors=provider_errors,
+        provider_diagnostics=provider_diagnostics,
+    )
+    summary_path = storage.save_run_summary(run_summary)
+    try:
+        sqlite_storage.insert_run(run_summary)
+    except sqlite3.Error as exc:
+        logger.warning(
+            "Failed to persist run summary to SQLite runs table. db=%s error=%s",
+            runtime.database_path,
+            exc,
+        )
+
     return {
         "analysis": analysis,
         "digest": digest,
@@ -861,6 +1085,7 @@ def run_pipeline(
         "summary_path": summary_path,
         "runtime": runtime,
         "raw_articles_count": len(raw_articles),
+        "provider_diagnostics": provider_diagnostics,
         "telegram_result": telegram_result,
         "notion_result": notion_result,
     }
@@ -922,6 +1147,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     elif command == "backfill":
         telegram_mode = None
         notion_mode = None
+    elif command == "test-provider":
+        result = test_provider(
+            provider_name=args.provider,
+            queries=args.queries,
+            days=args.days,
+            competitors=args.competitors,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
 
     result = run_pipeline(
         days=args.days,

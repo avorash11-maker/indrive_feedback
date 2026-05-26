@@ -253,7 +253,14 @@ class SQLiteTrackerStorage:
         candidates_kept INTEGER NOT NULL,
         alerts_created INTEGER NOT NULL,
         daily_digest_limit INTEGER NOT NULL,
+        raw_articles_fetched INTEGER NOT NULL DEFAULT 0,
+        raw_articles_deduplicated INTEGER NOT NULL DEFAULT 0,
+        articles_filtered_out INTEGER NOT NULL DEFAULT 0,
+        alerts_sent INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'success',
+        drop_reasons_json TEXT NOT NULL DEFAULT '{}',
         provider_errors_json TEXT NOT NULL,
+        provider_diagnostics_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -287,6 +294,29 @@ class SQLiteTrackerStorage:
     def _initialize(self) -> None:
         with self._connect() as connection:
             connection.executescript(self.SCHEMA)
+            self._migrate_runs_table(connection)
+
+    @staticmethod
+    def _migrate_runs_table(connection: sqlite3.Connection) -> None:
+        existing_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        required_columns = {
+            "raw_articles_fetched": "INTEGER NOT NULL DEFAULT 0",
+            "raw_articles_deduplicated": "INTEGER NOT NULL DEFAULT 0",
+            "articles_filtered_out": "INTEGER NOT NULL DEFAULT 0",
+            "alerts_sent": "INTEGER NOT NULL DEFAULT 0",
+            "status": "TEXT NOT NULL DEFAULT 'success'",
+            "drop_reasons_json": "TEXT NOT NULL DEFAULT '{}'",
+            "provider_diagnostics_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for column_name, column_sql in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            connection.execute(
+                f"ALTER TABLE runs ADD COLUMN {column_name} {column_sql}"
+            )
 
     def has_seen_article(self, url: str) -> bool:
         with self._connect() as connection:
@@ -442,8 +472,10 @@ class SQLiteTrackerStorage:
                 INSERT INTO runs (
                     started_at, finished_at, regions_json, providers_json,
                     queries_generated, raw_articles_collected, candidates_kept,
-                    alerts_created, daily_digest_limit, provider_errors_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    alerts_created, daily_digest_limit, raw_articles_fetched,
+                    raw_articles_deduplicated, articles_filtered_out, alerts_sent,
+                    status, drop_reasons_json, provider_errors_json, provider_diagnostics_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     summary.started_at,
@@ -455,7 +487,14 @@ class SQLiteTrackerStorage:
                     summary.candidates_kept,
                     summary.alerts_created,
                     summary.daily_digest_limit,
+                    summary.raw_articles_fetched,
+                    summary.raw_articles_deduplicated,
+                    summary.articles_filtered_out,
+                    summary.alerts_sent,
+                    summary.status,
+                    _json_dumps(summary.drop_reasons),
                     _json_dumps(summary.provider_errors),
+                    _json_dumps(summary.provider_diagnostics),
                 ),
             )
         return int(cursor.lastrowid)

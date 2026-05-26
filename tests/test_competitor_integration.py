@@ -1,13 +1,14 @@
 import json
 import sqlite3
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from competitor_tracker import cli
-from competitor_tracker.analyzer import AnalysisResult
+from competitor_tracker.analyzer import AnalysisResult, CompetitorAlertAnalyzer
 from competitor_tracker.config import TrackerConfig, TrackerRuntimeConfig
+from competitor_tracker.formatter import format_daily_digest
 from competitor_tracker.models import ArticleContext, CandidateArticle, RawArticle
 from competitor_tracker.providers import ProviderError
 from competitor_tracker.storage import SQLiteTrackerStorage
@@ -302,6 +303,86 @@ def test_full_dry_run_with_mocked_providers_writes_artifacts(tmp_path, monkeypat
     assert "Ежедневный превью-дайджест competitor tracker" in preview_text
     assert "### Что произошло" in preview_text
 
+    with sqlite3.connect(runtime.database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                started_at,
+                finished_at,
+                raw_articles_fetched,
+                raw_articles_deduplicated,
+                articles_filtered_out,
+                alerts_sent,
+                status
+            FROM runs
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    assert row is not None
+    assert row[0]
+    assert row[1]
+    assert row[2] == 1
+    assert row[3] == 1
+    assert row[4] == 0
+    assert row[5] == 0
+    assert row[6] == "success"
+
+
+def test_run_summary_uses_consistent_utc_timestamps_in_json_and_sqlite(
+    tmp_path, monkeypatch
+):
+    config = build_config()
+    runtime = patch_runtime(monkeypatch, tmp_path, config)
+    providers = [
+        StaticProvider(
+            "mock_news",
+            [
+                article(
+                    competitor="Grab",
+                    title="Grab launches Manila campaign",
+                    url="https://example.com/grab-manila-timestamps",
+                    snippet="Grab launches a new city campaign in Manila.",
+                )
+            ],
+        )
+    ]
+    monkeypatch.setattr(cli, "build_providers", lambda names: providers)
+
+    timestamps = iter(
+        [
+            "2026-05-26T01:00:00+00:00",
+            "2026-05-26T01:02:00+00:00",
+            "2026-05-26T01:05:30+00:00",
+        ]
+    )
+    monkeypatch.setattr(cli, "_utc_now_iso", lambda: next(timestamps))
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
+
+    summary_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
+    assert summary_payload["started_at"] == "2026-05-26T01:00:00+00:00"
+    assert summary_payload["finished_at"] == "2026-05-26T01:05:30+00:00"
+
+    with sqlite3.connect(runtime.database_path) as connection:
+        row = connection.execute(
+            "SELECT started_at, finished_at FROM runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    assert row == (
+        "2026-05-26T01:00:00+00:00",
+        "2026-05-26T01:05:30+00:00",
+    )
+
+    started_at = datetime.fromisoformat(summary_payload["started_at"])
+    finished_at = datetime.fromisoformat(summary_payload["finished_at"])
+    assert started_at.tzinfo is not None
+    assert finished_at.tzinfo is not None
+    assert started_at.utcoffset() == timedelta(0)
+    assert finished_at.utcoffset() == timedelta(0)
+    assert finished_at > started_at
+
 
 def test_duplicate_suppression_across_runs_uses_sqlite_history(tmp_path, monkeypatch):
     config = build_config()
@@ -436,6 +517,116 @@ def test_provider_partial_failure_keeps_run_alive_and_records_summary(tmp_path, 
     assert len(result["digest"].alerts) == 1
     summary_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
     assert summary_payload["provider_errors"] == {"failing_provider": "temporary upstream failure"}
+    assert summary_payload["provider_diagnostics"]["failing_provider"]["status"] == "error"
+    assert summary_payload["provider_diagnostics"]["failing_provider"]["queries"][0]["exception"] == (
+        "temporary upstream failure"
+    )
+
+    with sqlite3.connect(tmp_path / "output" / "tracker.db") as connection:
+        row = connection.execute(
+            """
+            SELECT
+                status,
+                provider_errors_json,
+                provider_diagnostics_json
+            FROM runs
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    assert row[0:2] == (
+        "success_with_provider_errors",
+        '{"failing_provider": "temporary upstream failure"}',
+    )
+    assert '"failing_provider"' in row[2]
+
+
+def test_run_pipeline_logs_sqlite_run_summary_failure_without_crashing(
+    tmp_path, monkeypatch, caplog
+):
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config)
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [
+            StaticProvider(
+                "mock_news",
+                [
+                    article(
+                        competitor="Grab",
+                        title="Grab launches new city campaign in Manila",
+                        url="https://example.com/grab-manila-storage-warning",
+                        snippet="Grab launches a new city campaign in Manila with driver messaging.",
+                    )
+                ],
+            )
+        ],
+    )
+
+    original_insert_run = cli.SQLiteTrackerStorage.insert_run
+
+    def failing_insert_run(self, summary):
+        raise sqlite3.OperationalError("runs table is locked")
+
+    monkeypatch.setattr(cli.SQLiteTrackerStorage, "insert_run", failing_insert_run)
+
+    result = cli.run_pipeline(
+        days=7,
+        min_score=5,
+        regions=["sea"],
+    )
+
+    assert len(result["digest"].alerts) == 1
+    assert result["summary_path"].exists()
+    assert "Failed to persist run summary to SQLite runs table" in caplog.text
+
+    monkeypatch.setattr(cli.SQLiteTrackerStorage, "insert_run", original_insert_run)
+
+
+def test_unknown_enabled_provider_is_visible_in_logs_and_run_summary(
+    tmp_path, monkeypatch, caplog
+):
+    config = build_config()
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                region: {
+                    "label": details.label,
+                    "geo_terms": list(details.geo_terms),
+                    "country_validation_terms": list(details.country_validation_terms),
+                    "language_hints": list(details.language_hints),
+                }
+                for region, details in config.regions.items()
+            },
+            "competitors_by_region": {
+                region: list(competitors)
+                for region, competitors in config.competitors_by_region.items()
+            },
+            "topic_groups": {
+                topic: list(keywords)
+                for topic, keywords in config.topic_groups.items()
+            },
+            "keyword_templates": list(config.keyword_templates),
+            "ignored_geo_terms": list(config.ignored_geo_terms),
+            "daily_digest_limit": config.daily_digest_limit,
+            "enabled_providers": ["mystery_provider"],
+        }
+    )
+    patch_runtime(monkeypatch, tmp_path, config)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
+
+    assert result["raw_articles_count"] == 0
+    assert "Unknown provider 'mystery_provider' is enabled in config" in caplog.text
+    summary_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
+    assert summary_payload["providers"] == ["mystery_provider"]
+    assert summary_payload["provider_errors"] == {
+        "mystery_provider": (
+            "Provider 'mystery_provider' is enabled in config but is not supported by competitor_tracker"
+        )
+    }
 
 
 @pytest.mark.parametrize(
@@ -660,6 +851,616 @@ def test_runtime_llm_settings_control_enrichment_and_context_limit(tmp_path, mon
     assert analyzer_modes == [False, True]
     assert result["alert_schemas"][0]["why_it_matters"] == "llm"
     assert result["alert_schemas"][1]["why_it_matters"] == "fallback"
+
+
+def test_run_pipeline_llm_enriches_only_top_n_with_extended_article_context(
+    tmp_path, monkeypatch
+):
+    config = build_config(
+        daily_digest_limit=2,
+        competitors_by_region={"sea": ["Grab", "Gojek"]},
+    )
+    patch_runtime(monkeypatch, tmp_path, config, use_llm_alerts=True, llm_top_n=1)
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [
+            StaticProvider(
+                "mock_news",
+                [
+                    article(
+                        competitor="Grab",
+                        title="Grab launches strategic partnership campaign in Manila",
+                        url="https://example.com/grab-strategic-partnership",
+                        query='"Grab" campaign_launches Southeast Asia',
+                        snippet="Grab launches a strategic partnership and new feature campaign in Manila.",
+                    ),
+                    article(
+                        competitor="Gojek",
+                        title="Gojek launches campaign in Cebu",
+                        url="https://example.com/gojek-campaign-cebu",
+                        query='"Gojek" campaign_launches Southeast Asia',
+                        snippet="Gojek launches a campaign in Cebu.",
+                    ),
+                ],
+            )
+        ],
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    captured = {"calls": 0, "prompt": ""}
+
+    class FakeContextExtractor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def extract(self, candidate):
+            return ArticleContext(
+                title=candidate.title,
+                snippet=candidate.raw_article.snippet,
+                source_url=candidate.url,
+                article_body=(
+                    "Extended article body: Grab frames the move as a strategic partnership, "
+                    "driver narrative, and rider trust push in Manila."
+                ),
+                published_at="2026-05-20",
+                published_at_source="html_scraped",
+            )
+
+        def build_fallback_context(self, candidate):
+            return ArticleContext(
+                title=candidate.title,
+                snippet=candidate.raw_article.snippet,
+                source_url=candidate.url,
+                article_body="",
+                published_at=None,
+                published_at_source=None,
+            )
+
+    class FakeOpenAIClient:
+        def __init__(self, api_key=None):
+            self.chat = type(
+                "ChatNamespace",
+                (),
+                {
+                    "completions": type(
+                        "CompletionNamespace",
+                        (),
+                        {
+                            "create": staticmethod(
+                                lambda **kwargs: _build_llm_response(
+                                    kwargs,
+                                    captured,
+                                    {
+                                        "competitor": "Grab",
+                                        "region": "sea",
+                                        "country": "Philippines",
+                                        "topic": "campaign launches",
+                                        "priority": "HIGH",
+                                        "published_date": "2026-05-20",
+                                        "published_date_source": "llm",
+                                        "what_happened": "LLM summary from extended body.",
+                                        "why_it_matters": "LLM used the extended article body.",
+                                        "potential_impact": "Potential trust and messaging impact.",
+                                        "recommended_action": "Respond with localized Marcom messaging.",
+                                        "confidence": 0.91,
+                                    },
+                                )
+                            )
+                        },
+                    )()
+                },
+            )()
+
+    def _build_llm_response(kwargs, target, payload):
+        target["calls"] += 1
+        target["prompt"] = kwargs["messages"][1]["content"]
+        return type(
+            "Response",
+            (),
+            {
+                "choices": [
+                    type(
+                        "Choice",
+                        (),
+                        {
+                            "message": type(
+                                "Message",
+                                (),
+                                {
+                                    "content": json.dumps(payload),
+                                },
+                            )()
+                        },
+                    )()
+                ]
+            },
+        )()
+
+    monkeypatch.setattr(cli, "ArticleContextExtractor", FakeContextExtractor)
+    monkeypatch.setattr("competitor_tracker.analyzer.openai.OpenAI", FakeOpenAIClient)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
+
+    assert captured["calls"] == 1
+    assert "Extended article body:" in captured["prompt"]
+    assert "strategic partnership, driver narrative, and rider trust push" in captured["prompt"]
+    assert "https://example.com/grab-strategic-partnership" in captured["prompt"]
+    assert len(result["alert_schemas"]) == 2
+    assert result["article_contexts"][0].article_body.startswith("Extended article body:")
+    assert result["article_contexts"][1].article_body == ""
+    assert result["alert_schemas"][0]["what_happened"] == "LLM summary from extended body."
+    assert result["alert_schemas"][0]["why_it_matters"] == "LLM used the extended article body."
+    assert result["alert_schemas"][0]["recommended_action"] == "Respond with localized Marcom messaging."
+    assert result["alert_schemas"][1]["why_it_matters"] != "LLM used the extended article body."
+
+
+def test_run_pipeline_invalid_llm_json_falls_back_to_rule_based_alert(
+    tmp_path, monkeypatch
+):
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config, use_llm_alerts=True, llm_top_n=1)
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [
+            StaticProvider(
+                "mock_news",
+                [
+                    article(
+                        competitor="Grab",
+                        title="Grab launches driver campaign in Manila",
+                        url="https://example.com/grab-invalid-json",
+                        query='"Grab" campaign_launches Southeast Asia',
+                    )
+                ],
+            )
+        ],
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    llm_calls = {"count": 0}
+
+    class FakeContextExtractor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def extract(self, candidate):
+            return ArticleContext(
+                title=candidate.title,
+                snippet=candidate.raw_article.snippet,
+                source_url=candidate.url,
+                article_body="Grab launched a driver campaign in Manila.",
+                published_at="2026-05-20",
+                published_at_source="html_scraped",
+            )
+
+        def build_fallback_context(self, candidate):
+            return self.extract(candidate)
+
+    class FakeOpenAIClient:
+        def __init__(self, api_key=None):
+            self.chat = type(
+                "ChatNamespace",
+                (),
+                {
+                    "completions": type(
+                        "CompletionNamespace",
+                        (),
+                        {
+                            "create": staticmethod(
+                                lambda **kwargs: _invalid_json_response(llm_calls)
+                            )
+                        },
+                    )()
+                },
+            )()
+
+    def _invalid_json_response(target):
+        target["count"] += 1
+        return type(
+            "Response",
+            (),
+            {
+                "choices": [
+                    type(
+                        "Choice",
+                        (),
+                        {
+                            "message": type(
+                                "Message",
+                                (),
+                                {
+                                    "content": "this is not valid json",
+                                },
+                            )()
+                        },
+                    )()
+                ]
+            },
+        )()
+
+    monkeypatch.setattr(cli, "ArticleContextExtractor", FakeContextExtractor)
+    monkeypatch.setattr("competitor_tracker.analyzer.openai.OpenAI", FakeOpenAIClient)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
+
+    assert llm_calls["count"] == 1
+    assert len(result["alert_schemas"]) == 1
+    alert = result["alert_schemas"][0]
+    assert alert["what_happened"].startswith("Grab appears in coverage related to")
+    assert "This may indicate a competitor move" in alert["why_it_matters"]
+    assert alert["recommended_action"].startswith("Review the signal, validate local market context")
+    assert alert["published_date_source"] == "html_scraped"
+
+
+def test_run_pipeline_no_body_context_uses_insufficient_source_fallback(
+    tmp_path, monkeypatch
+):
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config, use_llm_alerts=True, llm_top_n=1)
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [
+            StaticProvider(
+                "mock_news",
+                [
+                    article(
+                        competitor="Grab",
+                        title="Grab launches driver campaign in Manila",
+                        url="https://example.com/grab-no-body",
+                        query='"Grab" campaign_launches Southeast Asia',
+                    )
+                ],
+            )
+        ],
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    llm_calls = {"count": 0}
+
+    class FakeContextExtractor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def extract(self, candidate):
+            return ArticleContext(
+                title=candidate.title,
+                snippet=candidate.raw_article.snippet,
+                source_url=candidate.url,
+                article_body="",
+                published_at="2026-05-20",
+                published_at_source="html_scraped",
+            )
+
+        def build_fallback_context(self, candidate):
+            return self.extract(candidate)
+
+    class FakeOpenAIClient:
+        def __init__(self, api_key=None):
+            self.chat = type(
+                "ChatNamespace",
+                (),
+                {
+                    "completions": type(
+                        "CompletionNamespace",
+                        (),
+                        {
+                            "create": staticmethod(
+                                lambda **kwargs: _unexpected_llm_call(llm_calls)
+                            )
+                        },
+                    )()
+                },
+            )()
+
+    def _unexpected_llm_call(target):
+        target["count"] += 1
+        raise AssertionError("LLM should not be called when article body is empty")
+
+    monkeypatch.setattr(cli, "ArticleContextExtractor", FakeContextExtractor)
+    monkeypatch.setattr("competitor_tracker.analyzer.openai.OpenAI", FakeOpenAIClient)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
+
+    assert llm_calls["count"] == 0
+    assert len(result["alert_schemas"]) == 1
+    alert = result["alert_schemas"][0]
+    assert alert["why_it_matters"] == CompetitorAlertAnalyzer.INSUFFICIENT_SOURCE_DATA_MESSAGE
+    assert alert["recommended_action"] == CompetitorAlertAnalyzer.INSUFFICIENT_SOURCE_DATA_MESSAGE
+    assert alert["confidence"] == 0.0
+    assert alert["published_date"] == "2026-05-20"
+
+
+def test_telegram_delivery_uses_enriched_alert_cards_from_llm_output(
+    tmp_path, monkeypatch
+):
+    config = build_config()
+    patch_runtime(
+        monkeypatch,
+        tmp_path,
+        config,
+        use_llm_alerts=True,
+        llm_top_n=1,
+        telegram_top_n=1,
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [
+            StaticProvider(
+                "mock_news",
+                [
+                    article(
+                        competitor="Grab",
+                        title="Grab launches partnership campaign in Manila",
+                        url="https://example.com/grab-telegram-enriched",
+                        query='"Grab" campaign_launches Southeast Asia',
+                    )
+                ],
+            )
+        ],
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    class FakeContextExtractor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def extract(self, candidate):
+            return ArticleContext(
+                title=candidate.title,
+                snippet=candidate.raw_article.snippet,
+                source_url=candidate.url,
+                article_body="Rich body for Telegram formatting.",
+                published_at="2026-05-20",
+                published_at_source="html_scraped",
+            )
+
+        def build_fallback_context(self, candidate):
+            return self.extract(candidate)
+
+    class FakeOpenAIClient:
+        def __init__(self, api_key=None):
+            self.chat = type(
+                "ChatNamespace",
+                (),
+                {
+                    "completions": type(
+                        "CompletionNamespace",
+                        (),
+                        {
+                            "create": staticmethod(
+                                lambda **kwargs: type(
+                                    "Response",
+                                    (),
+                                    {
+                                        "choices": [
+                                            type(
+                                                "Choice",
+                                                (),
+                                                {
+                                                    "message": type(
+                                                        "Message",
+                                                        (),
+                                                        {
+                                                            "content": json.dumps(
+                                                                {
+                                                                    "competitor": "Grab",
+                                                                    "region": "sea",
+                                                                    "country": "Philippines",
+                                                                    "topic": "campaign launches",
+                                                                    "priority": "HIGH",
+                                                                    "published_date": "2026-05-20",
+                                                                    "published_date_source": "llm",
+                                                                    "what_happened": "LLM telegram event summary.",
+                                                                    "why_it_matters": "LLM telegram strategic angle.",
+                                                                    "potential_impact": "LLM telegram impact.",
+                                                                    "recommended_action": "LLM telegram action.",
+                                                                    "confidence": 0.88,
+                                                                }
+                                                            )
+                                                        },
+                                                    )()
+                                                },
+                                            )()
+                                        ]
+                                    },
+                                )()
+                            )
+                        },
+                    )()
+                },
+            )()
+
+    telegram_capture = {}
+
+    class FakeTelegramSender:
+        def __init__(self, storage, dry_run):
+            telegram_capture["dry_run"] = dry_run
+
+        def send_daily_digest(self, alert_schemas, alerts, source_urls, generated_at):
+            telegram_capture["schemas"] = list(alert_schemas)
+            telegram_capture["text"] = format_daily_digest(
+                alert_schemas,
+                source_urls=source_urls,
+                generated_at=generated_at,
+            )
+            return {"ok": True, "dry_run": True}
+
+    monkeypatch.setattr(cli, "ArticleContextExtractor", FakeContextExtractor)
+    monkeypatch.setattr("competitor_tracker.analyzer.openai.OpenAI", FakeOpenAIClient)
+    monkeypatch.setattr(cli, "TelegramSender", FakeTelegramSender)
+
+    result = cli.run_pipeline(
+        days=7,
+        min_score=5,
+        regions=["sea"],
+        telegram_mode="dry",
+    )
+
+    assert len(result["alert_schemas"]) == 1
+    assert telegram_capture["dry_run"] is True
+    assert telegram_capture["schemas"][0]["why_it_matters"] == "LLM telegram strategic angle."
+    assert "LLM telegram event summary." in telegram_capture["text"]
+    assert "LLM telegram strategic angle." in telegram_capture["text"]
+    assert "LLM telegram action." in telegram_capture["text"]
+
+
+def test_run_pipeline_does_not_call_llm_for_low_priority_noise(
+    tmp_path, monkeypatch
+):
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config, use_llm_alerts=True, llm_top_n=1)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    raw_articles = [
+        article(
+            competitor="Grab",
+            title="Grab strategic partnership campaign in Manila",
+            url="https://example.com/grab-high-priority",
+            query='"Grab" campaign_launches Southeast Asia',
+        ),
+        article(
+            competitor="Gojek",
+            title="Gojek campaign note",
+            url="https://example.com/gojek-low-priority",
+            query='"Gojek" campaign_launches Southeast Asia',
+        ),
+    ]
+
+    def fake_collect_raw_articles(**kwargs):
+        return raw_articles, ("mock_news",), {}
+
+    def fake_prefilter(self, raw_articles, regions=None):
+        return AnalysisResult(
+            candidates=[
+                CandidateArticle(
+                    raw_article=raw_articles[0],
+                    competitor="Grab",
+                    topic_group="campaign_launches",
+                    score=9,
+                    matched_keywords=("campaign", "partnership"),
+                    summary="Grab strategic partnership campaign in Manila",
+                    region="sea",
+                    country_hint="Philippines",
+                    language_hint="en",
+                    reasons=("competitor_mentioned", "priority_signal"),
+                ),
+                CandidateArticle(
+                    raw_article=raw_articles[1],
+                    competitor="Gojek",
+                    topic_group="campaign_launches",
+                    score=5,
+                    matched_keywords=("campaign",),
+                    summary="Gojek campaign note",
+                    region="sea",
+                    country_hint=None,
+                    language_hint="en",
+                    reasons=("competitor_mentioned",),
+                ),
+            ],
+            dropped_count=0,
+            dropped_articles=[],
+        )
+
+    llm_calls = {"count": 0}
+
+    class FakeContextExtractor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def extract(self, candidate):
+            return ArticleContext(
+                title=candidate.title,
+                snippet=candidate.raw_article.snippet,
+                source_url=candidate.url,
+                article_body="High-priority article body for LLM.",
+                published_at="2026-05-20",
+                published_at_source="html_scraped",
+            )
+
+        def build_fallback_context(self, candidate):
+            return ArticleContext(
+                title=candidate.title,
+                snippet=candidate.raw_article.snippet,
+                source_url=candidate.url,
+                article_body="",
+                published_at=None,
+                published_at_source=None,
+            )
+
+    class FakeOpenAIClient:
+        def __init__(self, api_key=None):
+            self.chat = type(
+                "ChatNamespace",
+                (),
+                {
+                    "completions": type(
+                        "CompletionNamespace",
+                        (),
+                        {
+                            "create": staticmethod(
+                                lambda **kwargs: _low_noise_llm_response(llm_calls)
+                            )
+                        },
+                    )()
+                },
+            )()
+
+    def _low_noise_llm_response(target):
+        target["count"] += 1
+        return type(
+            "Response",
+            (),
+            {
+                "choices": [
+                    type(
+                        "Choice",
+                        (),
+                        {
+                            "message": type(
+                                "Message",
+                                (),
+                                {
+                                    "content": json.dumps(
+                                        {
+                                            "competitor": "Grab",
+                                            "region": "sea",
+                                            "country": "Philippines",
+                                            "topic": "campaign launches",
+                                            "priority": "HIGH",
+                                            "published_date": "2026-05-20",
+                                            "published_date_source": "llm",
+                                            "what_happened": "High-priority LLM summary.",
+                                            "why_it_matters": "High-priority LLM significance.",
+                                            "potential_impact": "High-priority impact.",
+                                            "recommended_action": "High-priority action.",
+                                            "confidence": 0.9,
+                                        }
+                                    )
+                                },
+                            )()
+                        },
+                    )()
+                ]
+            },
+        )()
+
+    monkeypatch.setattr(cli, "collect_raw_articles", fake_collect_raw_articles)
+    monkeypatch.setattr(cli.CompetitorAnalyzer, "prefilter_raw_articles", fake_prefilter)
+    monkeypatch.setattr(cli, "ArticleContextExtractor", FakeContextExtractor)
+    monkeypatch.setattr("competitor_tracker.analyzer.openai.OpenAI", FakeOpenAIClient)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
+
+    assert llm_calls["count"] == 1
+    assert len(result["alert_schemas"]) == 2
+    assert result["alert_schemas"][0]["priority"] == "HIGH"
+    assert result["alert_schemas"][0]["why_it_matters"] == "High-priority LLM significance."
+    assert result["alert_schemas"][1]["priority"] == "LOW"
+    assert result["alert_schemas"][1]["why_it_matters"] != "High-priority LLM significance."
 
 
 def test_optional_notion_behavior_skips_cleanly_when_env_missing(tmp_path, monkeypatch):

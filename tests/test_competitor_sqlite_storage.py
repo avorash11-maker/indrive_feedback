@@ -63,6 +63,13 @@ def test_sqlite_storage_inserts_candidates_alerts_and_runs(tmp_path):
         candidates_kept=1,
         alerts_created=1,
         daily_digest_limit=12,
+        raw_articles_fetched=2,
+        raw_articles_deduplicated=1,
+        articles_filtered_out=0,
+        alerts_sent=1,
+        status="success",
+        drop_reasons={"score_below_threshold": 0},
+        provider_diagnostics={"gdelt": {"status": "ok", "items_found": 2}},
     )
 
     candidate_id = storage.insert_candidate(candidate)
@@ -83,6 +90,34 @@ def test_sqlite_storage_inserts_candidates_alerts_and_runs(tmp_path):
     assert candidate_count == 1
     assert alert_count == 1
     assert run_count == 1
+
+    with sqlite3.connect(tmp_path / "tracker.db") as connection:
+        row = connection.execute(
+            """
+            SELECT
+                raw_articles_fetched,
+                raw_articles_deduplicated,
+                articles_filtered_out,
+                alerts_sent,
+                status,
+                drop_reasons_json,
+                provider_errors_json,
+                provider_diagnostics_json
+            FROM runs
+            LIMIT 1
+            """
+        ).fetchone()
+
+    assert row == (
+        2,
+        1,
+        0,
+        1,
+        "success",
+        '{"score_below_threshold": 0}',
+        '{}',
+        '{"gdelt": {"items_found": 2, "status": "ok"}}',
+    )
 
 
 def test_sqlite_storage_checks_and_marks_delivered(tmp_path):

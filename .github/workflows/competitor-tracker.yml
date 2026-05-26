@@ -66,15 +66,16 @@ jobs:
       - name: Run competitor tracker
         shell: bash
         env:
-          INPUT_DRY_RUN: ${{ github.event_name == 'schedule' && 'true' || inputs.dry_run }}
+          INPUT_DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
           INPUT_DAYS: ${{ github.event_name == 'schedule' && '7' || inputs.days }}
           INPUT_REGIONS: ${{ github.event_name == 'schedule' && '' || inputs.regions }}
           INPUT_EXPORT_CSV: ${{ github.event_name == 'schedule' && 'true' || inputs.export_csv }}
-          INPUT_TO_TELEGRAM: ${{ github.event_name == 'schedule' && 'false' || inputs.to_telegram }}
-          INPUT_TO_NOTION: ${{ github.event_name == 'schedule' && 'false' || inputs.to_notion }}
+          INPUT_TO_TELEGRAM: ${{ github.event_name == 'schedule' && 'true' || inputs.to_telegram }}
+          INPUT_TO_NOTION: ${{ github.event_name == 'schedule' && 'auto' || inputs.to_notion }}
         run: |
           set -euo pipefail
           args=("run" "--days" "${INPUT_DAYS}")
+          notion_mode="false"
 
           if [[ "${INPUT_EXPORT_CSV}" == "true" ]]; then
             args+=("--export-csv")
@@ -90,22 +91,56 @@ jobs:
             done
           fi
 
+          if [[ "${INPUT_TO_NOTION}" == "auto" ]]; then
+            if [[ -n "${NOTION_TOKEN}" && -n "${COMPETITOR_TRACKER_NOTION_DATABASE_ID}" ]]; then
+              notion_mode="true"
+            else
+              notion_mode="false"
+              echo "Notion sync is disabled for this scheduled run because required Notion secrets are missing."
+            fi
+          else
+            notion_mode="${INPUT_TO_NOTION}"
+          fi
+
+          if [[ "${INPUT_TO_TELEGRAM}" == "true" && "${INPUT_DRY_RUN}" != "true" ]]; then
+            if [[ -z "${TELEGRAM_BOT_TOKEN}" ]]; then
+              echo "TELEGRAM_BOT_TOKEN is required for scheduled or manual Telegram delivery." >&2
+              exit 1
+            fi
+            if [[ -z "${TELEGRAM_CHAT_ID}" ]]; then
+              echo "TELEGRAM_CHAT_ID is required for scheduled or manual Telegram delivery." >&2
+              exit 1
+            fi
+          fi
+
+          if [[ "${notion_mode}" == "true" && "${INPUT_DRY_RUN}" != "true" ]]; then
+            if [[ -z "${NOTION_TOKEN}" ]]; then
+              echo "NOTION_TOKEN is required when Notion sync is enabled." >&2
+              exit 1
+            fi
+            if [[ -z "${COMPETITOR_TRACKER_NOTION_DATABASE_ID}" ]]; then
+              echo "COMPETITOR_TRACKER_NOTION_DATABASE_ID is required when Notion sync is enabled." >&2
+              exit 1
+            fi
+          fi
+
           if [[ "${INPUT_DRY_RUN}" == "true" ]]; then
             if [[ "${INPUT_TO_TELEGRAM}" == "true" ]]; then
               args+=("--telegram-dry-run")
             fi
-            if [[ "${INPUT_TO_NOTION}" == "true" ]]; then
+            if [[ "${notion_mode}" == "true" ]]; then
               args+=("--notion-dry-run")
             fi
           else
             if [[ "${INPUT_TO_TELEGRAM}" == "true" ]]; then
               args+=("--to-telegram")
             fi
-            if [[ "${INPUT_TO_NOTION}" == "true" ]]; then
+            if [[ "${notion_mode}" == "true" ]]; then
               args+=("--to-notion")
             fi
           fi
 
+          echo "Running competitor tracker with delivery settings: dry_run=${INPUT_DRY_RUN}, to_telegram=${INPUT_TO_TELEGRAM}, to_notion=${notion_mode}"
           python -m competitor_tracker "${args[@]}"
 
       - name: Upload competitor tracker artifacts

@@ -130,3 +130,31 @@ def test_cli_passes_export_csv_flag(monkeypatch):
     cli.main(["run", "--export-csv"])
 
     assert captured["export_csv"] is True
+
+
+def test_cli_test_provider_prints_structured_diagnostics(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "test_provider",
+        lambda **kwargs: {
+            "ok": False,
+            "provider": kwargs["provider_name"],
+            "query_count": len(kwargs["queries"]),
+            "error": "network timeout",
+            "diagnostics": {"provider": kwargs["provider_name"], "status": "error"},
+        },
+    )
+
+    cli.main(
+        [
+            "test-provider",
+            "--provider",
+            "google_news_rss",
+            "--query",
+            "Grab launch Philippines",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert '"provider": "google_news_rss"' in output
+    assert '"status": "error"' in output

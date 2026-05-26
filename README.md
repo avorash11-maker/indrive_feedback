@@ -147,6 +147,7 @@ The new CLI supports:
 - `send-digest`
 - `sync-notion`
 - `backfill`
+- `test-provider`
 
 Examples:
 
@@ -155,7 +156,19 @@ Examples:
 .\.venv\Scripts\competitor-tracker send-digest --dry-run --region sea
 .\.venv\Scripts\competitor-tracker sync-notion --dry-run --region sea
 .\.venv\Scripts\competitor-tracker backfill --days 30 --region sea --export-csv
+.\.venv\Scripts\competitor-tracker test-provider --provider google_news_rss --query "Grab launch Philippines"
 ```
+
+`test-provider` is the fastest way to separate `no data` from `provider/network/parser` failures during live ingestion checks. It prints structured JSON diagnostics with:
+
+- provider name
+- query
+- request URL with secrets redacted
+- HTTP status when available
+- exception text
+- items found before provider-side filtering
+- items kept after provider-side filtering
+- items left after global deduplication
 
 ## Configuration
 
@@ -182,6 +195,7 @@ Important config contract:
 - This allows the tracker to accept valid country values that are broader than the query-oriented `geo_terms`, without weakening the fallback rules.
 - `ignored_geo_terms` defines global non-target geo markers such as `USA` or `Europe`. If article text clearly matches one of these markers and does not also contain explicit target-region confirmation, the prefilter drops the article before it can reach the digest.
 - `run_summary.json` now includes aggregated `drop_reasons` so geo-policy rejections and other prefilter losses are auditable after each run.
+- `run_summary.json` also includes `provider_diagnostics`, so a `raw_articles=0` run can now be explained as `no provider data`, `network error`, `HTTP 403/429`, `feed/parser breakage`, or `deduped away`.
 - `dropped_articles.json` stores article-level rejection records with structured reasons and details for manual QA of the prefilter.
 - For competitors that are valid in multiple regions, region is not inferred from competitor alone. The tracker uses detected geo/country hints first; if those hints are missing or ambiguous, it preserves the pipeline-detected region when available or leaves region empty rather than trusting an LLM guess.
 - Final outward-facing alert schemas map internal `africa` and `mea` region keys to the shared business label `Africa & MEA`, so Telegram and Notion stay aligned to one macro-region.
@@ -247,6 +261,12 @@ Each run can generate a review-friendly set of artifacts in `output/competitor_t
 - `digest_preview.md`
 - `candidates_review.csv` when `--export-csv` is enabled
 - `tracker.db`
+
+Important ingestion diagnostics detail:
+
+- `provider_errors` is the compact high-level failure map.
+- `provider_diagnostics` is the structured per-provider payload with query-level request and count details.
+- If `test-provider` fails for several providers and queries with connection or DNS-style errors, that points to the environment or network path, not necessarily to tracker code.
 
 The markdown preview intentionally uses readable Russian section labels where helpful for manual review:
 
@@ -322,9 +342,30 @@ It supports:
 
 - daily schedule
 - manual dispatch
-- dry-run mode
+- scheduled Telegram delivery by default
+- manual dry-run mode
 - secrets for Telegram / Notion / OpenAI
 - artifact upload from `output/competitor_tracker/`
+
+Required GitHub Secrets for scheduled production delivery:
+
+- `OPENAI_API_KEY`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+Optional GitHub Secrets:
+
+- `NOTION_TOKEN`
+- `COMPETITOR_TRACKER_NOTION_DATABASE_ID`
+- `NOTION_DATABASE_ID`
+
+Behavior:
+
+- scheduled runs send the digest to `Telegram` by default
+- manual `workflow_dispatch` keeps `dry_run` support for safe testing
+- real Telegram delivery fails fast with a clear error if `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` is missing
+- scheduled Notion sync turns on only when both `NOTION_TOKEN` and `COMPETITOR_TRACKER_NOTION_DATABASE_ID` are present
+- missing Notion secrets do not block Telegram delivery
 
 ## Legacy Pipeline
 
