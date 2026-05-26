@@ -6,8 +6,9 @@ from pathlib import Path
 import pytest
 
 from competitor_tracker import cli
+from competitor_tracker.analyzer import AnalysisResult
 from competitor_tracker.config import TrackerConfig, TrackerRuntimeConfig
-from competitor_tracker.models import ArticleContext, RawArticle
+from competitor_tracker.models import ArticleContext, CandidateArticle, RawArticle
 from competitor_tracker.providers import ProviderError
 from competitor_tracker.storage import SQLiteTrackerStorage
 
@@ -75,6 +76,10 @@ def build_runtime(tmp_path: Path) -> TrackerRuntimeConfig:
         lookback_days=7,
         min_score=5,
         config_path=tmp_path / "config.json",
+        use_llm_alerts=False,
+        llm_top_n=15,
+        telegram_top_n=15,
+        article_context_max_chars=8000,
     )
 
 
@@ -180,8 +185,57 @@ def build_capped_articles(count: int) -> list[RawArticle]:
     return articles
 
 
-def patch_runtime(monkeypatch, tmp_path, config: TrackerConfig):
+def patch_runtime(
+    monkeypatch,
+    tmp_path,
+    config: TrackerConfig,
+    *,
+    use_llm_alerts: bool | None = None,
+    llm_top_n: int | None = None,
+    telegram_top_n: int | None = None,
+    article_context_max_chars: int | None = None,
+):
     runtime = build_runtime(tmp_path)
+    if use_llm_alerts is not None:
+        runtime = TrackerRuntimeConfig(
+            output_dir=runtime.output_dir,
+            database_path=runtime.database_path,
+            lookback_days=runtime.lookback_days,
+            min_score=runtime.min_score,
+            config_path=runtime.config_path,
+            use_llm_alerts=use_llm_alerts,
+            llm_top_n=runtime.llm_top_n if llm_top_n is None else llm_top_n,
+            telegram_top_n=(
+                runtime.telegram_top_n if telegram_top_n is None else telegram_top_n
+            ),
+            article_context_max_chars=(
+                runtime.article_context_max_chars
+                if article_context_max_chars is None
+                else article_context_max_chars
+            ),
+        )
+    elif (
+        llm_top_n is not None
+        or telegram_top_n is not None
+        or article_context_max_chars is not None
+    ):
+        runtime = TrackerRuntimeConfig(
+            output_dir=runtime.output_dir,
+            database_path=runtime.database_path,
+            lookback_days=runtime.lookback_days,
+            min_score=runtime.min_score,
+            config_path=runtime.config_path,
+            use_llm_alerts=runtime.use_llm_alerts,
+            llm_top_n=runtime.llm_top_n if llm_top_n is None else llm_top_n,
+            telegram_top_n=(
+                runtime.telegram_top_n if telegram_top_n is None else telegram_top_n
+            ),
+            article_context_max_chars=(
+                runtime.article_context_max_chars
+                if article_context_max_chars is None
+                else article_context_max_chars
+            ),
+        )
     monkeypatch.setattr(cli.TrackerRuntimeConfig, "from_env", staticmethod(lambda: runtime))
     monkeypatch.setattr(cli.TrackerConfig, "load", staticmethod(lambda path: config))
     return runtime
@@ -428,7 +482,7 @@ def test_run_pipeline_falls_back_to_candidate_truth_layer_on_bad_llm_geo_output(
     expected_fallback,
 ):
     config = build_config()
-    patch_runtime(monkeypatch, tmp_path, config)
+    patch_runtime(monkeypatch, tmp_path, config, use_llm_alerts=True, llm_top_n=15)
     source_article = article(
         competitor="Grab",
         title="Grab launches driver campaign in the Philippines",
@@ -445,6 +499,9 @@ def test_run_pipeline_falls_back_to_candidate_truth_layer_on_bad_llm_geo_output(
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
     class FakeContextExtractor:
+        def __init__(self, *args, **kwargs):
+            pass
+
         def extract(self, candidate):
             return ArticleContext(
                 title=candidate.title,
@@ -532,6 +589,79 @@ def test_run_pipeline_falls_back_to_candidate_truth_layer_on_bad_llm_geo_output(
     assert alert["geo_validation_fallback"] is expected_fallback
 
 
+def test_runtime_llm_settings_control_enrichment_and_context_limit(tmp_path, monkeypatch):
+    articles = build_capped_articles(3)
+    config = build_config(
+        daily_digest_limit=3,
+        competitors_by_region={"sea": [item.competitor_hints[0] for item in articles]},
+    )
+    patch_runtime(
+        monkeypatch,
+        tmp_path,
+        config,
+        use_llm_alerts=True,
+        llm_top_n=1,
+        article_context_max_chars=25,
+    )
+    monkeypatch.setattr(cli, "build_providers", lambda names: [StaticProvider("mock_news", articles)])
+
+    extractor_inits = []
+    analyzer_modes = []
+
+    class FakeContextExtractor:
+        def __init__(self, *args, max_chars=8000, **kwargs):
+            extractor_inits.append(max_chars)
+
+        def extract(self, candidate):
+            return ArticleContext(
+                title=candidate.title,
+                snippet=candidate.raw_article.snippet,
+                source_url=candidate.url,
+                article_body="x" * 25,
+                published_at="2026-05-20",
+                published_at_source="html_scraped",
+            )
+
+        def build_fallback_context(self, candidate):
+            return ArticleContext(
+                title=candidate.title,
+                snippet=candidate.raw_article.snippet,
+                source_url=candidate.url,
+                article_body="",
+                published_at=None,
+                published_at_source=None,
+            )
+
+    class FakeAlertAnalyzer:
+        def __init__(self, use_llm, model=None, config=None):
+            analyzer_modes.append(use_llm)
+            self.use_llm = use_llm
+
+        def analyze_candidate(self, candidate, *, article_context=None):
+            return {
+                "competitor": candidate.competitor,
+                "region": candidate.region or "",
+                "country": candidate.country_hint or "",
+                "topic": candidate.topic_group,
+                "priority": "MEDIUM",
+                "what_happened": article_context.article_body if article_context else "fallback",
+                "why_it_matters": "llm" if self.use_llm else "fallback",
+                "potential_impact": "impact",
+                "recommended_action": "act",
+                "confidence": 0.7,
+            }
+
+    monkeypatch.setattr(cli, "ArticleContextExtractor", FakeContextExtractor)
+    monkeypatch.setattr(cli, "CompetitorAlertAnalyzer", FakeAlertAnalyzer)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
+
+    assert extractor_inits == [25, 25]
+    assert analyzer_modes == [False, True]
+    assert result["alert_schemas"][0]["why_it_matters"] == "llm"
+    assert result["alert_schemas"][1]["why_it_matters"] == "fallback"
+
+
 def test_optional_notion_behavior_skips_cleanly_when_env_missing(tmp_path, monkeypatch):
     config = build_config()
     patch_runtime(monkeypatch, tmp_path, config)
@@ -586,7 +716,7 @@ def test_post_ranking_llm_enrichment_only_applies_to_top_fifteen(tmp_path, monke
         daily_digest_limit=16,
         competitors_by_region={"sea": [item.competitor_hints[0] for item in articles]},
     )
-    patch_runtime(monkeypatch, tmp_path, config)
+    patch_runtime(monkeypatch, tmp_path, config, use_llm_alerts=True, llm_top_n=15)
     monkeypatch.setattr(cli, "build_providers", lambda names: [StaticProvider("mock_news", articles)])
 
     analyzer_inits = []
@@ -628,13 +758,525 @@ def test_post_ranking_llm_enrichment_only_applies_to_top_fifteen(tmp_path, monke
     assert result["alert_schemas"][-1]["why_it_matters"] == "fallback"
 
 
-def test_telegram_delivery_uses_only_llm_targeted_top_slice(tmp_path, monkeypatch):
+def test_post_ranking_llm_enrichment_applies_per_region(tmp_path, monkeypatch):
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "sea": {
+                    "label": "Southeast Asia",
+                    "geo_terms": ["Philippines", "Indonesia", "Thailand"],
+                    "country_validation_terms": ["Philippines", "Indonesia", "Thailand"],
+                    "language_hints": ["en"],
+                },
+                "latam": {
+                    "label": "Latin America",
+                    "geo_terms": ["Mexico", "Brazil", "Colombia"],
+                    "country_validation_terms": ["Mexico", "Brazil", "Colombia"],
+                    "language_hints": ["en", "es", "pt"],
+                },
+            },
+            "competitors_by_region": {
+                "sea": ["Grab", "Gojek"],
+                "latam": ["Rappi", "DiDi"],
+            },
+            "topic_groups": {
+                "market_entry": ["launch", "new city", "entering market"],
+            },
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "ignored_geo_terms": ["USA", "United States", "Europe"],
+            "daily_digest_limit": 2,
+            "enabled_providers": ["google_news_rss"],
+        }
+    )
+    patch_runtime(
+        monkeypatch,
+        tmp_path,
+        config,
+        use_llm_alerts=True,
+        llm_top_n=1,
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [
+            StaticProvider(
+                "mock_news",
+                [
+                    article(
+                        competitor="Grab",
+                        title="Grab launches ferry permit campaign in Manila",
+                        url="https://example.com/grab-manila",
+                        region="sea",
+                        query='"Grab" market_entry Southeast Asia',
+                    ),
+                    article(
+                        competitor="Gojek",
+                        title="Gojek launches driver hub campaign in Jakarta",
+                        url="https://example.com/gojek-jakarta",
+                        region="sea",
+                        query='"Gojek" market_entry Southeast Asia',
+                    ),
+                    article(
+                        competitor="Rappi",
+                        title="Rappi launches grocery courier campaign in Mexico City",
+                        url="https://example.com/rappi-mexico-city",
+                        region="latam",
+                        query='"Rappi" market_entry Latin America',
+                    ),
+                    article(
+                        competitor="DiDi",
+                        title="DiDi launches women driver campaign in Sao Paulo",
+                        url="https://example.com/didi-sao-paulo",
+                        region="latam",
+                        query='"DiDi" market_entry Latin America',
+                    ),
+                ],
+            )
+        ],
+    )
+
+    class FakeAlertAnalyzer:
+        def __init__(self, use_llm, model=None):
+            self.use_llm = use_llm
+
+        def analyze_candidate(self, candidate, *, article_context=None):
+            return {
+                "competitor": candidate.competitor,
+                "region": candidate.region or "",
+                "country": candidate.country_hint or "",
+                "topic": candidate.topic_group,
+                "priority": "MEDIUM",
+                "what_happened": candidate.title,
+                "why_it_matters": "llm" if self.use_llm else "fallback",
+                "potential_impact": "impact",
+                "recommended_action": "act",
+                "confidence": 0.7,
+            }
+
+    monkeypatch.setattr(cli, "CompetitorAlertAnalyzer", FakeAlertAnalyzer)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea", "latam"])
+
+    assert len(result["digest"].alerts) == 4
+    sea_schemas = [item for item in result["alert_schemas"] if item["region"] == "sea"]
+    latam_schemas = [item for item in result["alert_schemas"] if item["region"] == "latam"]
+    assert len(sea_schemas) == 2
+    assert len(latam_schemas) == 2
+    assert sum(1 for item in sea_schemas if item["why_it_matters"] == "llm") == 1
+    assert sum(1 for item in latam_schemas if item["why_it_matters"] == "llm") == 1
+    assert sum(1 for item in result["alert_schemas"] if item["why_it_matters"] == "llm") == 2
+
+
+def test_post_ranking_llm_top_n_is_independent_for_latam_and_cis(tmp_path, monkeypatch):
+    latam_competitors = [f"LatamComp{index}" for index in range(10)]
+    cis_competitors = [f"CisComp{index}" for index in range(3)]
+    latam_descriptors = [
+        "airport shuttle rewards",
+        "grocery courier insurance",
+        "women driver academy",
+        "night bus transfer pass",
+        "electric bike rental launch",
+        "school pickup partnership",
+        "cargo van pilot",
+        "tourist transfer bundle",
+        "commuter wallet cashback",
+        "stadium event routing",
+    ]
+    latam_cities = [
+        "Mexico City",
+        "Sao Paulo",
+        "Bogota",
+        "Guadalajara",
+        "Monterrey",
+        "Medellin",
+        "Brasilia",
+        "Lima",
+        "Curitiba",
+        "Recife",
+    ]
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "latam": {
+                    "label": "Latin America",
+                    "geo_terms": ["Mexico", "Brazil", "Colombia"],
+                    "country_validation_terms": ["Mexico", "Brazil", "Colombia"],
+                    "language_hints": ["en", "es", "pt"],
+                },
+                "cis": {
+                    "label": "CIS",
+                    "geo_terms": ["Kazakhstan", "Uzbekistan", "Armenia"],
+                    "country_validation_terms": ["Kazakhstan", "Uzbekistan", "Armenia"],
+                    "language_hints": ["en", "ru"],
+                },
+            },
+            "competitors_by_region": {
+                "latam": latam_competitors,
+                "cis": cis_competitors,
+            },
+            "topic_groups": {
+                "market_entry": ["launch", "new city", "entering market"],
+            },
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "ignored_geo_terms": ["USA", "United States", "Europe"],
+            "daily_digest_limit": 10,
+            "enabled_providers": ["google_news_rss"],
+        }
+    )
+    patch_runtime(
+        monkeypatch,
+        tmp_path,
+        config,
+        use_llm_alerts=True,
+        llm_top_n=5,
+    )
+
+    latam_articles = [
+        article(
+            competitor=competitor,
+            title=f"{competitor} launches {latam_descriptors[index]} in {latam_cities[index]}",
+            url=f"https://example.com/latam-{index}",
+            region="latam",
+            query=f'"{competitor}" market_entry Latin America',
+        )
+        for index, competitor in enumerate(latam_competitors)
+    ]
+    cis_titles = [
+        "launches courier pilot in Almaty",
+        "launches pharmacy delivery hub in Tashkent",
+        "launches airport transfer program in Yerevan",
+    ]
+    cis_articles = [
+        article(
+            competitor=competitor,
+            title=f"{competitor} {cis_titles[index]}",
+            url=f"https://example.com/cis-{index}",
+            region="cis",
+            query=f'"{competitor}" market_entry CIS',
+        )
+        for index, competitor in enumerate(cis_competitors)
+    ]
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [StaticProvider("mock_news", [*latam_articles, *cis_articles])],
+    )
+
+    class FakeAlertAnalyzer:
+        def __init__(self, use_llm, model=None, config=None):
+            self.use_llm = use_llm
+
+        def analyze_candidate(self, candidate, *, article_context=None):
+            return {
+                "competitor": candidate.competitor,
+                "region": candidate.region or "",
+                "country": candidate.country_hint or "",
+                "topic": candidate.topic_group,
+                "priority": "MEDIUM",
+                "what_happened": candidate.title,
+                "why_it_matters": "llm" if self.use_llm else "fallback",
+                "potential_impact": "impact",
+                "recommended_action": "act",
+                "confidence": 0.7,
+            }
+
+    monkeypatch.setattr(cli, "CompetitorAlertAnalyzer", FakeAlertAnalyzer)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["latam", "cis"])
+
+    assert len(result["digest"].alerts) == 13
+
+    latam_schemas = [item for item in result["alert_schemas"] if item["region"] == "latam"]
+    cis_schemas = [item for item in result["alert_schemas"] if item["region"] == "cis"]
+    assert len(latam_schemas) == 10
+    assert len(cis_schemas) == 3
+    assert sum(1 for item in latam_schemas if item["why_it_matters"] == "llm") == 5
+    assert sum(1 for item in latam_schemas if item["why_it_matters"] == "fallback") == 5
+    assert sum(1 for item in cis_schemas if item["why_it_matters"] == "llm") == 3
+    assert sum(1 for item in cis_schemas if item["why_it_matters"] == "fallback") == 0
+
+    summary_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
+    assert summary_payload["regions"] == ["latam", "cis"]
+    assert summary_payload["raw_articles_collected"] == 13
+    assert summary_payload["alerts_created"] == 13
+    assert summary_payload["drop_reasons"] == {}
+
+    dropped_payload = json.loads(result["dropped_articles_path"].read_text(encoding="utf-8"))
+    assert dropped_payload == []
+
+
+def test_multi_region_collection_keeps_query_specific_competitor_hints(tmp_path, monkeypatch):
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "latam": {
+                    "label": "Latin America",
+                    "geo_terms": ["Mexico"],
+                    "country_validation_terms": ["Mexico"],
+                    "language_hints": ["es", "en"],
+                },
+                "cis": {
+                    "label": "CIS",
+                    "geo_terms": ["Kazakhstan"],
+                    "country_validation_terms": ["Kazakhstan"],
+                    "language_hints": ["ru", "en"],
+                },
+            },
+            "competitors_by_region": {
+                "latam": ["Uber", "DiDi"],
+                "cis": ["Yandex Go"],
+            },
+            "topic_groups": {
+                "market_entry": ["launch"],
+            },
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "ignored_geo_terms": ["USA"],
+            "daily_digest_limit": 10,
+            "enabled_providers": ["google_news_rss"],
+        }
+    )
+    patch_runtime(monkeypatch, tmp_path, config)
+
+    class QueryAwareProvider:
+        name = "query_aware_provider"
+
+        def fetch(self, request):
+            articles = []
+            for query in request.queries:
+                competitor = request.competitor_hints_for_query(query)[0]
+                region = "latam" if competitor in {"Uber", "DiDi"} else "cis"
+                city = "Mexico City" if competitor == "Uber" else (
+                    "Guadalajara" if competitor == "DiDi" else "Almaty"
+                )
+                descriptor = {
+                    "Uber": "launch airport transfer expansion",
+                    "DiDi": "launch driver rewards rollout",
+                    "Yandex Go": "launch courier pilot",
+                }[competitor]
+                articles.append(
+                    RawArticle(
+                        title=f"{competitor} {descriptor} in {city}",
+                        url=f"https://example.com/{competitor.casefold().replace(' ', '-')}",
+                        provider=self.name,
+                        source="Example News",
+                        published_at="2026-05-19T09:00:00Z",
+                        snippet=f"{competitor} {descriptor} in {city}",
+                        query=query,
+                        region=region,
+                        language="en",
+                        competitor_hints=request.competitor_hints_for_query(query),
+                    )
+                )
+            return articles
+
+    monkeypatch.setattr(cli, "build_providers", lambda names: [QueryAwareProvider()])
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["latam", "cis"])
+
+    assert len(result["analysis"].candidates) == 3
+    assert {candidate.competitor for candidate in result["analysis"].candidates} == {
+        "Uber",
+        "DiDi",
+        "Yandex Go",
+    }
+    assert {candidate.region for candidate in result["analysis"].candidates} == {
+        "latam",
+        "cis",
+    }
+
+
+def test_run_pipeline_keeps_global_uber_news_in_query_owner_region(tmp_path, monkeypatch):
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "sea": {
+                    "label": "Southeast Asia",
+                    "geo_terms": ["Philippines", "Indonesia"],
+                    "country_validation_terms": ["Philippines", "Indonesia"],
+                    "language_hints": ["en"],
+                },
+                "latam": {
+                    "label": "Latin America",
+                    "geo_terms": ["Mexico", "Brazil"],
+                    "country_validation_terms": ["Mexico", "Brazil"],
+                    "language_hints": ["en", "es", "pt"],
+                },
+            },
+            "competitors_by_region": {
+                "sea": ["Grab"],
+                "latam": ["Uber"],
+            },
+            "topic_groups": {
+                "campaign_launches": ["campaign", "launch"],
+            },
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "ignored_geo_terms": ["USA", "Europe"],
+            "daily_digest_limit": 10,
+            "enabled_providers": ["google_news_rss"],
+        }
+    )
+    patch_runtime(monkeypatch, tmp_path, config)
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [
+            StaticProvider(
+                "mock_news",
+                [
+                    RawArticle(
+                        title="Uber launches global driver campaign",
+                        url="https://example.com/uber-global-driver-campaign",
+                        provider="mock_provider",
+                        source="Example News",
+                        published_at="2026-05-19T09:00:00Z",
+                        snippet="Uber launches a new driver campaign across multiple markets.",
+                        query='"Uber" campaign launches Latin America',
+                        region=None,
+                        language="en",
+                        competitor_hints=("Uber",),
+                    )
+                ],
+            )
+        ],
+    )
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea", "latam"])
+
+    assert len(result["analysis"].candidates) == 1
+    assert result["analysis"].candidates[0].region == "latam"
+    assert len(result["digest"].alerts) == 1
+    assert result["alert_schemas"][0]["competitor"] == "Uber"
+    assert result["alert_schemas"][0]["region"] == "latam"
+
+
+def test_run_pipeline_deduplicates_shared_bolt_article_across_regions(tmp_path, monkeypatch):
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "sea": {
+                    "label": "Southeast Asia",
+                    "geo_terms": ["Indonesia", "Thailand"],
+                    "country_validation_terms": ["Indonesia", "Thailand"],
+                    "language_hints": ["en"],
+                },
+                "cis": {
+                    "label": "CIS / Central Asia",
+                    "geo_terms": ["Kazakhstan", "Uzbekistan"],
+                    "country_validation_terms": ["Kazakhstan", "Uzbekistan", "Almaty"],
+                    "language_hints": ["en", "ru"],
+                },
+            },
+            "competitors_by_region": {
+                "sea": ["Bolt"],
+                "cis": ["Bolt"],
+            },
+            "topic_groups": {
+                "campaign_launches": ["campaign", "launch", "driver"],
+            },
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "ignored_geo_terms": ["USA", "Europe"],
+            "daily_digest_limit": 10,
+            "enabled_providers": ["google_news_rss"],
+        }
+    )
+    patch_runtime(monkeypatch, tmp_path, config)
+
+    raw_articles = [
+        RawArticle(
+            title="Bolt launches driver campaign in Almaty",
+            url="https://example.com/bolt-almaty-driver-campaign",
+            provider="mock_provider",
+            source="Example News",
+            published_at="2026-05-19T09:00:00Z",
+            snippet="Bolt launches a driver campaign in Almaty, Kazakhstan.",
+            query='"Bolt" campaign launches Southeast Asia',
+            region=None,
+            language="en",
+            competitor_hints=("Bolt",),
+            metadata={
+                "query_owner_competitor": "Bolt",
+                "query_owner_region": "sea",
+            },
+        ),
+        RawArticle(
+            title="Bolt launches driver campaign in Almaty",
+            url="https://mirror.example.com/bolt-almaty-driver-campaign",
+            provider="mock_provider",
+            source="Mirror News",
+            published_at="2026-05-19T09:00:00Z",
+            snippet="Bolt launches a driver campaign in Almaty, Kazakhstan.",
+            query='"Bolt" campaign launches CIS / Central Asia',
+            region=None,
+            language="en",
+            competitor_hints=("Bolt",),
+            metadata={
+                "query_owner_competitor": "Bolt",
+                "query_owner_region": "cis",
+            },
+        ),
+    ]
+
+    def fake_collect_raw_articles(**kwargs):
+        return raw_articles, ("mock_news",), {}
+
+    def fake_prefilter(self, raw_articles, regions=None):
+        return AnalysisResult(
+            candidates=[
+                CandidateArticle(
+                    raw_article=raw_articles[0],
+                    competitor="Bolt",
+                    topic_group="campaign_launches",
+                    score=8,
+                    matched_keywords=("campaign", "launch", "driver"),
+                    region=None,
+                    country_hint=None,
+                    language_hint="en",
+                    reasons=("competitor_match",),
+                    summary="Bolt launches driver campaign in Almaty",
+                ),
+                CandidateArticle(
+                    raw_article=raw_articles[1],
+                    competitor="Bolt",
+                    topic_group="campaign_launches",
+                    score=7,
+                    matched_keywords=("campaign", "launch", "driver"),
+                    region=None,
+                    country_hint=None,
+                    language_hint="en",
+                    reasons=("competitor_match",),
+                    summary="Bolt launches driver campaign in Almaty",
+                ),
+            ],
+            dropped_count=0,
+            dropped_articles=[],
+        )
+
+    monkeypatch.setattr(cli, "collect_raw_articles", fake_collect_raw_articles)
+    monkeypatch.setattr(cli.CompetitorAnalyzer, "prefilter_raw_articles", fake_prefilter)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea", "cis"])
+
+    assert len(result["analysis"].candidates) == 2
+    assert len(result["digest"].alerts) == 1
+    assert len(result["alert_schemas"]) == 1
+    assert result["alert_schemas"][0]["competitor"] == "Bolt"
+    assert result["alert_schemas"][0]["region"] == "cis"
+
+
+def test_telegram_delivery_uses_dedicated_telegram_top_n_slice(tmp_path, monkeypatch):
     articles = build_capped_articles(16)
     config = build_config(
         daily_digest_limit=16,
         competitors_by_region={"sea": [item.competitor_hints[0] for item in articles]},
     )
-    patch_runtime(monkeypatch, tmp_path, config)
+    patch_runtime(
+        monkeypatch,
+        tmp_path,
+        config,
+        use_llm_alerts=True,
+        llm_top_n=1,
+        telegram_top_n=3,
+    )
     monkeypatch.setattr(cli, "build_providers", lambda names: [StaticProvider("mock_news", articles)])
 
     class FakeAlertAnalyzer:
@@ -684,9 +1326,9 @@ def test_telegram_delivery_uses_only_llm_targeted_top_slice(tmp_path, monkeypatc
     assert result["alert_schemas"][-1]["why_it_matters"] == "fallback"
     assert sender_calls == {
         "dry_run": True,
-        "alerts": 15,
-        "schemas": 15,
-        "fallback_count": 0,
+        "alerts": 3,
+        "schemas": 3,
+        "fallback_count": 2,
     }
 
 
@@ -1071,6 +1713,9 @@ def test_preranking_html_date_overrides_stale_provider_date_and_changes_digest_o
     extractor_calls = []
 
     class FakeContextExtractor:
+        def __init__(self, *args, **kwargs):
+            pass
+
         def extract(self, candidate):
             extractor_calls.append(candidate.url)
             published_at = (

@@ -32,6 +32,10 @@ The current MVP is optimized for a practical daily monitoring loop:
   - missing provider dates can trigger early HTML extraction
   - clearly suspicious provider dates such as stale or future dates can also trigger early HTML extraction before ranking
   - this prevents a good HTML date from being ignored during digest freshness sorting
+- Post-ranking LLM enrichment is region-scoped, not global:
+  - the pipeline builds a local digest for each selected macro-region first
+  - `llm_top_n` is then applied inside each region independently
+  - this prevents one region from consuming the entire LLM slice for the whole run
 - Final digest delivery applies a `7-day` freshness gate:
   - clearly stale alerts are excluded from the main digest and Telegram
   - stale-but-important newly detected alerts can still pass through a high-signal override
@@ -80,7 +84,8 @@ Config
   -> Rule-Based Prefilter
   -> SQLite History Checks
   -> Pre-Ranking Date Resolution
-  -> Ranking + Suppression
+  -> Regional Ranking + Suppression
+  -> Regional LLM / Fallback Split
   -> Final Alert Formatting
   -> Telegram / Notion / Local Artifacts
 ```
@@ -211,6 +216,10 @@ COMPETITOR_TRACKER_OUTPUT_DIR=
 COMPETITOR_TRACKER_DB_PATH=
 COMPETITOR_TRACKER_LOOKBACK_DAYS=
 COMPETITOR_TRACKER_MIN_SCORE=
+COMPETITOR_TRACKER_USE_LLM_ALERTS=
+COMPETITOR_TRACKER_LLM_TOP_N=
+COMPETITOR_TRACKER_TELEGRAM_TOP_N=
+COMPETITOR_TRACKER_ARTICLE_CONTEXT_MAX_CHARS=
 
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
@@ -265,6 +274,7 @@ Telegram is the main delivery channel for the MVP.
 - supports `dry-run`
 - logs delivery history into `SQLite`
 - enables suppression of already sent alerts
+- uses its own `telegram_top_n` delivery slice instead of reusing the LLM cap
 - excludes articles older than `7 days` from the main digest by default
 - allows a high-signal override for stale but newly detected important articles
 - keeps a Telegram-specific `deferred` queue for relevant alerts that miss the top slice

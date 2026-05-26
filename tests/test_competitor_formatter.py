@@ -52,7 +52,7 @@ def test_format_alert_card_matches_brief_sections():
 
     assert "Competitor Alert — Philippines" in card
     assert "Competitor: Grab / Move It" in card
-    assert "Event: Marketing + Policy Narrative" in card
+    assert "Event/Topic: Marketing + Policy Narrative" in card
     assert "Priority: MEDIUM" in card
     assert "What happened:" in card
     assert "Where: Philippines" in card
@@ -60,6 +60,16 @@ def test_format_alert_card_matches_brief_sections():
     assert "Why it matters:" in card
     assert "Potential impact:" in card
     assert "What to do:" in card
+    assert card.index("Competitor: Grab / Move It") < card.index("Event/Topic: Marketing + Policy Narrative")
+    assert card.index("Event/Topic: Marketing + Policy Narrative") < card.index("Priority: MEDIUM")
+    assert card.index("Priority: MEDIUM") < card.index("What happened:")
+    assert card.index("What happened:") < card.index("Where: Philippines")
+    assert card.index("Where: Philippines") < card.index("Source link:")
+    assert card.index("Source link:") < card.index("Why it matters:")
+    assert card.index("Why it matters:") < card.index("Potential impact:")
+    assert card.index("Potential impact:") < card.index("What to do:")
+    assert "\n\nWhat happened:\n" in card
+    assert "\n\nSource link:\n" in card
 
 
 def test_format_daily_digest_renders_local_digest_view():
@@ -112,3 +122,4 @@ def test_format_alert_card_uses_business_region_name_when_country_is_missing():
 
     assert "Where: Africa & MEA" in card
     assert "Competitor Alert — Africa & MEA" in card
+    assert "Source link:\nhttps://example.com/careem-mea" in card

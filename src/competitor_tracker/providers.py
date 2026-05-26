@@ -36,6 +36,13 @@ class ProviderRequest:
     days: int
     queries: List[str] = field(default_factory=list)
     regions: Sequence[str] = field(default_factory=tuple)
+    query_competitor_hints: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+    def competitor_hints_for_query(self, query: str) -> tuple[str, ...]:
+        hints = self.query_competitor_hints.get(query)
+        if hints is not None:
+            return hints
+        return tuple(self.competitors)
 
 
 class Provider(Protocol):
@@ -101,7 +108,7 @@ class GoogleNewsRssProvider(BaseHttpProvider):
                 self._fetch_query(
                     query=query,
                     days=request.days,
-                    competitor_hints=request.competitors,
+                    competitor_hints=request.competitor_hints_for_query(query),
                 )
             )
         return articles
@@ -163,7 +170,7 @@ class GdeltProvider(BaseHttpProvider):
                 self._fetch_query(
                     query=query,
                     days=request.days,
-                    competitor_hints=request.competitors,
+                    competitor_hints=request.competitor_hints_for_query(query),
                 )
             )
         return articles

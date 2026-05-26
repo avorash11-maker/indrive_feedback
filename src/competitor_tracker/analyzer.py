@@ -32,6 +32,15 @@ BUSINESS_REGION_NAMES = {
     "africa": "Africa & MEA",
     "mea": "Africa & MEA",
 }
+NINETY_NINE_CONTEXT_PATTERN = re.compile(
+    r"(?:\b99\b(?!\s*[%$])(?:\W+(app|ride|rides|rider|riders|taxi|driver|drivers|transport))\b)"
+    r"|(?:\b(app|ride|rides|rider|riders|taxi|driver|drivers|transport)\b(?:\W+99\b(?![%$])))",
+    re.IGNORECASE,
+)
+MAXIM_CONTEXT_PATTERN = re.compile(
+    r"(?:\bMaxim\b(?:\W+\w+){0,3}\W+\b(taxi|service|services|app|ride|rides|driver|drivers|transport)\b)"
+    r"|(?:\b(taxi|service|services|app|ride|rides|driver|drivers|transport)\b(?:\W+\w+){0,3}\W+\bMaxim\b)"
+)
 
 
 COUNTRY_ALIAS_MAP = {
@@ -326,6 +335,24 @@ class CompetitorAnalyzer:
                 reason="competitor_region_mismatch",
                 details={"competitor": competitor},
             )
+        if (
+            len(selected_regions) > 1
+            and region_key is None
+            and country_hint is None
+        ):
+            owner_region = self._query_owner_region(
+                article=article,
+                competitor=competitor,
+                selected_regions=selected_regions,
+            )
+            if owner_region is None:
+                return None, DroppedArticle(
+                    url=article.url,
+                    title=article.title,
+                    reason="no_target_geo_match",
+                    details={"competitor": competitor},
+                )
+            region_key = owner_region
         language_hint = self._detect_language(article, text_blob, region_key)
         score, reasons = self._score_candidate(
             article=article,
@@ -391,15 +418,55 @@ class CompetitorAnalyzer:
         for region in regions:
             region_competitors.extend(self.config.competitors_by_region.get(region, ()))
         competitors = tuple(dict.fromkeys(region_competitors)) or self.config.all_competitors()
+        article_content = self._competitor_content_blob(article)
 
         hint_map = {hint.casefold(): hint for hint in article.competitor_hints}
         for competitor in competitors:
-            if competitor.casefold() in hint_map:
+            if competitor.casefold() in hint_map and self._matches_competitor_mention(
+                article=article,
+                competitor=competitor,
+                text_blob=text_blob,
+                article_content=article_content,
+            ):
                 return competitor
         for competitor in competitors:
-            if competitor.casefold() in text_blob:
+            if self._matches_competitor_mention(
+                article=article,
+                competitor=competitor,
+                text_blob=text_blob,
+                article_content=article_content,
+            ):
                 return competitor
         return None
+
+    @staticmethod
+    def _competitor_content_blob(article: RawArticle) -> str:
+        return " ".join(
+            value
+            for value in (
+                article.title,
+                article.snippet,
+                article.source,
+            )
+            if value
+        )
+
+    def _matches_competitor_mention(
+        self,
+        *,
+        article: RawArticle,
+        competitor: str,
+        text_blob: str,
+        article_content: str,
+    ) -> bool:
+        normalized_competitor = competitor.casefold()
+        content_casefold = article_content.casefold()
+
+        if normalized_competitor == "99":
+            return bool(NINETY_NINE_CONTEXT_PATTERN.search(content_casefold))
+        if normalized_competitor == "maxim":
+            return bool(MAXIM_CONTEXT_PATTERN.search(article_content))
+        return normalized_competitor in text_blob
 
     def _validate_candidate_region(
         self,
@@ -431,6 +498,26 @@ class CompetitorAnalyzer:
             geo_text_blob=geo_text_blob,
             selected_regions=selected_regions,
         )
+
+    def _query_owner_region(
+        self,
+        *,
+        article: RawArticle,
+        competitor: str,
+        selected_regions: Sequence[str],
+    ) -> Optional[str]:
+        if self.config is None:
+            return None
+
+        owner_region = str(article.metadata.get("query_owner_region") or "").strip().lower()
+        owner_competitor = str(article.metadata.get("query_owner_competitor") or "").strip()
+        if not owner_region or owner_region not in selected_regions:
+            return None
+        if owner_competitor != competitor:
+            return None
+        if not self.config.is_competitor_allowed_in_region(competitor, owner_region):
+            return None
+        return owner_region
 
     def _is_region_mismatch(
         self,

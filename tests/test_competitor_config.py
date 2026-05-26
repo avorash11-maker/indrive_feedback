@@ -1,8 +1,9 @@
 import json
+from pathlib import Path
 
 import pytest
 
-from competitor_tracker.config import TrackerConfig
+from competitor_tracker.config import TrackerConfig, TrackerRuntimeConfig
 
 
 def test_load_default_competitor_tracker_config():
@@ -203,3 +204,41 @@ def test_queries_for_region_rejects_unknown_topic_group():
 
     with pytest.raises(ValueError, match="Unknown topic groups: impossible_topic"):
         config.queries_for_region("latam", topic_groups=["impossible_topic"])
+
+
+def test_runtime_config_reads_llm_settings_from_env(monkeypatch):
+    monkeypatch.setenv("COMPETITOR_TRACKER_OUTPUT_DIR", "custom/output")
+    monkeypatch.setenv("COMPETITOR_TRACKER_DB_PATH", "custom/output/tracker.db")
+    monkeypatch.setenv("COMPETITOR_TRACKER_LOOKBACK_DAYS", "14")
+    monkeypatch.setenv("COMPETITOR_TRACKER_MIN_SCORE", "6")
+    monkeypatch.setenv("COMPETITOR_TRACKER_CONFIG_PATH", "custom/config.json")
+    monkeypatch.setenv("COMPETITOR_TRACKER_USE_LLM_ALERTS", "true")
+    monkeypatch.setenv("COMPETITOR_TRACKER_LLM_TOP_N", "7")
+    monkeypatch.setenv("COMPETITOR_TRACKER_TELEGRAM_TOP_N", "9")
+    monkeypatch.setenv("COMPETITOR_TRACKER_ARTICLE_CONTEXT_MAX_CHARS", "1234")
+
+    runtime = TrackerRuntimeConfig.from_env()
+
+    assert runtime.output_dir == Path("custom/output")
+    assert runtime.database_path == Path("custom/output/tracker.db")
+    assert runtime.lookback_days == 14
+    assert runtime.min_score == 6
+    assert runtime.config_path == Path("custom/config.json")
+    assert runtime.use_llm_alerts is True
+    assert runtime.llm_top_n == 7
+    assert runtime.telegram_top_n == 9
+    assert runtime.article_context_max_chars == 1234
+
+
+def test_runtime_config_defaults_llm_settings_to_safe_non_llm_mode(monkeypatch):
+    monkeypatch.delenv("COMPETITOR_TRACKER_USE_LLM_ALERTS", raising=False)
+    monkeypatch.delenv("COMPETITOR_TRACKER_LLM_TOP_N", raising=False)
+    monkeypatch.delenv("COMPETITOR_TRACKER_TELEGRAM_TOP_N", raising=False)
+    monkeypatch.delenv("COMPETITOR_TRACKER_ARTICLE_CONTEXT_MAX_CHARS", raising=False)
+
+    runtime = TrackerRuntimeConfig.from_env()
+
+    assert runtime.use_llm_alerts is False
+    assert runtime.llm_top_n == 15
+    assert runtime.telegram_top_n == 15
+    assert runtime.article_context_max_chars == 8000

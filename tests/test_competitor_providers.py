@@ -40,7 +40,7 @@ class FakeProvider:
                 published_at="2026-05-18T09:00:00Z",
                 snippet="Airport expansion.",
                 query=request.queries[0],
-                competitor_hints=tuple(request.competitors),
+                competitor_hints=request.competitor_hints_for_query(request.queries[0]),
             ),
             RawArticle(
                 title="Uber launches airport rides in Mexico City | Another Publisher",
@@ -50,7 +50,7 @@ class FakeProvider:
                 published_at="Tue, 18 May 2026 09:00:00 GMT",
                 snippet="Airport expansion copy.",
                 query=request.queries[0],
-                competitor_hints=tuple(request.competitors),
+                competitor_hints=request.competitor_hints_for_query(request.queries[0]),
             ),
         ]
 
@@ -150,12 +150,36 @@ def test_collect_raw_articles_generates_queries_and_persists_to_sqlite(tmp_path)
     assert provider_names == ("fake_provider",)
     assert provider_errors == {}
     assert raw_articles[0].query == '"Uber" product launch Latin America'
+    assert raw_articles[0].competitor_hints == ("Uber",)
 
     with sqlite3.connect(runtime.database_path) as connection:
         count = connection.execute("SELECT COUNT(*) FROM articles_raw").fetchone()[0]
         stored_query = connection.execute(
             "SELECT query_text FROM articles_raw LIMIT 1"
         ).fetchone()[0]
+        stored_hints = connection.execute(
+            "SELECT competitor_hints_json FROM articles_raw LIMIT 1"
+        ).fetchone()[0]
 
     assert count == 1
     assert stored_query == '"Uber" product launch Latin America'
+    assert stored_hints == '["Uber"]'
+
+
+def test_provider_request_can_resolve_query_specific_competitor_hints():
+    request = ProviderRequest(
+        competitors=("Uber", "DiDi"),
+        days=7,
+        queries=['"Uber" launch Mexico', '"DiDi" launch Mexico'],
+        query_competitor_hints={
+            '"Uber" launch Mexico': ("Uber",),
+            '"DiDi" launch Mexico': ("DiDi",),
+        },
+    )
+
+    assert request.competitor_hints_for_query('"Uber" launch Mexico') == ("Uber",)
+    assert request.competitor_hints_for_query('"DiDi" launch Mexico') == ("DiDi",)
+    assert request.competitor_hints_for_query('"Cabify" launch Mexico') == (
+        "Uber",
+        "DiDi",
+    )

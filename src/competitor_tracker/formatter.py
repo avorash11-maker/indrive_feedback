@@ -22,21 +22,30 @@ def format_alert_card(
     source_url: str = "",
     headline: Optional[str] = None,
 ) -> str:
-    """Format one alert card in the brief delivery style."""
+    """Format one alert card in a Telegram-friendly delivery style."""
+    resolved_source_url = _clean(source_url or alert.get("source_url"))
+    resolved_market = _clean(alert.get("country") or alert.get("region") or "Unknown")
     lines = [
         headline or build_alert_headline(alert),
+        "",
         f"Competitor: {_clean(alert.get('competitor'))}",
-        f"Event: {_clean(alert.get('topic'))}",
+        f"Event/Topic: {_clean(alert.get('topic'))}",
         f"Priority: {_clean(str(alert.get('priority', '')).upper())}",
+        "",
         "What happened:",
         _clean(alert.get("what_happened")),
-        f"Where: {_clean(alert.get('country') or alert.get('region') or 'Unknown')}",
+        "",
+        f"Where: {resolved_market}",
+        "",
         "Source link:",
-        _clean(source_url or alert.get("source_url")),
+        resolved_source_url,
+        "",
         "Why it matters:",
         _clean(alert.get("why_it_matters")),
+        "",
         "Potential impact:",
         _clean(alert.get("potential_impact")),
+        "",
         "What to do:",
         _clean(alert.get("recommended_action")),
     ]

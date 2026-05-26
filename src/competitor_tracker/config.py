@@ -12,6 +12,18 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("default_config.json")
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def _dedupe_keep_order(values: Iterable[str]) -> Tuple[str, ...]:
     seen = set()
     ordered: List[str] = []
@@ -256,6 +268,48 @@ class TrackerConfig:
                         queries.append(" ".join(query.split()))
         return list(_dedupe_keep_order(queries))
 
+    def query_specs_for_region(
+        self,
+        region: str,
+        *,
+        topic_groups: Optional[Sequence[str]] = None,
+        competitors: Optional[Sequence[str]] = None,
+    ) -> List[tuple[str, str]]:
+        """Expand query strings and preserve their owning competitor."""
+        if region not in self.regions:
+            raise ValueError(f"Unknown region '{region}'")
+
+        region_config = self.regions[region]
+        selected_competitors = _dedupe_keep_order(
+            competitors or self.competitors_by_region[region]
+        )
+        selected_topic_groups = _dedupe_keep_order(topic_groups or self.topic_groups.keys())
+
+        unknown_topics = set(selected_topic_groups) - set(self.topic_groups)
+        if unknown_topics:
+            missing_list = ", ".join(sorted(unknown_topics))
+            raise ValueError(f"Unknown topic groups: {missing_list}")
+
+        query_specs: List[tuple[str, str]] = []
+        seen_queries = set()
+        for competitor in selected_competitors:
+            for topic_name in selected_topic_groups:
+                keyword_list = self.topic_groups[topic_name]
+                expanded = self._expand_template_values(
+                    competitor=competitor,
+                    topic_name=topic_name,
+                    topic_keywords=keyword_list,
+                    region_config=region_config,
+                )
+                for template in self.keyword_templates:
+                    query = template.format(**expanded).strip()
+                    normalized_query = " ".join(query.split())
+                    if not normalized_query or normalized_query in seen_queries:
+                        continue
+                    seen_queries.add(normalized_query)
+                    query_specs.append((normalized_query, competitor))
+        return query_specs
+
     def queries_for_regions(
         self,
         regions: Optional[Sequence[str]] = None,
@@ -268,6 +322,27 @@ class TrackerConfig:
         for region in selected_regions:
             queries.extend(self.queries_for_region(region, topic_groups=topic_groups))
         return list(_dedupe_keep_order(queries))
+
+    def query_specs_for_regions(
+        self,
+        regions: Optional[Sequence[str]] = None,
+        *,
+        topic_groups: Optional[Sequence[str]] = None,
+    ) -> List[tuple[str, str]]:
+        """Expand query strings across regions and preserve owning competitor."""
+        selected_regions = _dedupe_keep_order(regions or self.regions.keys())
+        query_specs: List[tuple[str, str]] = []
+        seen_queries = set()
+        for region in selected_regions:
+            for query, competitor in self.query_specs_for_region(
+                region,
+                topic_groups=topic_groups,
+            ):
+                if query in seen_queries:
+                    continue
+                seen_queries.add(query)
+                query_specs.append((query, competitor))
+        return query_specs
 
     @staticmethod
     def _expand_template_values(
@@ -296,6 +371,10 @@ class TrackerRuntimeConfig:
     lookback_days: int = 7
     min_score: int = 5
     config_path: Path = DEFAULT_CONFIG_PATH
+    use_llm_alerts: bool = False
+    llm_top_n: int = 15
+    telegram_top_n: int = 15
+    article_context_max_chars: int = 8000
 
     @classmethod
     def from_env(cls) -> "TrackerRuntimeConfig":
@@ -314,10 +393,24 @@ class TrackerRuntimeConfig:
         config_path = Path(
             os.getenv("COMPETITOR_TRACKER_CONFIG_PATH", str(DEFAULT_CONFIG_PATH))
         )
+        use_llm_alerts = _env_flag("COMPETITOR_TRACKER_USE_LLM_ALERTS", False)
+        llm_top_n = max(0, int(os.getenv("COMPETITOR_TRACKER_LLM_TOP_N", "15")))
+        telegram_top_n = max(
+            0,
+            int(os.getenv("COMPETITOR_TRACKER_TELEGRAM_TOP_N", "15")),
+        )
+        article_context_max_chars = max(
+            0,
+            int(os.getenv("COMPETITOR_TRACKER_ARTICLE_CONTEXT_MAX_CHARS", "8000")),
+        )
         return cls(
             output_dir=output_dir,
             database_path=database_path,
             lookback_days=lookback_days,
             min_score=min_score,
             config_path=config_path,
+            use_llm_alerts=use_llm_alerts,
+            llm_top_n=llm_top_n,
+            telegram_top_n=telegram_top_n,
+            article_context_max_chars=article_context_max_chars,
         )

@@ -136,11 +136,35 @@ def test_article_context_extractor_falls_back_without_crashing():
     assert context.published_at_source is None
 
 
+def test_article_context_extractor_respects_max_chars_limit():
+    html = """
+    <html>
+      <body>
+        <article>
+          <p>Grab launched a driver support campaign in Manila with fuel subsidies and bonuses for new drivers.</p>
+          <p>The company framed the move as part of its public driver-care narrative and incentive package.</p>
+        </article>
+      </body>
+    </html>
+    """
+    extractor = ArticleContextExtractor(
+        session=FakeSession(FakeResponse(html)),
+        max_chars=40,
+    )
+
+    context = extractor.extract(build_candidate())
+
+    assert len(context.article_body) == 40
+
+
 def test_build_delivery_alert_schemas_only_extracts_context_for_llm_top_n(monkeypatch):
     alerts = [build_candidate(title=f"Grab signal {index}", url=f"https://example.com/{index}").to_alert() for index in range(4)]
     extractor_calls = []
 
     class FakeExtractor:
+        def __init__(self, *args, **kwargs):
+            pass
+
         def extract(self, candidate):
             extractor_calls.append(candidate.title)
             return type(
@@ -191,7 +215,11 @@ def test_build_delivery_alert_schemas_only_extracts_context_for_llm_top_n(monkey
     monkeypatch.setattr(cli, "ArticleContextExtractor", FakeExtractor)
     monkeypatch.setattr(cli, "CompetitorAlertAnalyzer", FakeAnalyzer)
 
-    alert_schemas, contexts = cli.build_delivery_alert_schemas(alerts, llm_top_n=2)
+    alert_schemas, contexts = cli.build_delivery_alert_schemas(
+        alerts,
+        use_llm_alerts=True,
+        llm_top_n=2,
+    )
 
     assert extractor_calls == ["Grab signal 0", "Grab signal 1"]
     assert len(contexts) == 4
@@ -211,6 +239,9 @@ def test_build_delivery_alert_schemas_reuses_prefetched_contexts(monkeypatch):
     extractor_calls = []
 
     class FakeExtractor:
+        def __init__(self, *args, **kwargs):
+            pass
+
         def extract(self, candidate):
             extractor_calls.append(candidate.title)
             return type(
@@ -276,6 +307,7 @@ def test_build_delivery_alert_schemas_reuses_prefetched_contexts(monkeypatch):
 
     alert_schemas, contexts = cli.build_delivery_alert_schemas(
         alerts,
+        use_llm_alerts=True,
         llm_top_n=2,
         prefetched_contexts={alerts[0].candidate.url: prefetched_context},
     )
@@ -285,3 +317,158 @@ def test_build_delivery_alert_schemas_reuses_prefetched_contexts(monkeypatch):
     assert contexts[1].article_body == "body for Grab signal fetched"
     assert alert_schemas[0]["what_happened"] == "prefetched body"
     assert alert_schemas[1]["what_happened"] == "body for Grab signal fetched"
+
+
+def test_build_delivery_alert_schemas_skips_context_fetch_when_llm_alerts_disabled(monkeypatch):
+    alerts = [build_candidate(title="Grab signal 0", url="https://example.com/0").to_alert()]
+    extractor_calls = []
+
+    class FakeExtractor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def extract(self, candidate):
+            extractor_calls.append(candidate.title)
+            return None
+
+        def build_fallback_context(self, candidate):
+            return type(
+                "Context",
+                (),
+                {
+                    "title": candidate.title,
+                    "snippet": candidate.raw_article.snippet,
+                    "source_url": candidate.url,
+                    "article_body": "",
+                    "published_at": None,
+                    "published_at_source": None,
+                },
+            )()
+
+    class FakeAnalyzer:
+        def __init__(self, use_llm, model=None):
+            self.use_llm = use_llm
+
+        def analyze_candidate(self, candidate, *, article_context=None):
+            return {
+                "competitor": candidate.competitor,
+                "region": candidate.region or "",
+                "country": candidate.country_hint or "",
+                "topic": candidate.topic_group,
+                "priority": "MEDIUM",
+                "what_happened": article_context.article_body if article_context else "fallback",
+                "why_it_matters": "fallback",
+                "potential_impact": "ok",
+                "recommended_action": "ok",
+                "confidence": 0.7,
+            }
+
+    monkeypatch.setattr(cli, "ArticleContextExtractor", FakeExtractor)
+    monkeypatch.setattr(cli, "CompetitorAlertAnalyzer", FakeAnalyzer)
+
+    alert_schemas, contexts = cli.build_delivery_alert_schemas(
+        alerts,
+        use_llm_alerts=False,
+        llm_top_n=5,
+    )
+
+    assert extractor_calls == []
+    assert contexts[0].article_body == ""
+    assert alert_schemas[0]["what_happened"] == "fallback"
+
+
+def test_build_delivery_alert_schemas_uses_runtime_defaults_when_args_omitted(monkeypatch):
+    alerts = [
+        build_candidate(title=f"Grab signal {index}", url=f"https://example.com/{index}").to_alert()
+        for index in range(3)
+    ]
+    extractor_inits = []
+    analyzer_modes = []
+
+    runtime = cli.TrackerRuntimeConfig(
+        use_llm_alerts=True,
+        llm_top_n=1,
+        telegram_top_n=2,
+        article_context_max_chars=33,
+    )
+
+    class FakeExtractor:
+        def __init__(self, *args, max_chars=8000, **kwargs):
+            extractor_inits.append(max_chars)
+
+        def extract(self, candidate):
+            return type(
+                "Context",
+                (),
+                {
+                    "title": candidate.title,
+                    "snippet": candidate.raw_article.snippet,
+                    "source_url": candidate.url,
+                    "article_body": "x" * 33,
+                    "published_at": None,
+                    "published_at_source": None,
+                },
+            )()
+
+        def build_fallback_context(self, candidate):
+            return type(
+                "Context",
+                (),
+                {
+                    "title": candidate.title,
+                    "snippet": candidate.raw_article.snippet,
+                    "source_url": candidate.url,
+                    "article_body": "",
+                    "published_at": None,
+                    "published_at_source": None,
+                },
+            )()
+
+    class FakeAnalyzer:
+        def __init__(self, use_llm, model=None, config=None):
+            analyzer_modes.append(use_llm)
+            self.use_llm = use_llm
+
+        def analyze_candidate(self, candidate, *, article_context=None):
+            return {
+                "competitor": candidate.competitor,
+                "region": candidate.region or "",
+                "country": candidate.country_hint or "",
+                "topic": candidate.topic_group,
+                "priority": "MEDIUM",
+                "what_happened": article_context.article_body if article_context else "fallback",
+                "why_it_matters": "llm" if self.use_llm else "fallback",
+                "potential_impact": "ok",
+                "recommended_action": "ok",
+                "confidence": 0.7,
+            }
+
+    monkeypatch.setattr(cli.TrackerRuntimeConfig, "from_env", staticmethod(lambda: runtime))
+    monkeypatch.setattr(cli, "ArticleContextExtractor", FakeExtractor)
+    monkeypatch.setattr(cli, "CompetitorAlertAnalyzer", FakeAnalyzer)
+
+    alert_schemas, contexts = cli.build_delivery_alert_schemas(alerts)
+
+    assert extractor_inits == [33]
+    assert analyzer_modes == [False, True]
+    assert alert_schemas[0]["why_it_matters"] == "llm"
+    assert alert_schemas[1]["why_it_matters"] == "fallback"
+    assert contexts[0].article_body == "x" * 33
+
+
+def test_select_telegram_delivery_payload_uses_runtime_top_n_when_arg_omitted(monkeypatch):
+    runtime = cli.TrackerRuntimeConfig(
+        use_llm_alerts=False,
+        llm_top_n=0,
+        telegram_top_n=2,
+        article_context_max_chars=8000,
+    )
+    monkeypatch.setattr(cli.TrackerRuntimeConfig, "from_env", staticmethod(lambda: runtime))
+
+    payload = cli.select_telegram_delivery_payload(
+        alerts=[1, 2, 3],
+        alert_schemas=["a", "b", "c"],
+        article_contexts=["x", "y", "z"],
+    )
+
+    assert payload == ([1, 2], ["a", "b"], ["x", "y"])

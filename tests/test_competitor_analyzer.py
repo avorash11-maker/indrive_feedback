@@ -85,6 +85,40 @@ def build_africa_mea_shared_config() -> TrackerConfig:
     )
 
 
+def build_short_brand_config() -> TrackerConfig:
+    return TrackerConfig.from_dict(
+        {
+            "regions": {
+                "latam": {
+                    "label": "Latin America",
+                    "geo_terms": ["Brazil"],
+                    "country_validation_terms": ["Brazil"],
+                    "language_hints": ["pt", "en"],
+                },
+                "sea": {
+                    "label": "Southeast Asia",
+                    "geo_terms": ["Indonesia"],
+                    "country_validation_terms": ["Indonesia"],
+                    "language_hints": ["id", "en"],
+                },
+            },
+            "competitors_by_region": {
+                "latam": ["99"],
+                "sea": ["Maxim"],
+            },
+            "topic_groups": {
+                "pricing": ["price", "prices", "pricing", "fare", "discount"],
+                "strategy": ["profit", "profits", "maximize", "growth"],
+                "product_launch": ["launch", "taxi", "driver", "rides", "app", "service"],
+            },
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "ignored_geo_terms": ["USA", "Europe"],
+            "daily_digest_limit": 10,
+            "enabled_providers": ["gdelt", "google_news_rss"],
+        }
+    )
+
+
 def test_prefilter_matches_topic_region_and_language_hint():
     analyzer = CompetitorAnalyzer(min_score=5, config=build_config())
     raw_article = RawArticle(
@@ -202,6 +236,70 @@ def test_prefilter_does_not_use_query_geo_terms_to_fabricate_country_hint():
     candidate = result.candidates[0]
     assert candidate.region is None
     assert candidate.country_hint is None
+
+
+def test_prefilter_keeps_query_owned_global_article_when_multiple_regions_selected():
+    analyzer = CompetitorAnalyzer(min_score=5, config=build_config())
+    raw_article = RawArticle(
+        title="Uber launches global driver campaign",
+        url="https://example.com/uber-global-campaign",
+        provider="google_news_rss",
+        snippet="Uber launches a new driver campaign across multiple markets.",
+        query='"Uber" campaign Latin America',
+        competitor_hints=("Uber",),
+        language="en",
+        metadata={
+            "query_owner_competitor": "Uber",
+            "query_owner_region": "latam",
+        },
+    )
+
+    result = analyzer.prefilter_raw_articles([raw_article], regions=("sea", "latam"))
+
+    assert result.dropped_count == 0
+    assert result.dropped_articles == []
+    assert len(result.candidates) == 1
+    assert result.candidates[0].competitor == "Uber"
+    assert result.candidates[0].region == "latam"
+    assert result.candidates[0].country_hint is None
+
+
+def test_prefilter_does_not_treat_percentages_as_brand_99():
+    analyzer = CompetitorAnalyzer(min_score=5, config=build_short_brand_config())
+    raw_article = RawArticle(
+        title="Ride prices dropped by 99% during the holiday campaign",
+        url="https://example.com/prices-dropped-by-99-percent",
+        provider="google_news_rss",
+        snippet="Transport prices dropped by 99% after the discount campaign.",
+        query='"99" pricing Latin America',
+        competitor_hints=("99",),
+        language="en",
+    )
+
+    result = analyzer.prefilter_raw_articles([raw_article], regions=("latam",))
+
+    assert result.candidates == []
+    assert result.dropped_count == 1
+    assert result.dropped_articles[0].reason == "no_competitor_match"
+
+
+def test_prefilter_does_not_treat_maximize_as_maxim_brand():
+    analyzer = CompetitorAnalyzer(min_score=5, config=build_short_brand_config())
+    raw_article = RawArticle(
+        title="Operators look to maximize profits after demand rebound",
+        url="https://example.com/maximize-profits",
+        provider="google_news_rss",
+        snippet="Executives want to maximize profits through better pricing strategy.",
+        query='"Maxim" strategy Southeast Asia',
+        competitor_hints=("Maxim",),
+        language="en",
+    )
+
+    result = analyzer.prefilter_raw_articles([raw_article], regions=("sea",))
+
+    assert result.candidates == []
+    assert result.dropped_count == 1
+    assert result.dropped_articles[0].reason == "no_competitor_match"
 
 
 def test_prefilter_drops_ignored_geo_article_and_records_reason():

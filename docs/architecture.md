@@ -48,6 +48,15 @@ The `competitors_by_region` matrix is also the source of truth for validating al
 
 The system is designed to decide “what is worth showing today”, not just “what was found”.
 
+### Region-local AI budgets
+
+Post-ranking enrichment is budgeted per macro-region, not per whole run.
+
+- the pipeline first builds a local ranked digest for each selected region
+- `llm_top_n` is applied independently inside each regional digest
+- a final flat digest is then assembled from all regional results for downstream artifacts and delivery
+- this prevents a high-volume region from starving other regions of LLM analysis
+
 ### Dates with layered confidence
 
 Publication date is not taken from one source blindly. The tracker resolves one canonical date for the whole pipeline through:
@@ -94,21 +103,22 @@ graph TD
     C --> D[Normalization + Raw Dedup]
     D --> E[Rule-Based Prefilter]
     E --> F[Pre-Ranking Date Resolution]
-    F --> G[SQLite History]
-    G --> H[Ranking + Suppression]
-    H --> I[Final Alert Schemas]
-    I --> J[Local Artifacts]
-    I --> K[Telegram Delivery]
-    I --> L[Optional Notion Mirror]
+    F --> G[Regional Digest Build]
+    G --> H[Regional History + Suppression]
+    H --> I[Regional LLM or Fallback Enrichment]
+    I --> J[Final Flat Alert Schemas]
+    J --> K[Local Artifacts]
+    J --> L[Telegram Delivery]
+    J --> M[Optional Notion Mirror]
 
     C --> C1[Google News RSS]
     C --> C2[GDELT]
 
-    J --> J1[run_summary.json]
-    J --> J2[digest.json]
-    J --> J3[digest_preview.md]
-    J --> J4[candidates_review.csv]
-    J --> J5[tracker.db]
+    K --> K1[run_summary.json]
+    K --> K2[digest.json]
+    K --> K3[digest_preview.md]
+    K --> K4[candidates_review.csv]
+    K --> K5[tracker.db]
 ```
 
 ## Main Modules
@@ -317,11 +327,21 @@ This removes the old architectural skew where ranking happened before final date
 
 Candidates become alerts, and the digest builder ranks them using precomputed canonical dates:
 
-- ranks them
+- groups candidates by selected macro-region
+- ranks each region locally
 - compares against history
 - suppresses repeats
-- trims the result to a daily cap
-- optionally merges the Telegram `deferred` pool back into the next ranking pass
+- trims each regional digest to the configured daily cap
+- optionally merges the Telegram `deferred` pool back into the next ranking pass before regional digesting
+
+### 7. Region-Local Enrichment
+
+After each regional digest is ranked, the pipeline enriches alerts region by region:
+
+- `build_delivery_alert_schemas(...)` receives only one region's digest at a time
+- `llm_top_n` applies to that region only
+- alerts that fall outside the regional LLM slice still receive fallback schemas
+- the final result returned by `run_pipeline(...)` remains a single flat digest plus flat schema/context lists
 
 Before final alert delivery, LLM enrichment is allowed to improve narrative fields, but it is not treated as the authority for core identity fields.
 In the current implementation:
@@ -344,7 +364,7 @@ The tracker keeps internal provenance markers such as:
 
 Those validation markers are visible in local review artifacts like markdown preview and CSV export, but they are intentionally kept out of the Telegram card.
 
-### 7. Artifacts and Delivery
+### 8. Artifacts and Delivery
 
 The run produces:
 
@@ -367,6 +387,7 @@ Stale alerts that fail the final `7-day` gate do not reach Telegram or the main 
 Downstream consumers now follow the canonical date contract:
 
 - Telegram receives user-facing `published_date`, which stays empty for undated fallback cases
+- Telegram applies its own `telegram_top_n` delivery cap, separate from the regional `llm_top_n` enrichment cap
 - CSV review artifacts include both outward `published_date` and technical `resolved_publication_date`
 - Notion reads the already computed resolved date from the final schema and only falls back to the resolver if that field is unexpectedly absent
 
