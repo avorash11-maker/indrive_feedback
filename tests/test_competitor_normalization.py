@@ -74,7 +74,35 @@ def test_deduplicate_raw_articles_removes_url_and_title_duplicates():
     unique = deduplicate_raw_articles(articles)
 
     assert len(unique) == 1
-    assert unique[0].url == "https://example.com/one"
+    assert unique[0].provider == "gdelt"
+    assert unique[0].url == "https://example.com/two"
+
+
+def test_deduplicate_raw_articles_prefers_direct_tier_sources_over_aggregators():
+    articles = [
+        RawArticle(
+            title="Bolt expands airport shuttle in Nairobi",
+            url="https://aggregator.example.com/bolt-nairobi",
+            provider="google_news_rss",
+            source="Google News",
+            snippet="",
+            metadata={"source_tier": "tier1_aggregator"},
+        ),
+        RawArticle(
+            title="Bolt expands airport shuttle in Nairobi | Daily Feed",
+            url="https://direct.example.com/bolt-nairobi",
+            provider="regional_rss",
+            source="Daily Feed",
+            snippet="Direct feed with better context.",
+            metadata={"source_tier": "tier2_direct"},
+        ),
+    ]
+
+    unique = deduplicate_raw_articles(articles)
+
+    assert len(unique) == 1
+    assert unique[0].provider == "regional_rss"
+    assert unique[0].url == "https://direct.example.com/bolt-nairobi"
 
 
 def test_normalize_source_falls_back_to_domain():

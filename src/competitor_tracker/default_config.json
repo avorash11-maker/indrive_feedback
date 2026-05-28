@@ -106,11 +106,105 @@
       "safety features"
     ]
   },
+  "topic_priority_groups": [
+    "market_expansion",
+    "campaign_launches",
+    "pricing_promo",
+    "strategic_operations",
+    "performance_growth",
+    "product_features_innovation",
+    "industry_context"
+  ],
+  "competitor_aliases": {
+    "Yandex Go": ["Yango", "Yandex Taxi"],
+    "Careem": ["Careem Rides", "Careem Pay"],
+    "Grab": ["GrabTaxi", "GrabCar", "GrabBike"],
+    "Gojek": ["Go-Jek", "Go Ride", "GoCar"],
+    "Bolt": ["Bolt Food", "Bolt Drive"],
+    "Uber": ["Uber Eats", "Uber Taxi"]
+  },
+  "regional_rss_feeds": {
+    "latam": [
+      {
+        "name": "EL PAIS America",
+        "url": "https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/america/portada",
+        "language": "es"
+      },
+      {
+        "name": "Mexico News Daily",
+        "url": "https://mexiconewsdaily.com/feed/",
+        "language": "en"
+      },
+      {
+        "name": "Buenos Aires Times",
+        "url": "https://www.batimes.com.ar/feed",
+        "language": "en"
+      },
+      {
+        "name": "MercoPress",
+        "url": "https://en.mercopress.com/rss",
+        "language": "en"
+      }
+    ],
+    "africa": [
+      {
+        "name": "AllAfrica Kenya",
+        "url": "https://allafrica.com/tools/headlines/rdf/kenya/headlines.rdf",
+        "language": "en"
+      },
+      {
+        "name": "AllAfrica Nigeria",
+        "url": "https://allafrica.com/tools/headlines/rdf/nigeria/headlines.rdf",
+        "language": "en"
+      },
+      {
+        "name": "AllAfrica South Africa",
+        "url": "https://allafrica.com/tools/headlines/rdf/southafrica/headlines.rdf",
+        "language": "en"
+      }
+    ],
+    "mea": [
+      {
+        "name": "AGBI",
+        "url": "https://www.agbi.com/feed/",
+        "language": "en"
+      },
+      {
+        "name": "Doha News",
+        "url": "https://dohanews.co/feed/",
+        "language": "en"
+      }
+    ],
+    "sea": [
+      {
+        "name": "CNA Asia",
+        "url": "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml&category=6511",
+        "language": "en"
+      }
+    ],
+    "cis_central_asia": [
+      {
+        "name": "Civil Georgia",
+        "url": "https://civil.ge/feed/",
+        "language": "en"
+      },
+      {
+        "name": "Astana Times",
+        "url": "https://astanatimes.com/feed/",
+        "language": "en"
+      },
+      {
+        "name": "The Times of Central Asia",
+        "url": "https://timesca.com/feed/",
+        "language": "en"
+      }
+    ]
+  },
   "keyword_templates": [
     "\"{competitor}\" {topic_keywords} {geo_terms}",
     "\"{competitor}\" {topic_name} {region_label} {language_hints}"
   ],
   "ignored_geo_terms": ["USA", "United States", "North America", "Europe", "UK"],
   "daily_digest_limit": 12,
-  "enabled_providers": ["newsapi", "gdelt", "google_news_rss"]
+  "enabled_providers": ["gdelt", "google_news_rss", "regional_rss", "guardian"]
 }

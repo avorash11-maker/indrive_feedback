@@ -158,3 +158,23 @@ def test_cli_test_provider_prints_structured_diagnostics(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert '"provider": "google_news_rss"' in output
     assert '"status": "error"' in output
+
+
+def test_cli_qa_feeds_prints_stored_feed_health_report(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "run_feed_qa",
+        lambda **kwargs: {
+            "days": kwargs["days"],
+            "feed_count": 1,
+            "highest_noise_feed": {"feed_name": "MercoPress"},
+            "recommendations": [],
+            "feeds": [],
+        },
+    )
+
+    cli.main(["qa-feeds", "--days", "14", "--min-feed-items", "3", "--limit", "5"])
+
+    output = capsys.readouterr().out
+    assert '"days": 14' in output
+    assert '"feed_name": "MercoPress"' in output

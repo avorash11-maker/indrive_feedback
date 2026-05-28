@@ -6,6 +6,8 @@ import csv
 import json
 import sqlite3
 from dataclasses import asdict
+from datetime import datetime, timezone
+from math import pow
 from pathlib import Path
 from typing import Any, Optional, Protocol, Sequence
 
@@ -261,6 +263,7 @@ class SQLiteTrackerStorage:
         drop_reasons_json TEXT NOT NULL DEFAULT '{}',
         provider_errors_json TEXT NOT NULL,
         provider_diagnostics_json TEXT NOT NULL DEFAULT '{}',
+        provider_metrics_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -277,6 +280,27 @@ class SQLiteTrackerStorage:
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(alert_key, channel, destination)
+    );
+
+    CREATE TABLE IF NOT EXISTS rss_feed_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER,
+        measured_at TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        region TEXT NOT NULL,
+        feed_name TEXT NOT NULL,
+        feed_url TEXT NOT NULL,
+        items_found INTEGER NOT NULL DEFAULT 0,
+        provider_matches INTEGER NOT NULL DEFAULT 0,
+        raw_articles_after_global_dedup INTEGER NOT NULL DEFAULT 0,
+        prefilter_passed INTEGER NOT NULL DEFAULT 0,
+        candidates_kept INTEGER NOT NULL DEFAULT 0,
+        alerts_created INTEGER NOT NULL DEFAULT 0,
+        dropped_prefilter INTEGER NOT NULL DEFAULT 0,
+        noise_ratio REAL NOT NULL DEFAULT 0,
+        recommendation TEXT NOT NULL DEFAULT 'keep',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(run_id) REFERENCES runs(id)
     );
     """
 
@@ -295,6 +319,7 @@ class SQLiteTrackerStorage:
         with self._connect() as connection:
             connection.executescript(self.SCHEMA)
             self._migrate_runs_table(connection)
+            self._migrate_rss_feed_metrics_table(connection)
 
     @staticmethod
     def _migrate_runs_table(connection: sqlite3.Connection) -> None:
@@ -310,12 +335,51 @@ class SQLiteTrackerStorage:
             "status": "TEXT NOT NULL DEFAULT 'success'",
             "drop_reasons_json": "TEXT NOT NULL DEFAULT '{}'",
             "provider_diagnostics_json": "TEXT NOT NULL DEFAULT '{}'",
+            "provider_metrics_json": "TEXT NOT NULL DEFAULT '{}'",
         }
         for column_name, column_sql in required_columns.items():
             if column_name in existing_columns:
                 continue
             connection.execute(
                 f"ALTER TABLE runs ADD COLUMN {column_name} {column_sql}"
+            )
+
+    @staticmethod
+    def _migrate_rss_feed_metrics_table(connection: sqlite3.Connection) -> None:
+        existing_tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if "rss_feed_metrics" not in existing_tables:
+            return
+        existing_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(rss_feed_metrics)").fetchall()
+        }
+        required_columns = {
+            "run_id": "INTEGER",
+            "measured_at": "TEXT NOT NULL DEFAULT ''",
+            "provider": "TEXT NOT NULL DEFAULT ''",
+            "region": "TEXT NOT NULL DEFAULT ''",
+            "feed_name": "TEXT NOT NULL DEFAULT ''",
+            "feed_url": "TEXT NOT NULL DEFAULT ''",
+            "items_found": "INTEGER NOT NULL DEFAULT 0",
+            "provider_matches": "INTEGER NOT NULL DEFAULT 0",
+            "raw_articles_after_global_dedup": "INTEGER NOT NULL DEFAULT 0",
+            "prefilter_passed": "INTEGER NOT NULL DEFAULT 0",
+            "candidates_kept": "INTEGER NOT NULL DEFAULT 0",
+            "alerts_created": "INTEGER NOT NULL DEFAULT 0",
+            "dropped_prefilter": "INTEGER NOT NULL DEFAULT 0",
+            "noise_ratio": "REAL NOT NULL DEFAULT 0",
+            "recommendation": "TEXT NOT NULL DEFAULT 'keep'",
+        }
+        for column_name, column_sql in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            connection.execute(
+                f"ALTER TABLE rss_feed_metrics ADD COLUMN {column_name} {column_sql}"
             )
 
     def has_seen_article(self, url: str) -> bool:
@@ -474,8 +538,9 @@ class SQLiteTrackerStorage:
                     queries_generated, raw_articles_collected, candidates_kept,
                     alerts_created, daily_digest_limit, raw_articles_fetched,
                     raw_articles_deduplicated, articles_filtered_out, alerts_sent,
-                    status, drop_reasons_json, provider_errors_json, provider_diagnostics_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, drop_reasons_json, provider_errors_json, provider_diagnostics_json,
+                    provider_metrics_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     summary.started_at,
@@ -495,9 +560,250 @@ class SQLiteTrackerStorage:
                     _json_dumps(summary.drop_reasons),
                     _json_dumps(summary.provider_errors),
                     _json_dumps(summary.provider_diagnostics),
+                    _json_dumps(summary.provider_metrics),
                 ),
             )
         return int(cursor.lastrowid)
+
+    @staticmethod
+    def recommend_feed_action(
+        *,
+        items_found: int,
+        provider_matches: int,
+        prefilter_passed: int,
+        alerts_created: int,
+    ) -> str:
+        if items_found >= 15 and provider_matches == 0:
+            return "consider_removal_broad_feed"
+        if provider_matches >= 8 and alerts_created == 0 and prefilter_passed <= 1:
+            return "consider_removal_high_noise"
+        if provider_matches >= 5 and prefilter_passed <= 1:
+            return "review_low_signal"
+        if provider_matches >= 5 and alerts_created == 0:
+            return "review_low_alert_yield"
+        return "keep"
+
+    def insert_feed_metric_rows(
+        self,
+        *,
+        run_id: Optional[int],
+        rows: Sequence[dict[str, Any]],
+    ) -> list[int]:
+        inserted_ids: list[int] = []
+        if not rows:
+            return inserted_ids
+        with self._connect() as connection:
+            for row in rows:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO rss_feed_metrics (
+                        run_id,
+                        measured_at,
+                        provider,
+                        region,
+                        feed_name,
+                        feed_url,
+                        items_found,
+                        provider_matches,
+                        raw_articles_after_global_dedup,
+                        prefilter_passed,
+                        candidates_kept,
+                        alerts_created,
+                        dropped_prefilter,
+                        noise_ratio,
+                        recommendation
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        str(row.get("measured_at") or ""),
+                        str(row.get("provider") or ""),
+                        str(row.get("region") or ""),
+                        str(row.get("feed_name") or ""),
+                        str(row.get("feed_url") or ""),
+                        int(row.get("items_found") or 0),
+                        int(row.get("provider_matches") or 0),
+                        int(row.get("raw_articles_after_global_dedup") or 0),
+                        int(row.get("prefilter_passed") or 0),
+                        int(row.get("candidates_kept") or 0),
+                        int(row.get("alerts_created") or 0),
+                        int(row.get("dropped_prefilter") or 0),
+                        float(row.get("noise_ratio") or 0.0),
+                        str(row.get("recommendation") or "keep"),
+                    ),
+                )
+                inserted_ids.append(int(cursor.lastrowid))
+        return inserted_ids
+
+    def get_feed_health_report(
+        self,
+        *,
+        days: int = 30,
+        min_items_found: int = 5,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        lookback_days = max(1, int(days))
+        row_limit = max(1, int(limit))
+        min_found = max(0, int(min_items_found))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    provider,
+                    region,
+                    feed_name,
+                    feed_url,
+                    COUNT(*) AS snapshots,
+                    SUM(items_found) AS items_found,
+                    SUM(provider_matches) AS provider_matches,
+                    SUM(raw_articles_after_global_dedup) AS raw_articles_after_global_dedup,
+                    SUM(prefilter_passed) AS prefilter_passed,
+                    SUM(candidates_kept) AS candidates_kept,
+                    SUM(alerts_created) AS alerts_created,
+                    SUM(dropped_prefilter) AS dropped_prefilter
+                FROM rss_feed_metrics
+                WHERE measured_at >= datetime('now', ?)
+                GROUP BY provider, region, feed_name, feed_url
+                HAVING SUM(items_found) >= ?
+                ORDER BY
+                    CASE
+                        WHEN SUM(provider_matches) > 0
+                            THEN 1.0 - (CAST(SUM(candidates_kept) AS REAL) / SUM(provider_matches))
+                        ELSE CASE WHEN SUM(items_found) > 0 THEN 1.0 ELSE 0.0 END
+                    END DESC,
+                    SUM(items_found) DESC,
+                    feed_name ASC
+                LIMIT ?
+                """,
+                (f"-{lookback_days} days", min_found, row_limit),
+            ).fetchall()
+        feeds: list[dict[str, Any]] = []
+        recommendations: list[dict[str, Any]] = []
+        for row in rows:
+            items_found = int(row["items_found"] or 0)
+            provider_matches = int(row["provider_matches"] or 0)
+            candidates_kept = int(row["candidates_kept"] or 0)
+            prefilter_passed = int(row["prefilter_passed"] or 0)
+            alerts_created = int(row["alerts_created"] or 0)
+            noise_ratio = (
+                round(1.0 - (candidates_kept / provider_matches), 4)
+                if provider_matches > 0
+                else (1.0 if items_found > 0 else 0.0)
+            )
+            recommendation = self.recommend_feed_action(
+                items_found=items_found,
+                provider_matches=provider_matches,
+                prefilter_passed=prefilter_passed,
+                alerts_created=alerts_created,
+            )
+            feed_row = {
+                "provider": str(row["provider"] or ""),
+                "region": str(row["region"] or ""),
+                "feed_name": str(row["feed_name"] or ""),
+                "feed_url": str(row["feed_url"] or ""),
+                "snapshots": int(row["snapshots"] or 0),
+                "items_found": items_found,
+                "provider_matches": provider_matches,
+                "raw_articles_after_global_dedup": int(row["raw_articles_after_global_dedup"] or 0),
+                "prefilter_passed": prefilter_passed,
+                "candidates_kept": candidates_kept,
+                "alerts_created": alerts_created,
+                "dropped_prefilter": int(row["dropped_prefilter"] or 0),
+                "noise_ratio": noise_ratio,
+                "recommendation": recommendation,
+            }
+            feeds.append(feed_row)
+            if recommendation != "keep":
+                recommendations.append(
+                    {
+                        "feed_name": feed_row["feed_name"],
+                        "feed_url": feed_row["feed_url"],
+                        "region": feed_row["region"],
+                        "recommendation": recommendation,
+                        "reason": (
+                            f"items_found={items_found} provider_matches={provider_matches} "
+                            f"candidates_kept={candidates_kept} alerts_created={alerts_created} "
+                            f"noise_ratio={noise_ratio}"
+                        ),
+                    }
+                )
+        highest_noise_feed = feeds[0] if feeds else None
+        return {
+            "days": lookback_days,
+            "min_items_found": min_found,
+            "feed_count": len(feeds),
+            "highest_noise_feed": highest_noise_feed,
+            "recommendations": recommendations,
+            "feeds": feeds,
+        }
+
+    def get_query_precision_by_text(
+        self,
+        queries: Sequence[str],
+        *,
+        half_life_days: float = 30.0,
+        now: Optional[datetime] = None,
+    ) -> dict[str, float]:
+        normalized_queries = [str(query).strip() for query in queries if str(query).strip()]
+        if not normalized_queries:
+            return {}
+        placeholders = ", ".join("?" for _ in normalized_queries)
+        effective_half_life_days = max(float(half_life_days), 0.0001)
+        reference_now = now or datetime.now(timezone.utc)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    r.query_text,
+                    r.created_at,
+                    CASE WHEN COUNT(DISTINCT c.id) > 0 THEN 1 ELSE 0 END AS has_candidate,
+                    CASE WHEN COUNT(DISTINCT a.id) > 0 THEN 1 ELSE 0 END AS has_alert
+                FROM articles_raw r
+                LEFT JOIN article_candidates c
+                    ON c.raw_article_id = r.id
+                LEFT JOIN alerts a
+                    ON a.candidate_id = c.id
+                WHERE r.query_text IN ({placeholders})
+                GROUP BY r.id, r.query_text, r.created_at
+                """,
+                tuple(normalized_queries),
+            ).fetchall()
+        totals: dict[str, dict[str, float]] = {}
+        for row in rows:
+            created_at_raw = str(row["created_at"] or "").strip()
+            created_at = reference_now
+            if created_at_raw:
+                normalized = created_at_raw.replace("Z", "+00:00")
+                try:
+                    created_at = datetime.fromisoformat(normalized)
+                except ValueError:
+                    created_at = reference_now
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            age_days = max((reference_now - created_at.astimezone(timezone.utc)).total_seconds() / 86400.0, 0.0)
+            weight = pow(0.5, age_days / effective_half_life_days)
+            bucket = totals.setdefault(
+                str(row["query_text"]),
+                {
+                    "raw_weight": 0.0,
+                    "candidate_weight": 0.0,
+                    "alert_weight": 0.0,
+                },
+            )
+            bucket["raw_weight"] += weight
+            if int(row["has_candidate"] or 0):
+                bucket["candidate_weight"] += weight
+            if int(row["has_alert"] or 0):
+                bucket["alert_weight"] += weight
+        scores: dict[str, float] = {}
+        for query_text, bucket in totals.items():
+            raw_weight = max(bucket["raw_weight"], 0.0001)
+            candidate_ratio = bucket["candidate_weight"] / raw_weight
+            alert_ratio = bucket["alert_weight"] / raw_weight
+            precision = (candidate_ratio * 0.4) + (alert_ratio * 0.6)
+            confidence = raw_weight / (raw_weight + 2.0)
+            scores[query_text] = round(precision * confidence, 4)
+        return scores
 
     def log_delivery(self, record: DeliveryRecord) -> int:
         with self._connect() as connection:

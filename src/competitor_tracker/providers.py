@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import json
+import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Protocol, Sequence
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Iterable, List, Optional, Protocol, Sequence
 from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
 from xml.etree import ElementTree
 
@@ -13,6 +17,7 @@ import requests
 from bs4 import BeautifulSoup
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from .environment import get_env_value
 from .models import RawArticle
 from .normalization import clean_text, extract_domain, normalize_source
 
@@ -29,6 +34,26 @@ DEFAULT_HEADERS = {
 GOOGLE_NEWS_MAX_ITEMS = 75
 GDELT_MAX_RECORDS = 75
 NEWSAPI_PAGE_SIZE = 50
+NEWSAPI_DAILY_REQUEST_LIMIT = 90
+NEWSAPI_CACHE_TTL_SECONDS = 600
+NEWSAPI_COOLDOWN_SECONDS = 900
+GUARDIAN_PAGE_SIZE = 20
+GUARDIAN_DAILY_REQUEST_LIMIT = 450
+GUARDIAN_CACHE_TTL_SECONDS = 900
+GUARDIAN_COOLDOWN_SECONDS = 900
+SHORT_COMPETITOR_CONTEXT_TERMS = (
+    "app",
+    "apps",
+    "ride",
+    "rides",
+    "rider",
+    "riders",
+    "taxi",
+    "driver",
+    "drivers",
+    "mobility",
+    "transport",
+)
 
 
 class ProviderError(Exception):
@@ -90,6 +115,7 @@ class BaseHttpProvider:
         query: str,
         provider: str,
         competitor_hints: Sequence[str],
+        metadata: Optional[dict[str, str]] = None,
     ) -> RawArticle:
         return RawArticle(
             title=clean_text(title),
@@ -100,6 +126,7 @@ class BaseHttpProvider:
             snippet=clean_text(snippet),
             query=clean_text(query),
             competitor_hints=tuple(competitor_hints),
+            metadata=metadata or {},
         )
 
     @staticmethod
@@ -179,6 +206,214 @@ class BaseHttpProvider:
         ) from exc
 
 
+class JsonBudgetCacheMixin:
+    """Small reusable file-backed cache/budget helpers for capped providers."""
+
+    cache_path: Path
+    budget_path: Path
+    cache_ttl_seconds: int
+    daily_request_limit: int
+    cooldown_seconds: int
+    name: str
+
+    def _read_json_file(self, path: Path) -> dict[str, object]:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except json.JSONDecodeError:
+            logger.warning("Ignoring unreadable JSON state file: %s", path)
+            return {}
+
+    def _write_json_file(self, path: Path, payload: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _utc_now() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _load_cached_query(
+        self,
+        *,
+        query: str,
+        competitor_hints: Sequence[str],
+        request_url: str,
+    ) -> Optional[tuple[List[RawArticle], dict[str, object]]]:
+        if self.cache_ttl_seconds <= 0:
+            return None
+        payload = self._read_json_file(self.cache_path)
+        cache = payload.get("queries")
+        if not isinstance(cache, dict):
+            return None
+        entry = cache.get(query)
+        if not isinstance(entry, dict):
+            return None
+        expires_at_raw = str(entry.get("expires_at") or "").strip()
+        try:
+            expires_at = datetime.fromisoformat(expires_at_raw)
+        except ValueError:
+            return None
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= self._utc_now():
+            cache.pop(query, None)
+            self._write_json_file(self.cache_path, payload)
+            return None
+        articles_payload = entry.get("articles")
+        if not isinstance(articles_payload, list):
+            return None
+        articles = [
+            RawArticle(
+                title=str(item.get("title") or ""),
+                url=str(item.get("url") or ""),
+                provider=self.name,
+                source=str(item.get("source") or ""),
+                published_at=item.get("published_at"),
+                snippet=str(item.get("snippet") or ""),
+                query=query,
+                region=item.get("region"),
+                language=item.get("language"),
+                competitor_hints=tuple(item.get("competitor_hints") or competitor_hints),
+                metadata=dict(item.get("metadata") or {}),
+            )
+            for item in articles_payload
+            if isinstance(item, dict)
+        ]
+        stored_diagnostic = entry.get("diagnostic")
+        http_status = None
+        if isinstance(stored_diagnostic, dict):
+            http_status = stored_diagnostic.get("http_status")
+        diagnostic = BaseHttpProvider._query_diagnostic(
+            provider=self.name,
+            query=query,
+            request_url=request_url,
+            http_status=http_status,
+            items_found=len(articles),
+            items_after_filter=len(articles),
+            status="cached",
+        )
+        diagnostic["cached"] = True
+        return articles, diagnostic
+
+    def _store_cached_query(
+        self,
+        *,
+        query: str,
+        articles: Sequence[RawArticle],
+        diagnostic: dict[str, object],
+    ) -> None:
+        if self.cache_ttl_seconds <= 0:
+            return
+        payload = self._read_json_file(self.cache_path)
+        cache = payload.get("queries")
+        if not isinstance(cache, dict):
+            cache = {}
+        cache[query] = {
+            "expires_at": (
+                self._utc_now() + timedelta(seconds=self.cache_ttl_seconds)
+            ).isoformat(),
+            "articles": [
+                {
+                    "title": article.title,
+                    "url": article.url,
+                    "source": article.source,
+                    "published_at": article.published_at,
+                    "snippet": article.snippet,
+                    "region": article.region,
+                    "language": article.language,
+                    "competitor_hints": list(article.competitor_hints),
+                    "metadata": dict(article.metadata),
+                }
+                for article in articles
+            ],
+            "diagnostic": {
+                "request_url": diagnostic.get("request_url", ""),
+                "http_status": diagnostic.get("http_status"),
+            },
+        }
+        payload["queries"] = cache
+        self._write_json_file(self.cache_path, payload)
+
+    def _reserve_request_budget(
+        self,
+        *,
+        query: str,
+        request_url: str,
+        cooldown_message: str,
+    ) -> None:
+        payload = self._read_json_file(self.budget_path)
+        today = self._utc_now().date().isoformat()
+        if payload.get("day") != today:
+            payload = {"day": today, "count": 0, "cooldown_until": ""}
+        cooldown_until_raw = str(payload.get("cooldown_until") or "").strip()
+        if cooldown_until_raw:
+            try:
+                cooldown_until = datetime.fromisoformat(cooldown_until_raw)
+            except ValueError:
+                cooldown_until = self._utc_now()
+            if cooldown_until.tzinfo is None:
+                cooldown_until = cooldown_until.replace(tzinfo=timezone.utc)
+            if cooldown_until > self._utc_now():
+                diagnostic = BaseHttpProvider._query_diagnostic(
+                    provider=self.name,
+                    query=query,
+                    request_url=request_url,
+                    exception=cooldown_message,
+                    status="error",
+                )
+                diagnostic["cooldown_hit"] = True
+                raise ProviderError(
+                    f"Failed to fetch from {self.name}: cooldown is active after rate limiting",
+                    diagnostics={
+                        "provider": self.name,
+                        "status": "error",
+                        "queries": [diagnostic],
+                        "items_found": 0,
+                        "items_after_filter": 0,
+                        "items_after_global_dedup": 0,
+                    },
+                )
+        count = int(payload.get("count") or 0)
+        if count >= self.daily_request_limit:
+            diagnostic = BaseHttpProvider._query_diagnostic(
+                provider=self.name,
+                query=query,
+                request_url=request_url,
+                exception=(
+                    f"{self.name} daily request limit reached ({self.daily_request_limit})."
+                ),
+                status="error",
+            )
+            diagnostic["budget_hit"] = True
+            raise ProviderError(
+                f"Failed to fetch from {self.name}: daily request limit reached ({self.daily_request_limit})",
+                diagnostics={
+                    "provider": self.name,
+                    "status": "error",
+                    "queries": [diagnostic],
+                    "items_found": 0,
+                    "items_after_filter": 0,
+                    "items_after_global_dedup": 0,
+                },
+            )
+        payload["count"] = count + 1
+        self._write_json_file(self.budget_path, payload)
+
+    def _activate_cooldown(self) -> None:
+        payload = self._read_json_file(self.budget_path)
+        if payload.get("day") != self._utc_now().date().isoformat():
+            payload["day"] = self._utc_now().date().isoformat()
+            payload["count"] = int(payload.get("count") or 0)
+        payload["cooldown_until"] = (
+            self._utc_now() + timedelta(seconds=self.cooldown_seconds)
+        ).isoformat()
+        self._write_json_file(self.budget_path, payload)
+
+
 class UnsupportedProvider:
     """Placeholder that makes unknown configured providers visible at runtime."""
 
@@ -222,7 +457,483 @@ class UnsupportedProvider:
         )
 
 
-class NewsApiProvider(BaseHttpProvider):
+class GuardianProvider(JsonBudgetCacheMixin, BaseHttpProvider):
+    """Guardian Content API provider for non-commercial portfolio usage."""
+
+    name = "guardian"
+
+    def __init__(
+        self,
+        session: Optional[requests.Session] = None,
+        *,
+        api_key: Optional[str] = None,
+    ) -> None:
+        super().__init__(session=session)
+        self.api_key = (
+            get_env_value("GUARDIAN_API_KEY")
+            if api_key is None
+            else api_key.strip()
+        )
+        output_dir = Path(
+            os.getenv("COMPETITOR_TRACKER_OUTPUT_DIR", "output/competitor_tracker")
+        )
+        self.cache_path = Path(
+            os.getenv(
+                "COMPETITOR_TRACKER_GUARDIAN_CACHE_PATH",
+                str(output_dir / "guardian_cache.json"),
+            )
+        )
+        self.budget_path = Path(
+            os.getenv(
+                "COMPETITOR_TRACKER_GUARDIAN_BUDGET_PATH",
+                str(output_dir / "guardian_budget.json"),
+            )
+        )
+        self.daily_request_limit = max(
+            0,
+            int(
+                os.getenv(
+                    "COMPETITOR_TRACKER_GUARDIAN_DAILY_REQUEST_LIMIT",
+                    str(GUARDIAN_DAILY_REQUEST_LIMIT),
+                )
+            ),
+        )
+        self.cache_ttl_seconds = max(
+            0,
+            int(
+                os.getenv(
+                    "COMPETITOR_TRACKER_GUARDIAN_CACHE_TTL_SECONDS",
+                    str(GUARDIAN_CACHE_TTL_SECONDS),
+                )
+            ),
+        )
+        self.cooldown_seconds = max(
+            0,
+            int(
+                os.getenv(
+                    "COMPETITOR_TRACKER_GUARDIAN_COOLDOWN_SECONDS",
+                    str(GUARDIAN_COOLDOWN_SECONDS),
+                )
+            ),
+        )
+
+    def fetch(self, request: ProviderRequest) -> List[RawArticle]:
+        articles, _ = self.fetch_with_diagnostics(request)
+        return articles
+
+    def fetch_with_diagnostics(
+        self,
+        request: ProviderRequest,
+    ) -> tuple[List[RawArticle], dict[str, object]]:
+        if not self.api_key:
+            diagnostic = self._query_diagnostic(
+                provider=self.name,
+                query="guardian-content-api",
+                request_url="https://content.guardianapis.com/search",
+                exception="GUARDIAN_API_KEY is missing; Guardian provider skipped.",
+                status="skipped",
+            )
+            return [], {
+                "provider": self.name,
+                "status": "skipped",
+                "queries": [diagnostic],
+                "items_found": 0,
+                "items_after_filter": 0,
+                "items_after_global_dedup": 0,
+            }
+
+        articles: List[RawArticle] = []
+        query_diagnostics: list[dict[str, object]] = []
+        for query in request.queries:
+            fetched, diagnostic = self._fetch_query(
+                query=query,
+                days=request.days,
+                competitor_hints=request.competitor_hints_for_query(query),
+            )
+            articles.extend(fetched)
+            query_diagnostics.append(diagnostic)
+        return articles, {
+            "provider": self.name,
+            "status": "ok",
+            "queries": query_diagnostics,
+            "items_found": sum(int(item["items_found"]) for item in query_diagnostics),
+            "items_after_filter": sum(int(item["items_after_filter"]) for item in query_diagnostics),
+            "items_after_global_dedup": 0,
+        }
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(requests.RequestException),
+    )
+    def _fetch_query(
+        self,
+        *,
+        query: str,
+        days: int,
+        competitor_hints: Sequence[str],
+    ) -> tuple[List[RawArticle], dict[str, object]]:
+        url = "https://content.guardianapis.com/search"
+        params = {
+            "q": query,
+            "api-key": self.api_key,
+            "page-size": GUARDIAN_PAGE_SIZE,
+            "order-by": "newest",
+            "show-fields": "trailText,bodyText",
+            "from-date": (datetime.now(timezone.utc) - timedelta(days=max(1, days))).date().isoformat(),
+        }
+        request_url = self._build_request_url(
+            url=url,
+            params=params,
+            redacted_params=("api-key",),
+        )
+        cached = self._load_cached_query(
+            query=query,
+            competitor_hints=competitor_hints,
+            request_url=request_url,
+        )
+        if cached is not None:
+            return cached
+        self._reserve_request_budget(
+            query=query,
+            request_url=request_url,
+            cooldown_message="Guardian cooldown is active after a rate limit response.",
+        )
+        response = None
+        try:
+            response = self.session.get(url, params=params, timeout=20)
+            if self._http_status(response) == 429:
+                diagnostic = self._query_diagnostic(
+                    provider=self.name,
+                    query=query,
+                    request_url=request_url,
+                    http_status=429,
+                    exception="Guardian rate limit hit; cooldown activated.",
+                    status="error",
+                )
+                diagnostic["cooldown_hit"] = True
+                self._activate_cooldown()
+                raise ProviderError(
+                    f"Failed to fetch from guardian for query '{query}': rate limit hit [429]",
+                    diagnostics={
+                        "provider": self.name,
+                        "status": "error",
+                        "queries": [diagnostic],
+                        "items_found": 0,
+                        "items_after_filter": 0,
+                        "items_after_global_dedup": 0,
+                    },
+                )
+            response.raise_for_status()
+            data = response.json()
+            response_payload = data.get("response") or {}
+            found_items = list(response_payload.get("results", []))
+            articles = [
+                self._article(
+                    title=item.get("webTitle"),
+                    url=item.get("webUrl"),
+                    source="The Guardian",
+                    published_at=item.get("webPublicationDate"),
+                    snippet=(item.get("fields") or {}).get("trailText")
+                    or (item.get("fields") or {}).get("bodyText")
+                    or "",
+                    query=query,
+                    provider=self.name,
+                    competitor_hints=competitor_hints,
+                    metadata={
+                        "source_tier": "tier2_direct",
+                    },
+                )
+                for item in found_items
+                if item.get("webUrl")
+            ]
+            diagnostic = self._query_diagnostic(
+                provider=self.name,
+                query=query,
+                request_url=request_url,
+                http_status=self._http_status(response),
+                items_found=len(found_items),
+                items_after_filter=len(articles),
+            )
+            self._store_cached_query(
+                query=query,
+                articles=articles,
+                diagnostic=diagnostic,
+            )
+            return articles, diagnostic
+        except Exception as exc:
+            diagnostic = self._query_diagnostic(
+                provider=self.name,
+                query=query,
+                request_url=request_url,
+                http_status=self._http_status(response),
+                exception=str(exc),
+                status="error",
+            )
+            self._raise_provider_error(
+                provider=self.name,
+                query=query,
+                exc=exc,
+                diagnostics={
+                    "provider": self.name,
+                    "status": "error",
+                    "queries": [diagnostic],
+                    "items_found": 0,
+                    "items_after_filter": 0,
+                    "items_after_global_dedup": 0,
+                },
+            )
+
+
+class RegionalRssProvider(BaseHttpProvider):
+    """Curated regional RSS provider with direct-feed source matching."""
+
+    name = "regional_rss"
+
+    def __init__(
+        self,
+        session: Optional[requests.Session] = None,
+        *,
+        feeds_by_region: Optional[dict[str, Sequence[object]]] = None,
+        competitor_aliases: Optional[dict[str, Sequence[str]]] = None,
+    ) -> None:
+        super().__init__(session=session)
+        self.feeds_by_region = dict(feeds_by_region or {})
+        self.competitor_aliases = {
+            str(key): tuple(value)
+            for key, value in (competitor_aliases or {}).items()
+        }
+
+    def configure(
+        self,
+        *,
+        feeds_by_region: dict[str, Sequence[object]],
+        competitor_aliases: dict[str, Sequence[str]],
+    ) -> None:
+        self.feeds_by_region = dict(feeds_by_region)
+        self.competitor_aliases = {
+            str(key): tuple(value)
+            for key, value in competitor_aliases.items()
+        }
+
+    def fetch(self, request: ProviderRequest) -> List[RawArticle]:
+        articles, _ = self.fetch_with_diagnostics(request)
+        return articles
+
+    def fetch_with_diagnostics(
+        self,
+        request: ProviderRequest,
+    ) -> tuple[List[RawArticle], dict[str, object]]:
+        feed_specs = list(self._iter_feed_specs(request.regions))
+        if not feed_specs:
+            diagnostic = self._query_diagnostic(
+                provider=self.name,
+                query="regional_rss",
+                request_url="",
+                exception="No curated RSS feeds configured for requested regions.",
+                status="skipped",
+            )
+            return [], {
+                "provider": self.name,
+                "status": "skipped",
+                "queries": [diagnostic],
+                "items_found": 0,
+                "items_after_filter": 0,
+                "items_after_global_dedup": 0,
+                "feeds_skipped": 0,
+            }
+
+        articles: List[RawArticle] = []
+        query_diagnostics: list[dict[str, object]] = []
+        feeds_skipped = 0
+        for region_key, feed in feed_specs:
+            fetched, diagnostic = self._fetch_feed(
+                region_key=region_key,
+                feed=feed,
+                competitors=request.competitors,
+            )
+            articles.extend(fetched)
+            if int(diagnostic.get("items_after_filter") or 0) == 0:
+                feeds_skipped += 1
+            query_diagnostics.append(diagnostic)
+        return articles, {
+            "provider": self.name,
+            "status": "ok",
+            "queries": query_diagnostics,
+            "items_found": sum(int(item["items_found"]) for item in query_diagnostics),
+            "items_after_filter": sum(int(item["items_after_filter"]) for item in query_diagnostics),
+            "items_after_global_dedup": 0,
+            "feeds_skipped": feeds_skipped,
+        }
+
+    def _iter_feed_specs(self, regions: Sequence[str]) -> Iterable[tuple[str, object]]:
+        seen = set()
+        for region in regions:
+            for feed in self.feeds_by_region.get(region, ()):
+                feed_key = (region, getattr(feed, "url", ""))
+                if feed_key in seen:
+                    continue
+                seen.add(feed_key)
+                yield region, feed
+
+    def _fetch_feed(
+        self,
+        *,
+        region_key: str,
+        feed: object,
+        competitors: Sequence[str],
+    ) -> tuple[List[RawArticle], dict[str, object]]:
+        feed_name = str(getattr(feed, "name", "") or region_key)
+        feed_url = str(getattr(feed, "url", "") or "")
+        feed_language = str(getattr(feed, "language", "") or "")
+        response = None
+        try:
+            response = self.session.get(feed_url, timeout=20)
+            response.raise_for_status()
+            root = ElementTree.fromstring(response.content)
+            items = root.findall(".//item")
+            found_items = len(items)
+            articles: List[RawArticle] = []
+            for item in items[:GOOGLE_NEWS_MAX_ITEMS]:
+                title = self._xml_text(item, "title")
+                link = self._xml_text(item, "link")
+                snippet = self._html_to_text(self._xml_text(item, "description"))
+                source = self._xml_text(item, "source") or feed_name or extract_domain(link)
+                matched_competitor = self._match_competitor(
+                    title=title,
+                    snippet=snippet,
+                    source=source,
+                    competitors=competitors,
+                )
+                if not matched_competitor:
+                    continue
+                articles.append(
+                    self._article(
+                        title=title,
+                        url=link,
+                        source=source,
+                        published_at=self._xml_text(item, "pubDate"),
+                        snippet=snippet,
+                        query=f"regional_rss::{region_key}::{matched_competitor}",
+                        provider=self.name,
+                        competitor_hints=(matched_competitor,),
+                        metadata={
+                            "query_owner_competitor": matched_competitor,
+                            "query_owner_region": region_key,
+                            "source_tier": "tier2_direct",
+                            "direct_feed_name": feed_name,
+                            "direct_feed_url": feed_url,
+                        },
+                    )
+                )
+                if feed_language:
+                    articles[-1] = RawArticle(
+                        title=articles[-1].title,
+                        url=articles[-1].url,
+                        provider=articles[-1].provider,
+                        source=articles[-1].source,
+                        published_at=articles[-1].published_at,
+                        snippet=articles[-1].snippet,
+                        query=articles[-1].query,
+                        region=region_key,
+                        language=feed_language,
+                        competitor_hints=articles[-1].competitor_hints,
+                        metadata=articles[-1].metadata,
+                    )
+            diagnostic = self._query_diagnostic(
+                provider=self.name,
+                query=f"{region_key}:{feed_name}",
+                request_url=feed_url,
+                http_status=self._http_status(response),
+                items_found=found_items,
+                items_after_filter=len(articles),
+            )
+            diagnostic["feed_name"] = feed_name
+            diagnostic["feed_url"] = feed_url
+            diagnostic["feed_region"] = region_key
+            return articles, diagnostic
+        except Exception as exc:
+            diagnostic = self._query_diagnostic(
+                provider=self.name,
+                query=f"{region_key}:{feed_name}",
+                request_url=feed_url,
+                http_status=self._http_status(response),
+                exception=str(exc),
+                status="error",
+            )
+            diagnostic["feed_name"] = feed_name
+            diagnostic["feed_url"] = feed_url
+            diagnostic["feed_region"] = region_key
+            self._raise_provider_error(
+                provider=self.name,
+                query=f"{region_key}:{feed_name}",
+                exc=exc,
+                diagnostics={
+                    "provider": self.name,
+                    "status": "error",
+                    "queries": [diagnostic],
+                    "items_found": 0,
+                    "items_after_filter": 0,
+                    "items_after_global_dedup": 0,
+                },
+            )
+
+    def _match_competitor(
+        self,
+        *,
+        title: str,
+        snippet: str,
+        source: str,
+        competitors: Sequence[str],
+    ) -> str:
+        text_blob = " ".join(
+            value.casefold()
+            for value in (title, snippet, source)
+            if value
+        )
+        for competitor in competitors:
+            aliases = self.competitor_aliases.get(competitor, ())
+            for candidate in (competitor, *aliases):
+                normalized = " ".join(str(candidate).casefold().split())
+                if self._matches_competitor_token(text_blob, normalized):
+                    return competitor
+        return ""
+
+    def _matches_competitor_token(self, text_blob: str, candidate: str) -> bool:
+        if not candidate:
+            return False
+        if self._is_context_required_token(candidate):
+            return self._matches_contextual_short_token(text_blob, candidate)
+        return bool(self._compile_competitor_pattern(candidate).search(text_blob))
+
+    def _is_context_required_token(self, candidate: str) -> bool:
+        compact = re.sub(r"[\W_]+", "", candidate)
+        if not compact:
+            return False
+        return compact.isdigit() or len(compact) <= 2
+
+    def _matches_contextual_short_token(self, text_blob: str, candidate: str) -> bool:
+        token_pattern = self._token_pattern(candidate)
+        context_pattern = "|".join(re.escape(term) for term in SHORT_COMPETITOR_CONTEXT_TERMS)
+        pattern = re.compile(
+            rf"(?:{token_pattern}(?!\s*[%$])(?:\W+\w+){{0,3}}\W+\b(?:{context_pattern})\b)"
+            rf"|(?:\b(?:{context_pattern})\b(?:\W+\w+){{0,3}}\W+{token_pattern}(?![%$]))",
+            re.IGNORECASE,
+        )
+        return bool(pattern.search(text_blob))
+
+    def _compile_competitor_pattern(self, candidate: str) -> re.Pattern[str]:
+        return re.compile(self._token_pattern(candidate), re.IGNORECASE)
+
+    def _token_pattern(self, candidate: str) -> str:
+        parts = [re.escape(part) for part in candidate.split() if part]
+        if not parts:
+            return r"$^"
+        joined = r"(?:\W|_)".join(parts) if len(parts) > 1 else parts[0]
+        return rf"(?<!\w){joined}(?!\w)"
+
+
+class NewsApiProvider(JsonBudgetCacheMixin, BaseHttpProvider):
     """NewsAPI provider with conservative page sizing to avoid quota spikes."""
 
     name = "newsapi"
@@ -234,7 +945,53 @@ class NewsApiProvider(BaseHttpProvider):
         api_key: Optional[str] = None,
     ) -> None:
         super().__init__(session=session)
-        self.api_key = api_key or os.getenv("NEWS_API_KEY", "").strip()
+        self.api_key = (
+            get_env_value("NEWS_API_KEY")
+            if api_key is None
+            else api_key.strip()
+        )
+        output_dir = Path(
+            os.getenv("COMPETITOR_TRACKER_OUTPUT_DIR", "output/competitor_tracker")
+        )
+        self.cache_path = Path(
+            os.getenv(
+                "COMPETITOR_TRACKER_NEWSAPI_CACHE_PATH",
+                str(output_dir / "newsapi_cache.json"),
+            )
+        )
+        self.budget_path = Path(
+            os.getenv(
+                "COMPETITOR_TRACKER_NEWSAPI_BUDGET_PATH",
+                str(output_dir / "newsapi_budget.json"),
+            )
+        )
+        self.daily_request_limit = max(
+            0,
+            int(
+                os.getenv(
+                    "COMPETITOR_TRACKER_NEWSAPI_DAILY_REQUEST_LIMIT",
+                    str(NEWSAPI_DAILY_REQUEST_LIMIT),
+                )
+            ),
+        )
+        self.cache_ttl_seconds = max(
+            0,
+            int(
+                os.getenv(
+                    "COMPETITOR_TRACKER_NEWSAPI_CACHE_TTL_SECONDS",
+                    str(NEWSAPI_CACHE_TTL_SECONDS),
+                )
+            ),
+        )
+        self.cooldown_seconds = max(
+            0,
+            int(
+                os.getenv(
+                    "COMPETITOR_TRACKER_NEWSAPI_COOLDOWN_SECONDS",
+                    str(NEWSAPI_COOLDOWN_SECONDS),
+                )
+            ),
+        )
 
     def fetch(self, request: ProviderRequest) -> List[RawArticle]:
         articles, _ = self.fetch_with_diagnostics(request)
@@ -306,9 +1063,43 @@ class NewsApiProvider(BaseHttpProvider):
             params=params,
             redacted_params=("apiKey",),
         )
+        cached = self._load_cached_query(
+            query=query,
+            competitor_hints=competitor_hints,
+            request_url=request_url,
+        )
+        if cached is not None:
+            return cached
+        self._reserve_request_budget(
+            query=query,
+            request_url=request_url,
+            cooldown_message="NewsAPI cooldown is active after a rate limit response.",
+        )
         response = None
         try:
             response = self.session.get(url, params=params, timeout=20)
+            if self._http_status(response) == 429:
+                diagnostic = self._query_diagnostic(
+                    provider=self.name,
+                    query=query,
+                    request_url=request_url,
+                    http_status=429,
+                    exception="NewsAPI rate limit hit; cooldown activated.",
+                    status="error",
+                )
+                diagnostic["cooldown_hit"] = True
+                self._activate_cooldown()
+                raise ProviderError(
+                    f"Failed to fetch from newsapi for query '{query}': rate limit hit [rateLimited]",
+                    diagnostics={
+                        "provider": self.name,
+                        "status": "error",
+                        "queries": [diagnostic],
+                        "items_found": 0,
+                        "items_after_filter": 0,
+                        "items_after_global_dedup": 0,
+                    },
+                )
             response.raise_for_status()
             data = response.json()
             if data.get("status") == "error":
@@ -323,6 +1114,11 @@ class NewsApiProvider(BaseHttpProvider):
                     exception=f"{message}{details}",
                     status="error",
                 )
+                if code in {"rateLimited", "apiKeyExhausted"}:
+                    diagnostic["cooldown_hit"] = True
+                    self._activate_cooldown()
+                if code == "apiKeyExhausted":
+                    diagnostic["budget_hit"] = True
                 raise ProviderError(
                     f"Failed to fetch from newsapi for query '{query}': {message}{details}",
                     diagnostics={
@@ -345,6 +1141,7 @@ class NewsApiProvider(BaseHttpProvider):
                     query=query,
                     provider=self.name,
                     competitor_hints=competitor_hints,
+                    metadata={"source_tier": "tier1_aggregator"},
                 )
                 for item in found_items
                 if item.get("url")
@@ -356,6 +1153,11 @@ class NewsApiProvider(BaseHttpProvider):
                 http_status=self._http_status(response),
                 items_found=len(found_items),
                 items_after_filter=len(articles),
+            )
+            self._store_cached_query(
+                query=query,
+                articles=articles,
+                diagnostic=diagnostic,
             )
             return articles, diagnostic
         except ProviderError:
@@ -382,6 +1184,30 @@ class NewsApiProvider(BaseHttpProvider):
                     "items_after_global_dedup": 0,
                 },
             )
+
+    @staticmethod
+    def _utc_now() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _read_json_file(self, path: Path) -> dict[str, object]:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except json.JSONDecodeError:
+            logger.warning("Ignoring unreadable JSON state file: %s", path)
+            return {}
+
+    def _write_json_file(self, path: Path, payload: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _utc_now() -> datetime:
+        return datetime.now(timezone.utc)
 
 
 class GoogleNewsRssProvider(BaseHttpProvider):
@@ -453,6 +1279,7 @@ class GoogleNewsRssProvider(BaseHttpProvider):
                         query=query,
                         provider=self.name,
                         competitor_hints=competitor_hints,
+                        metadata={"source_tier": "tier1_aggregator"},
                     )
                 )
             filtered_articles = [article for article in articles if article.url]
@@ -559,6 +1386,7 @@ class GdeltProvider(BaseHttpProvider):
                     query=query,
                     provider=self.name,
                     competitor_hints=competitor_hints,
+                    metadata={"source_tier": "tier1_aggregator"},
                 )
                 for item in found_items
                 if item.get("url")
@@ -598,7 +1426,7 @@ class GdeltProvider(BaseHttpProvider):
 
 def supported_provider_names() -> tuple[str, ...]:
     """Return the canonical provider names supported by the codebase."""
-    return ("newsapi", "gdelt", "google_news_rss")
+    return ("newsapi", "gdelt", "google_news_rss", "guardian", "regional_rss")
 
 
 def build_providers(
@@ -611,6 +1439,8 @@ def build_providers(
         "newsapi": NewsApiProvider,
         "google_news_rss": GoogleNewsRssProvider,
         "gdelt": GdeltProvider,
+        "guardian": GuardianProvider,
+        "regional_rss": RegionalRssProvider,
     }
     providers: List[Provider] = []
     for provider_name in enabled_provider_names:

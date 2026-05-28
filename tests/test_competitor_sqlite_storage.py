@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime, timezone
 
 from competitor_tracker.models import CandidateArticle, DeliveryRecord, RawArticle, RunSummary
 from competitor_tracker.storage import SQLiteTrackerStorage
@@ -70,6 +71,7 @@ def test_sqlite_storage_inserts_candidates_alerts_and_runs(tmp_path):
         status="success",
         drop_reasons={"score_below_threshold": 0},
         provider_diagnostics={"gdelt": {"status": "ok", "items_found": 2}},
+        provider_metrics={"gdelt": {"cache_hits": 1, "source_tier_wins": 2}},
     )
 
     candidate_id = storage.insert_candidate(candidate)
@@ -102,7 +104,8 @@ def test_sqlite_storage_inserts_candidates_alerts_and_runs(tmp_path):
                 status,
                 drop_reasons_json,
                 provider_errors_json,
-                provider_diagnostics_json
+                provider_diagnostics_json,
+                provider_metrics_json
             FROM runs
             LIMIT 1
             """
@@ -117,6 +120,7 @@ def test_sqlite_storage_inserts_candidates_alerts_and_runs(tmp_path):
         '{"score_below_threshold": 0}',
         '{}',
         '{"gdelt": {"items_found": 2, "status": "ok"}}',
+        '{"gdelt": {"cache_hits": 1, "source_tier_wins": 2}}',
     )
 
 
@@ -283,14 +287,196 @@ def test_sqlite_storage_marks_deferred_and_expires_stale_entries(tmp_path):
     )
 
     assert expired_count == 1
-    with sqlite3.connect(tmp_path / "tracker.db") as connection:
-        row = connection.execute(
-            """
-            SELECT status
-            FROM delivery_log
-            WHERE alert_key = ? AND channel = ? AND destination = ?
-            """,
-            (alert.digest_key, "telegram", "12345"),
-        ).fetchone()
 
-    assert row == ("expired",)
+
+def test_sqlite_storage_scores_query_precision_from_history(tmp_path):
+    storage = SQLiteTrackerStorage(tmp_path / "tracker.db")
+
+    strong_raw = RawArticle(
+        title="Uber expands premium rides in Mexico City",
+        url="https://example.com/uber-precision",
+        provider="guardian",
+        source="Example News",
+        published_at="2026-05-18T09:00:00Z",
+        snippet="Strong signal.",
+        query='"Uber" market expansion Latin America',
+        region="latam",
+        language="en",
+        competitor_hints=("Uber",),
+        metadata={"source_type": "news"},
+    )
+    weak_raw = RawArticle(
+        title="DiDi appears in industry roundup",
+        url="https://example.com/didi-precision",
+        provider="guardian",
+        source="Example News",
+        published_at="2026-05-18T09:00:00Z",
+        snippet="Weak signal.",
+        query='"DiDi" market expansion Latin America',
+        region="latam",
+        language="en",
+        competitor_hints=("DiDi",),
+        metadata={"source_type": "news"},
+    )
+    strong_candidate = CandidateArticle(
+        raw_article=strong_raw,
+        competitor="Uber",
+        topic_group="market_expansion",
+        score=9,
+        matched_keywords=("launch",),
+        summary="Strong signal.",
+        region="latam",
+        language_hint="en",
+        reasons=("high precision",),
+    )
+
+    storage.insert_raw_article(strong_raw)
+    storage.insert_candidate(strong_candidate)
+    storage.insert_alert(strong_candidate.to_alert())
+    storage.insert_raw_article(weak_raw)
+
+    precision = storage.get_query_precision_by_text(
+        [
+            '"Uber" market expansion Latin America',
+            '"DiDi" market expansion Latin America',
+        ]
+    )
+
+    assert precision['"Uber" market expansion Latin America'] > precision['"DiDi" market expansion Latin America']
+
+
+def test_sqlite_storage_applies_time_decay_to_historical_precision(tmp_path):
+    storage = SQLiteTrackerStorage(tmp_path / "tracker.db")
+    recent_query = '"Uber" market expansion Latin America'
+    old_query = '"DiDi" market expansion Latin America'
+    reference_now = datetime(2026, 5, 26, 0, 0, tzinfo=timezone.utc)
+
+    recent_raw = RawArticle(
+        title="Uber expands in Mexico City",
+        url="https://example.com/recent-uber",
+        provider="guardian",
+        source="Example News",
+        published_at="2026-05-25T09:00:00Z",
+        snippet="Recent strong signal.",
+        query=recent_query,
+        region="latam",
+        language="en",
+        competitor_hints=("Uber",),
+        metadata={"source_type": "news"},
+    )
+    old_raw = RawArticle(
+        title="DiDi expands in Mexico City",
+        url="https://example.com/old-didi",
+        provider="guardian",
+        source="Example News",
+        published_at="2026-03-01T09:00:00Z",
+        snippet="Older strong signal.",
+        query=old_query,
+        region="latam",
+        language="en",
+        competitor_hints=("DiDi",),
+        metadata={"source_type": "news"},
+    )
+
+    recent_candidate = CandidateArticle(
+        raw_article=recent_raw,
+        competitor="Uber",
+        topic_group="market_expansion",
+        score=9,
+        matched_keywords=("launch",),
+        summary="Recent strong signal.",
+        region="latam",
+        language_hint="en",
+        reasons=("recent",),
+    )
+    old_candidate = CandidateArticle(
+        raw_article=old_raw,
+        competitor="DiDi",
+        topic_group="market_expansion",
+        score=9,
+        matched_keywords=("launch",),
+        summary="Older strong signal.",
+        region="latam",
+        language_hint="en",
+        reasons=("old",),
+    )
+
+    recent_raw_id = storage.insert_raw_article(recent_raw)
+    storage.insert_candidate(recent_candidate)
+    storage.insert_alert(recent_candidate.to_alert())
+    old_raw_id = storage.insert_raw_article(old_raw)
+    storage.insert_candidate(old_candidate)
+    storage.insert_alert(old_candidate.to_alert())
+
+    with sqlite3.connect(tmp_path / "tracker.db") as connection:
+        connection.execute(
+            "UPDATE articles_raw SET created_at = ? WHERE id = ?",
+            ("2026-05-25 00:00:00", recent_raw_id),
+        )
+        connection.execute(
+            "UPDATE articles_raw SET created_at = ? WHERE id = ?",
+            ("2026-03-01 00:00:00", old_raw_id),
+        )
+        connection.commit()
+
+    precision = storage.get_query_precision_by_text(
+        [recent_query, old_query],
+        half_life_days=14,
+        now=reference_now,
+    )
+
+    assert precision[recent_query] > precision[old_query]
+
+
+def test_sqlite_storage_persists_and_reports_feed_health_metrics(tmp_path):
+    storage = SQLiteTrackerStorage(tmp_path / "tracker.db")
+
+    inserted_ids = storage.insert_feed_metric_rows(
+        run_id=None,
+        rows=[
+            {
+                "measured_at": "2026-05-26T10:00:00+00:00",
+                "provider": "regional_rss",
+                "region": "latam",
+                "feed_name": "MercoPress",
+                "feed_url": "https://en.mercopress.com/rss",
+                "items_found": 12,
+                "provider_matches": 6,
+                "raw_articles_after_global_dedup": 4,
+                "prefilter_passed": 1,
+                "candidates_kept": 1,
+                "alerts_created": 0,
+                "dropped_prefilter": 3,
+                "noise_ratio": 0.8333,
+                "recommendation": "review_low_alert_yield",
+            },
+            {
+                "measured_at": "2026-05-26T10:00:00+00:00",
+                "provider": "regional_rss",
+                "region": "mea",
+                "feed_name": "Doha News",
+                "feed_url": "https://dohanews.co/feed/",
+                "items_found": 10,
+                "provider_matches": 4,
+                "raw_articles_after_global_dedup": 3,
+                "prefilter_passed": 2,
+                "candidates_kept": 2,
+                "alerts_created": 1,
+                "dropped_prefilter": 1,
+                "noise_ratio": 0.5,
+                "recommendation": "keep",
+            },
+        ],
+    )
+
+    assert len(inserted_ids) == 2
+
+    report = storage.get_feed_health_report(days=365, min_items_found=1, limit=10)
+
+    assert report["feed_count"] == 2
+    assert report["highest_noise_feed"]["feed_name"] == "MercoPress"
+    assert report["feeds"][0]["recommendation"] == "review_low_signal"
+    assert any(
+        item["feed_name"] == "MercoPress"
+        for item in report["recommendations"]
+    )

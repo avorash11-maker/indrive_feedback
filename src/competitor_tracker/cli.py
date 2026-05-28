@@ -20,20 +20,28 @@ from .analyzer import (
 )
 from .config import TrackerConfig, TrackerRuntimeConfig
 from .digest import DigestBuilder
+from .environment import get_env_value
 from .geo_policy import GeoPolicy
 from .models import CompetitorDigest, RunSummary
 from .normalization import (
     deduplicate_raw_articles,
+    deduplicate_raw_articles_with_metrics,
     normalize_title,
     normalize_url,
     parse_published_at,
 )
 from .notion_sync import CompetitorNotionMirrorSync
-from .providers import Provider, ProviderError, ProviderRequest, build_providers
+from .providers import (
+    Provider,
+    ProviderError,
+    ProviderRequest,
+    RegionalRssProvider,
+    build_providers,
+)
 from .storage import JsonFileStorage, SQLiteTrackerStorage
 from .telegram_sender import TelegramSender
 
-COMMAND_NAMES = {"run", "dry-run", "send-digest", "sync-notion", "backfill", "test-provider"}
+COMMAND_NAMES = {"run", "dry-run", "send-digest", "sync-notion", "backfill", "test-provider", "qa-feeds"}
 MAX_ARTICLE_AGE_DAYS = 7
 HIGH_SIGNAL_SCORE_THRESHOLD = 7
 logger = logging.getLogger(__name__)
@@ -48,6 +56,347 @@ def _utc_now_iso() -> str:
     """Return a timezone-aware UTC timestamp in ISO 8601 format."""
 
     return datetime.now(timezone.utc).isoformat()
+
+
+def _newsapi_disabled_diagnostic(
+    *,
+    queries: Sequence[str],
+    reason: str,
+) -> dict[str, object]:
+    return {
+        "provider": "newsapi",
+        "status": "skipped",
+        "queries": [
+            {
+                "provider": "newsapi",
+                "query": query,
+                "request_url": "",
+                "http_status": None,
+                "exception": reason,
+                "items_found": 0,
+                "items_after_filter": 0,
+                "status": "skipped",
+            }
+            for query in queries
+        ],
+        "items_found": 0,
+        "items_after_filter": 0,
+        "items_after_global_dedup": 0,
+    }
+
+
+def _query_history_sort_key(
+    query_spec: tuple[str, str, str, str],
+    *,
+    precision_by_query: dict[str, float],
+) -> float:
+    query, _competitor, _region, _topic_name = query_spec
+    return -precision_by_query.get(query, 0.0)
+
+
+def _limit_newsapi_request(
+    request: ProviderRequest,
+    *,
+    max_queries: int,
+) -> tuple[ProviderRequest, Optional[str]]:
+    if max_queries <= 0:
+        return replace(request, queries=[]), (
+            "NewsAPI skipped for full-run because COMPETITOR_TRACKER_NEWSAPI_MAX_QUERIES_PER_RUN=0."
+        )
+    if len(request.queries) <= max_queries:
+        return request, None
+    limited_queries = list(request.queries[:max_queries])
+    skipped_count = len(request.queries) - len(limited_queries)
+    limited_hints = {
+        query: request.query_competitor_hints[query]
+        for query in limited_queries
+        if query in request.query_competitor_hints
+    }
+    return (
+        replace(
+            request,
+            queries=limited_queries,
+            query_competitor_hints=limited_hints,
+        ),
+        (
+            f"NewsAPI query set truncated from {len(request.queries)} to {len(limited_queries)} "
+            f"for this run; skipped {skipped_count} queries."
+        ),
+    )
+
+
+def _limit_provider_request(
+    request: ProviderRequest,
+    *,
+    provider_name: str,
+    max_queries: int,
+) -> tuple[ProviderRequest, Optional[str]]:
+    if max_queries <= 0:
+        return replace(request, queries=[]), (
+            f"{provider_name} skipped for full-run because its max queries per run is 0."
+        )
+    if len(request.queries) <= max_queries:
+        return request, None
+    limited_queries = list(request.queries[:max_queries])
+    skipped_count = len(request.queries) - len(limited_queries)
+    limited_hints = {
+        query: request.query_competitor_hints[query]
+        for query in limited_queries
+        if query in request.query_competitor_hints
+    }
+    return (
+        replace(
+            request,
+            queries=limited_queries,
+            query_competitor_hints=limited_hints,
+        ),
+        (
+            f"{provider_name} query set truncated from {len(request.queries)} to {len(limited_queries)} "
+            f"for this run; skipped {skipped_count} queries."
+        ),
+    )
+
+
+def _build_gdelt_request(
+    *,
+    request: ProviderRequest,
+    query_specs: Sequence[tuple[str, str, str, str]],
+    config: TrackerConfig,
+) -> ProviderRequest:
+    simplified_queries: list[str] = []
+    simplified_hints: dict[str, tuple[str, ...]] = {}
+    seen_queries: set[str] = set()
+    for _query, competitor, region, topic_name in query_specs:
+        region_config = config.regions[region]
+        topic_keywords = config.topic_groups.get(topic_name, ())
+        primary_keyword = str(topic_keywords[0] if topic_keywords else topic_name.replace("_", " ")).strip()
+        primary_geo = str(region_config.geo_terms[0] if region_config.geo_terms else region_config.label).strip()
+        simplified_query = " ".join(
+            part
+            for part in (
+                f'"{competitor}"',
+                primary_keyword,
+                primary_geo,
+            )
+            if part
+        )
+        normalized_query = " ".join(simplified_query.split())
+        if not normalized_query or normalized_query in seen_queries:
+            continue
+        seen_queries.add(normalized_query)
+        simplified_queries.append(normalized_query)
+        simplified_hints[normalized_query] = (competitor,)
+    if not simplified_queries:
+        return request
+    return replace(
+        request,
+        queries=simplified_queries,
+        query_competitor_hints=simplified_hints,
+    )
+
+
+def _build_focused_api_request(
+    *,
+    request: ProviderRequest,
+    query_specs: Sequence[tuple[str, str, str, str]],
+    config: TrackerConfig,
+) -> ProviderRequest:
+    focused_queries: list[str] = []
+    focused_hints: dict[str, tuple[str, ...]] = {}
+    seen_queries: set[str] = set()
+    for _query, competitor, region, topic_name in query_specs:
+        region_config = config.regions[region]
+        focused_query = " ".join(
+            part
+            for part in (
+                f'"{competitor}"',
+                topic_name.replace("_", " "),
+                region_config.label,
+            )
+            if part
+        )
+        normalized_query = " ".join(focused_query.split())
+        if not normalized_query or normalized_query in seen_queries:
+            continue
+        seen_queries.add(normalized_query)
+        focused_queries.append(normalized_query)
+        focused_hints[normalized_query] = (competitor,)
+    if not focused_queries:
+        return request
+    return replace(
+        request,
+        queries=focused_queries,
+        query_competitor_hints=focused_hints,
+    )
+
+
+def _extract_provider_metrics(
+    provider_diagnostics: dict[str, dict[str, object]],
+) -> dict[str, dict[str, int]]:
+    metrics: dict[str, dict[str, int]] = {}
+    for provider_name, diagnostics in provider_diagnostics.items():
+        query_rows = diagnostics.get("queries")
+        if not isinstance(query_rows, list):
+            query_rows = []
+        cache_hits = sum(1 for item in query_rows if isinstance(item, dict) and item.get("status") == "cached")
+        skipped_items = sum(1 for item in query_rows if isinstance(item, dict) and item.get("status") == "skipped")
+        budget_hits = sum(1 for item in query_rows if isinstance(item, dict) and item.get("budget_hit"))
+        cooldown_hits = sum(1 for item in query_rows if isinstance(item, dict) and item.get("cooldown_hit"))
+        metrics[provider_name] = {
+            "cache_hits": cache_hits,
+            "skipped_items": skipped_items,
+            "budget_hits": budget_hits,
+            "cooldown_hits": cooldown_hits,
+            "source_tier_wins": int(diagnostics.get("source_tier_wins") or 0),
+            "items_after_global_dedup": int(diagnostics.get("items_after_global_dedup") or 0),
+        }
+        if "feeds_skipped" in diagnostics:
+            metrics[provider_name]["feeds_skipped"] = int(diagnostics.get("feeds_skipped") or 0)
+    return metrics
+
+
+def _build_feed_metric_rows(
+    *,
+    provider_diagnostics: dict[str, dict[str, object]],
+    raw_articles: Sequence,
+    analysis,
+    digest,
+    measured_at: str,
+) -> list[dict[str, object]]:
+    diagnostics = provider_diagnostics.get("regional_rss")
+    if not isinstance(diagnostics, dict):
+        return []
+    query_rows = diagnostics.get("queries")
+    if not isinstance(query_rows, list):
+        return []
+
+    def _feed_key_from_metadata(metadata: dict[str, object]) -> tuple[str, str, str]:
+        return (
+            str(metadata.get("query_owner_region") or ""),
+            str(metadata.get("direct_feed_name") or ""),
+            str(metadata.get("direct_feed_url") or ""),
+        )
+
+    raw_counts: dict[tuple[str, str, str], int] = {}
+    raw_urls_to_feed_key: dict[str, tuple[str, str, str]] = {}
+    for article in raw_articles:
+        metadata = dict(getattr(article, "metadata", {}) or {})
+        feed_key = _feed_key_from_metadata(metadata)
+        if not feed_key[1]:
+            continue
+        raw_counts[feed_key] = raw_counts.get(feed_key, 0) + 1
+        raw_urls_to_feed_key[str(getattr(article, "url", "") or "")] = feed_key
+
+    candidate_counts: dict[tuple[str, str, str], int] = {}
+    for candidate in getattr(analysis, "candidates", []):
+        metadata = dict(getattr(candidate.raw_article, "metadata", {}) or {})
+        feed_key = _feed_key_from_metadata(metadata)
+        if not feed_key[1]:
+            continue
+        candidate_counts[feed_key] = candidate_counts.get(feed_key, 0) + 1
+
+    alert_counts: dict[tuple[str, str, str], int] = {}
+    for alert in getattr(digest, "alerts", ()):
+        metadata = dict(getattr(alert.candidate.raw_article, "metadata", {}) or {})
+        feed_key = _feed_key_from_metadata(metadata)
+        if not feed_key[1]:
+            continue
+        alert_counts[feed_key] = alert_counts.get(feed_key, 0) + 1
+
+    dropped_counts: dict[tuple[str, str, str], int] = {}
+    for dropped in getattr(analysis, "dropped_articles", []):
+        feed_key = raw_urls_to_feed_key.get(str(getattr(dropped, "url", "") or ""))
+        if feed_key is None:
+            continue
+        dropped_counts[feed_key] = dropped_counts.get(feed_key, 0) + 1
+
+    rows: list[dict[str, object]] = []
+    for item in query_rows:
+        if not isinstance(item, dict):
+            continue
+        feed_name = str(item.get("feed_name") or "").strip()
+        feed_url = str(item.get("feed_url") or "").strip()
+        region = str(item.get("feed_region") or "").strip()
+        if not feed_name:
+            continue
+        feed_key = (region, feed_name, feed_url)
+        provider_matches = int(item.get("items_after_filter") or 0)
+        candidates_kept = candidate_counts.get(feed_key, 0)
+        prefilter_passed = candidates_kept
+        alerts_created = alert_counts.get(feed_key, 0)
+        items_found = int(item.get("items_found") or 0)
+        noise_ratio = (
+            round(1.0 - (candidates_kept / provider_matches), 4)
+            if provider_matches > 0
+            else (1.0 if items_found > 0 else 0.0)
+        )
+        rows.append(
+            {
+                "measured_at": measured_at,
+                "provider": "regional_rss",
+                "region": region,
+                "feed_name": feed_name,
+                "feed_url": feed_url,
+                "items_found": items_found,
+                "provider_matches": provider_matches,
+                "raw_articles_after_global_dedup": raw_counts.get(feed_key, 0),
+                "prefilter_passed": prefilter_passed,
+                "candidates_kept": candidates_kept,
+                "alerts_created": alerts_created,
+                "dropped_prefilter": dropped_counts.get(feed_key, 0),
+                "noise_ratio": noise_ratio,
+                "recommendation": SQLiteTrackerStorage.recommend_feed_action(
+                    items_found=items_found,
+                    provider_matches=provider_matches,
+                    prefilter_passed=prefilter_passed,
+                    alerts_created=alerts_created,
+                ),
+            }
+        )
+    return rows
+
+
+def _has_fresh_ingest(
+    *,
+    raw_articles: Sequence[object],
+    fetched_articles_count: int,
+) -> bool:
+    """Return True only when the current run produced fresh raw articles."""
+
+    return fetched_articles_count > 0 and bool(raw_articles)
+
+
+def run_feed_qa(
+    *,
+    days: int = 30,
+    min_items_found: int = 5,
+    limit: int = 20,
+) -> dict[str, object]:
+    runtime = TrackerRuntimeConfig.from_env()
+    storage = SQLiteTrackerStorage(runtime.database_path)
+    report = storage.get_feed_health_report(
+        days=days,
+        min_items_found=min_items_found,
+        limit=limit,
+    )
+    report["database_path"] = str(runtime.database_path)
+    return report
+
+
+def _configure_runtime_providers(
+    providers: Sequence[Provider],
+    *,
+    config: TrackerConfig,
+) -> list[Provider]:
+    configured: list[Provider] = []
+    for provider in providers:
+        if isinstance(provider, RegionalRssProvider):
+            provider.configure(
+                feeds_by_region=config.regional_rss_feeds or {},
+                competitor_aliases=config.competitor_aliases or {},
+            )
+        configured.append(provider)
+    return configured
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -181,6 +530,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional competitor hints attached to the provider request.",
     )
 
+    qa_feeds_parser = subparsers.add_parser(
+        "qa-feeds",
+        help="Summarize stored RSS feed quality metrics and cleanup recommendations.",
+    )
+    qa_feeds_parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Lookback window for feed QA snapshots.",
+    )
+    qa_feeds_parser.add_argument(
+        "--min-feed-items",
+        type=int,
+        default=5,
+        dest="min_feed_items",
+        help="Minimum aggregated feed items required before a feed appears in the report.",
+    )
+    qa_feeds_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of feeds to return in the QA report.",
+    )
+
     return parser
 
 
@@ -195,41 +568,134 @@ def collect_raw_articles(
 ) -> tuple[list, tuple[str, ...], dict[str, str], int, dict[str, dict[str, object]]]:
     """Generate queries, fetch raw articles, deduplicate, and store in SQLite."""
     query_days = days if days is not None else runtime.lookback_days
+    sqlite_storage = SQLiteTrackerStorage(runtime.database_path)
     query_specs = []
     seen_queries = set()
     for region in regions:
-        for query, competitor in config.query_specs_for_region(region):
+        for query, competitor, topic_name in config.prioritized_query_specs_for_region(region):
             if query in seen_queries:
                 continue
             seen_queries.add(query)
-            query_specs.append((query, competitor, region))
-    queries = [query for query, _, _ in query_specs]
+            query_specs.append((query, competitor, region, topic_name))
+    precision_by_query = sqlite_storage.get_query_precision_by_text(
+        [query for query, _, _, _ in query_specs],
+        half_life_days=runtime.historical_precision_half_life_days,
+    )
+    query_specs = sorted(
+        query_specs,
+        key=lambda item: _query_history_sort_key(
+            item,
+            precision_by_query=precision_by_query,
+        ),
+    )
+    queries = [query for query, _, _, _ in query_specs]
     request = ProviderRequest(
         competitors=tuple(competitors),
         days=query_days,
         queries=queries,
         regions=tuple(regions),
         query_competitor_hints={
-            query: (competitor,) for query, competitor, _ in query_specs
+            query: (competitor,) for query, competitor, _, _ in query_specs
         },
     )
     query_owner_by_query = {
-        query: {"query_owner_competitor": competitor, "query_owner_region": region}
-        for query, competitor, region in query_specs
+        query: {
+            "query_owner_competitor": competitor,
+            "query_owner_region": region,
+            "query_owner_topic_group": topic_name,
+        }
+        for query, competitor, region, topic_name in query_specs
     }
-    active_providers = list(providers) if providers is not None else build_providers(
-        config.enabled_providers
+    active_providers = _configure_runtime_providers(
+        list(providers) if providers is not None else build_providers(config.enabled_providers),
+        config=config,
     )
 
     raw_articles = []
     provider_errors: dict[str, str] = {}
     provider_diagnostics: dict[str, dict[str, object]] = {}
     for provider in active_providers:
+        provider_request = request
+        skipped_reason = None
+        if provider.name == "gdelt":
+            provider_request = _build_gdelt_request(
+                request=request,
+                query_specs=query_specs,
+                config=config,
+            )
+        elif provider.name == "google_news_rss":
+            provider_request = _build_gdelt_request(
+                request=request,
+                query_specs=query_specs,
+                config=config,
+            )
+        elif provider.name == "guardian":
+            provider_request = _build_focused_api_request(
+                request=request,
+                query_specs=query_specs,
+                config=config,
+            )
+            provider_request, skipped_reason = _limit_provider_request(
+                provider_request,
+                provider_name="Guardian",
+                max_queries=runtime.guardian_max_queries_per_run,
+            )
+            if not provider_request.queries:
+                provider_errors[provider.name] = skipped_reason or "Guardian skipped for this run."
+                provider_diagnostics[provider.name] = {
+                    "provider": provider.name,
+                    "status": "skipped",
+                    "queries": [
+                        {
+                            "provider": provider.name,
+                            "query": query,
+                            "request_url": "",
+                            "http_status": None,
+                            "exception": provider_errors[provider.name],
+                            "items_found": 0,
+                            "items_after_filter": 0,
+                            "status": "skipped",
+                        }
+                        for query in request.queries
+                    ],
+                    "items_found": 0,
+                    "items_after_filter": 0,
+                    "items_after_global_dedup": 0,
+                }
+                continue
+        elif provider.name == "newsapi":
+            provider_request = _build_focused_api_request(
+                request=request,
+                query_specs=query_specs,
+                config=config,
+            )
+            if not runtime.enable_newsapi_full_run:
+                skipped_reason = (
+                    "NewsAPI is disabled for full pipeline runs by default. "
+                    "Use COMPETITOR_TRACKER_ENABLE_NEWSAPI_FULL_RUN=true to opt in."
+                )
+                provider_errors[provider.name] = skipped_reason
+                provider_diagnostics[provider.name] = _newsapi_disabled_diagnostic(
+                    queries=request.queries,
+                    reason=skipped_reason,
+                )
+                continue
+            provider_request, skipped_reason = _limit_newsapi_request(
+                provider_request,
+                max_queries=runtime.newsapi_max_queries_per_run,
+            )
+            if not provider_request.queries:
+                provider_errors[provider.name] = skipped_reason or "NewsAPI skipped for this run."
+                provider_diagnostics[provider.name] = _newsapi_disabled_diagnostic(
+                    queries=request.queries,
+                    reason=provider_errors[provider.name],
+                )
+                continue
         try:
             if hasattr(provider, "fetch_with_diagnostics"):
-                fetched, diagnostics = provider.fetch_with_diagnostics(request)
+                fetched, diagnostics = provider.fetch_with_diagnostics(provider_request)
             else:
-                fetched = provider.fetch(request)
+                fetched = provider.fetch(provider_request)
                 diagnostics = {
                     "provider": provider.name,
                     "status": "ok",
@@ -244,12 +710,14 @@ def collect_raw_articles(
                             "items_after_filter": 0,
                             "status": "ok",
                         }
-                        for query in queries
+                        for query in provider_request.queries
                     ],
                     "items_found": len(fetched),
                     "items_after_filter": len(fetched),
                     "items_after_global_dedup": 0,
                 }
+            if skipped_reason:
+                diagnostics["warning"] = skipped_reason
             provider_diagnostics[provider.name] = diagnostics
         except ProviderError as exc:
             provider_errors[provider.name] = str(exc)
@@ -270,7 +738,7 @@ def collect_raw_articles(
                             "items_after_filter": 0,
                             "status": "error",
                         }
-                        for query in queries
+                        for query in provider_request.queries
                     ],
                     "items_found": 0,
                     "items_after_filter": 0,
@@ -290,13 +758,26 @@ def collect_raw_articles(
         )
 
     fetched_articles_count = len(raw_articles)
-    raw_articles = deduplicate_raw_articles(raw_articles)
+    raw_articles, dedup_metrics = deduplicate_raw_articles_with_metrics(raw_articles)
     deduped_provider_counts: dict[str, int] = {}
     for article in raw_articles:
         deduped_provider_counts[article.provider] = deduped_provider_counts.get(article.provider, 0) + 1
     for provider_name, diagnostics in provider_diagnostics.items():
         diagnostics["items_after_global_dedup"] = deduped_provider_counts.get(provider_name, 0)
-    sqlite_storage = SQLiteTrackerStorage(runtime.database_path)
+        diagnostics["source_tier_wins"] = (
+            dedup_metrics.get("source_tier_wins_by_provider", {}).get(provider_name, 0)
+            if isinstance(dedup_metrics.get("source_tier_wins_by_provider"), dict)
+            else 0
+        )
+    provider_diagnostics["global_dedup"] = {
+        "provider": "global_dedup",
+        "status": "ok",
+        "queries": [],
+        "items_found": fetched_articles_count,
+        "items_after_filter": len(raw_articles),
+        "items_after_global_dedup": len(raw_articles),
+        "source_tier_wins": int(dedup_metrics.get("direct_source_wins_over_aggregators") or 0),
+    }
     sqlite_storage.insert_raw_articles(raw_articles)
     return (
         raw_articles,
@@ -317,6 +798,10 @@ def test_provider(
     """Run one provider directly and return structured diagnostics."""
 
     providers = build_providers([provider_name])
+    if provider_name == "regional_rss":
+        runtime = TrackerRuntimeConfig.from_env()
+        config = TrackerConfig.load(runtime.config_path)
+        providers = _configure_runtime_providers(providers, config=config)
     provider = providers[0]
     request = ProviderRequest(
         competitors=tuple(competitors or ()),
@@ -886,15 +1371,19 @@ def run_pipeline(
 
     analyzer = CompetitorAnalyzer(min_score=min_score, config=config)
     analysis = analyzer.prefilter_raw_articles(raw_articles, regions=selected_regions)
+    has_fresh_ingest = _has_fresh_ingest(
+        raw_articles=raw_articles,
+        fetched_articles_count=fetched_articles_count,
+    )
     delivery_channel = (
         "telegram" if telegram_mode in {"dry", "send"} else "daily_digest"
     )
     delivery_destination = (
-        os.getenv("TELEGRAM_CHAT_ID", "") if telegram_mode in {"dry", "send"} else ""
+        get_env_value("TELEGRAM_CHAT_ID") if telegram_mode in {"dry", "send"} else ""
     )
     candidate_pool = list(analysis.candidates)
 
-    if telegram_mode in {"dry", "send"}:
+    if telegram_mode in {"dry", "send"} and has_fresh_ingest:
         sqlite_storage.expire_stale_deferred(
             channel=delivery_channel,
             destination=delivery_destination,
@@ -907,6 +1396,19 @@ def run_pipeline(
             limit=100,
         )
         candidate_pool.extend(deferred_candidates)
+    elif telegram_mode in {"dry", "send"}:
+        provider_diagnostics["pipeline"] = {
+            "provider": "pipeline",
+            "status": "skipped",
+            "queries": [],
+            "items_found": 0,
+            "items_after_filter": 0,
+            "items_after_global_dedup": 0,
+            "warning": (
+                "No fresh ingest available for this run; deferred backlog was not used to build "
+                "a fresh daily digest."
+            ),
+        }
 
     regional_candidates = _deduplicate_region_candidates(
         candidate_pool,
@@ -940,6 +1442,8 @@ def run_pipeline(
             delivery_channel=delivery_channel,
             delivery_destination=delivery_destination,
             include_deferred=False,
+            apply_marketing_filters=True,
+            marketing_config=config,
             ranking_alert_schemas_builder=ranking_alert_schemas_builder,
         )
         regional_alert_schemas, regional_article_contexts = build_delivery_alert_schemas(
@@ -1000,7 +1504,7 @@ def run_pipeline(
     telegram_result = None
     notion_result = None
     telegram_alerts = []
-    if telegram_mode in {"dry", "send"}:
+    if telegram_mode in {"dry", "send"} and has_fresh_ingest:
         telegram_alerts, telegram_schemas, _ = select_telegram_delivery_payload(
             digest.alerts,
             alert_schemas,
@@ -1012,7 +1516,7 @@ def run_pipeline(
                 sqlite_storage.mark_deferred(
                     alert_key=alert.digest_key,
                     channel="telegram",
-                    destination=os.getenv("TELEGRAM_CHAT_ID", ""),
+                    destination=get_env_value("TELEGRAM_CHAT_ID"),
                     metadata={
                         "mode": "daily_digest",
                         "generated_at": digest.generated_at,
@@ -1028,6 +1532,13 @@ def run_pipeline(
             source_urls=[alert.candidate.url for alert in telegram_alerts],
             generated_at=digest.generated_at,
         )
+    elif telegram_mode in {"dry", "send"}:
+        telegram_result = {
+            "ok": True,
+            "skipped": True,
+            "reason": "no_fresh_ingest",
+            "message_id": None,
+        }
 
     if notion_mode in {"dry", "sync"}:
         notion_sync = CompetitorNotionMirrorSync()
@@ -1037,7 +1548,17 @@ def run_pipeline(
         )
 
     run_status = "success_with_provider_errors" if provider_errors else "success"
+    if not has_fresh_ingest:
+        run_status = f"{run_status}_no_fresh_ingest"
     run_finished_at = _utc_now_iso()
+    provider_metrics = _extract_provider_metrics(provider_diagnostics)
+    feed_metric_rows = _build_feed_metric_rows(
+        provider_diagnostics=provider_diagnostics,
+        raw_articles=raw_articles,
+        analysis=analysis,
+        digest=digest,
+        measured_at=run_finished_at,
+    )
     run_summary = RunSummary(
         started_at=run_started_at,
         finished_at=run_finished_at,
@@ -1059,10 +1580,15 @@ def run_pipeline(
         },
         provider_errors=provider_errors,
         provider_diagnostics=provider_diagnostics,
+        provider_metrics=provider_metrics,
     )
     summary_path = storage.save_run_summary(run_summary)
     try:
-        sqlite_storage.insert_run(run_summary)
+        run_id = sqlite_storage.insert_run(run_summary)
+        sqlite_storage.insert_feed_metric_rows(
+            run_id=run_id,
+            rows=feed_metric_rows,
+        )
     except sqlite3.Error as exc:
         logger.warning(
             "Failed to persist run summary to SQLite runs table. db=%s error=%s",
@@ -1086,6 +1612,8 @@ def run_pipeline(
         "runtime": runtime,
         "raw_articles_count": len(raw_articles),
         "provider_diagnostics": provider_diagnostics,
+        "provider_metrics": provider_metrics,
+        "feed_metrics": feed_metric_rows,
         "telegram_result": telegram_result,
         "notion_result": notion_result,
     }
@@ -1153,6 +1681,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             queries=args.queries,
             days=args.days,
             competitors=args.competitors,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    elif command == "qa-feeds":
+        result = run_feed_qa(
+            days=args.days,
+            min_items_found=args.min_feed_items,
+            limit=args.limit,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return

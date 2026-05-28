@@ -209,6 +209,7 @@ class RunSummary:
     drop_reasons: Dict[str, int] = field(default_factory=dict)
     provider_errors: Dict[str, str] = field(default_factory=dict)
     provider_diagnostics: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    provider_metrics: Dict[str, Dict[str, int]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

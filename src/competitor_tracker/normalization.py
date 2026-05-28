@@ -52,6 +52,19 @@ DROP_QUERY_PARAMS = {
     "mc_eid",
 }
 
+SOURCE_TIER_SCORE = {
+    "tier2_direct": 2,
+    "tier1_aggregator": 1,
+}
+
+PROVIDER_QUALITY_SCORE = {
+    "regional_rss": 4,
+    "guardian": 3,
+    "gdelt": 2,
+    "google_news_rss": 1,
+    "newsapi": 1,
+}
+
 
 def clean_text(value: Optional[str]) -> str:
     """Collapse whitespace for provider strings without external deps."""
@@ -173,32 +186,79 @@ def normalize_raw_article(article: RawArticle) -> RawArticle:
     )
 
 
-def deduplicate_raw_articles(articles: Iterable[RawArticle]) -> List[RawArticle]:
-    """Deduplicate raw articles by normalized URL and normalized title."""
-    seen_urls = set()
+def _article_quality(article: RawArticle) -> tuple[int, int, int, int]:
+    tier_score = SOURCE_TIER_SCORE.get(
+        str(article.metadata.get("source_tier") or "").strip(),
+        0,
+    )
+    provider_score = PROVIDER_QUALITY_SCORE.get(article.provider, 0)
+    snippet_score = 1 if clean_text(article.snippet) else 0
+    published_score = 1 if parse_published_at(article.published_at or "") else 0
+    return (tier_score, provider_score, snippet_score, published_score)
+
+
+def deduplicate_raw_articles_with_metrics(
+    articles: Iterable[RawArticle],
+) -> tuple[List[RawArticle], dict[str, object]]:
+    """Deduplicate raw articles and report source-tier replacement metrics."""
+    seen_urls: dict[str, int] = {}
     seen_titles: List[str] = []
     unique: List[RawArticle] = []
+    source_tier_wins_by_provider: dict[str, int] = {}
+    source_tier_wins_by_tier: dict[str, int] = {}
+    direct_source_wins_over_aggregators = 0
 
     for article in articles:
         normalized = normalize_raw_article(article)
         url_key = normalized.url
         title_key = normalize_title(normalized.title)
+        duplicate_index = seen_urls.get(url_key, -1) if url_key else -1
+        if duplicate_index < 0 and title_key:
+            for index, existing in enumerate(seen_titles):
+                if (
+                    title_key == existing
+                    or is_title_contained_duplicate(title_key, existing)
+                    or is_semantic_title_duplicate(title_key, existing)
+                    or SequenceMatcher(None, title_key, existing).ratio() >= 0.72
+                ):
+                    duplicate_index = index
+                    break
 
-        if url_key and url_key in seen_urls:
-            continue
-        if title_key and any(
-            title_key == existing
-            or is_title_contained_duplicate(title_key, existing)
-            or is_semantic_title_duplicate(title_key, existing)
-            or SequenceMatcher(None, title_key, existing).ratio() >= 0.72
-            for existing in seen_titles
-        ):
-            continue
-
-        if url_key:
-            seen_urls.add(url_key)
-        if title_key:
+        if duplicate_index < 0:
+            if url_key:
+                seen_urls[url_key] = len(unique)
             seen_titles.append(title_key)
-        unique.append(normalized)
+            unique.append(normalized)
+            continue
 
+        existing_article = unique[duplicate_index]
+        if _article_quality(normalized) <= _article_quality(existing_article):
+            continue
+        old_tier = str(existing_article.metadata.get("source_tier") or "").strip()
+        new_tier = str(normalized.metadata.get("source_tier") or "").strip()
+        source_tier_wins_by_provider[normalized.provider] = (
+            source_tier_wins_by_provider.get(normalized.provider, 0) + 1
+        )
+        if new_tier:
+            source_tier_wins_by_tier[new_tier] = source_tier_wins_by_tier.get(new_tier, 0) + 1
+        if old_tier == "tier1_aggregator" and new_tier == "tier2_direct":
+            direct_source_wins_over_aggregators += 1
+        existing_url_key = existing_article.url
+        if existing_url_key:
+            seen_urls[existing_url_key] = duplicate_index
+        if url_key:
+            seen_urls[url_key] = duplicate_index
+        seen_titles[duplicate_index] = title_key
+        unique[duplicate_index] = normalized
+
+    return unique, {
+        "source_tier_wins_by_provider": source_tier_wins_by_provider,
+        "source_tier_wins_by_tier": source_tier_wins_by_tier,
+        "direct_source_wins_over_aggregators": direct_source_wins_over_aggregators,
+    }
+
+
+def deduplicate_raw_articles(articles: Iterable[RawArticle]) -> List[RawArticle]:
+    """Deduplicate raw articles by normalized URL/title while preferring stronger sources."""
+    unique, _ = deduplicate_raw_articles_with_metrics(articles)
     return unique

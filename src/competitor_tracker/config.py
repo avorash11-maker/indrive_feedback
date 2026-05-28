@@ -47,6 +47,15 @@ class RegionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RssFeedConfig:
+    """Curated direct RSS feed used by the regional RSS provider."""
+
+    name: str
+    url: str
+    language: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class TrackerConfig:
     """Loaded configuration and source of truth for competitor tracking."""
 
@@ -57,6 +66,9 @@ class TrackerConfig:
     daily_digest_limit: int
     enabled_providers: Tuple[str, ...]
     ignored_geo_terms: Tuple[str, ...] = ()
+    topic_priority_groups: Tuple[str, ...] = ()
+    competitor_aliases: Dict[str, Tuple[str, ...]] = None
+    regional_rss_feeds: Dict[str, Tuple[RssFeedConfig, ...]] = None
 
     @classmethod
     def load_default(cls) -> "TrackerConfig":
@@ -94,6 +106,23 @@ class TrackerConfig:
             topic_key: _dedupe_keep_order(keywords)
             for topic_key, keywords in payload["topic_groups"].items()
         }
+        competitor_aliases = {
+            competitor.strip(): _dedupe_keep_order(aliases)
+            for competitor, aliases in payload.get("competitor_aliases", {}).items()
+            if competitor.strip()
+        }
+        regional_rss_feeds = {
+            region_key: tuple(
+                RssFeedConfig(
+                    name=str(feed["name"]).strip(),
+                    url=str(feed["url"]).strip(),
+                    language=str(feed.get("language") or "").strip(),
+                )
+                for feed in feeds
+                if str(feed.get("name") or "").strip() and str(feed.get("url") or "").strip()
+            )
+            for region_key, feeds in payload.get("regional_rss_feeds", {}).items()
+        }
         return cls(
             regions=regions,
             competitors_by_region=competitors_by_region,
@@ -102,6 +131,11 @@ class TrackerConfig:
             daily_digest_limit=payload["daily_digest_limit"],
             enabled_providers=_dedupe_keep_order(payload["enabled_providers"]),
             ignored_geo_terms=_dedupe_keep_order(payload.get("ignored_geo_terms", ())),
+            topic_priority_groups=_dedupe_keep_order(
+                payload.get("topic_priority_groups", ())
+            ),
+            competitor_aliases=competitor_aliases,
+            regional_rss_feeds=regional_rss_feeds,
         )
 
     @staticmethod
@@ -133,6 +167,12 @@ class TrackerConfig:
             raise ValueError("'daily_digest_limit' must be a positive integer")
         if "ignored_geo_terms" in payload and not isinstance(payload["ignored_geo_terms"], list):
             raise ValueError("'ignored_geo_terms' must be a list when provided")
+        if "topic_priority_groups" in payload and not isinstance(payload["topic_priority_groups"], list):
+            raise ValueError("'topic_priority_groups' must be a list when provided")
+        if "competitor_aliases" in payload and not isinstance(payload["competitor_aliases"], dict):
+            raise ValueError("'competitor_aliases' must be an object when provided")
+        if "regional_rss_feeds" in payload and not isinstance(payload["regional_rss_feeds"], dict):
+            raise ValueError("'regional_rss_feeds' must be an object when provided")
 
         region_keys = set(payload["regions"])
         for region_key, region_data in payload["regions"].items():
@@ -177,6 +217,52 @@ class TrackerConfig:
                 raise ValueError(
                     f"Topic group '{topic_key}' must define at least one keyword"
                 )
+        if "topic_priority_groups" in payload:
+            unknown_priority_topics = set(payload["topic_priority_groups"]) - set(payload["topic_groups"])
+            if unknown_priority_topics:
+                missing_list = ", ".join(sorted(unknown_priority_topics))
+                raise ValueError(
+                    f"topic_priority_groups references unknown topics: {missing_list}"
+                )
+        if "competitor_aliases" in payload:
+            known_competitors = {
+                competitor.strip()
+                for competitors in payload["competitors_by_region"].values()
+                for competitor in competitors
+                if competitor.strip()
+            }
+            for competitor, aliases in payload["competitor_aliases"].items():
+                if competitor not in known_competitors:
+                    raise ValueError(
+                        f"competitor_aliases references unknown competitor '{competitor}'"
+                    )
+                if not isinstance(aliases, list):
+                    raise ValueError(
+                        f"competitor_aliases for '{competitor}' must be a list"
+                    )
+        if "regional_rss_feeds" in payload:
+            for region_key, feeds in payload["regional_rss_feeds"].items():
+                if region_key not in region_keys:
+                    raise ValueError(
+                        f"regional_rss_feeds references unknown region '{region_key}'"
+                    )
+                if not isinstance(feeds, list):
+                    raise ValueError(
+                        f"regional_rss_feeds for '{region_key}' must be a list"
+                    )
+                for feed in feeds:
+                    if not isinstance(feed, dict):
+                        raise ValueError(
+                            f"regional_rss_feeds entry for '{region_key}' must be an object"
+                        )
+                    if not isinstance(feed.get("name"), str) or not feed["name"].strip():
+                        raise ValueError(
+                            f"regional_rss_feeds entry for '{region_key}' must have a non-empty name"
+                        )
+                    if not isinstance(feed.get("url"), str) or not feed["url"].strip():
+                        raise ValueError(
+                            f"regional_rss_feeds entry for '{region_key}' must have a non-empty url"
+                        )
 
         required_template_fields = {
             "{competitor}",
@@ -268,6 +354,24 @@ class TrackerConfig:
                         queries.append(" ".join(query.split()))
         return list(_dedupe_keep_order(queries))
 
+    def prioritized_topic_groups(
+        self,
+        topic_groups: Optional[Sequence[str]] = None,
+    ) -> Tuple[str, ...]:
+        """Return topic groups ordered by business priority first, then the remainder."""
+        selected_topic_groups = _dedupe_keep_order(topic_groups or self.topic_groups.keys())
+        prioritized = [
+            topic_name
+            for topic_name in self.topic_priority_groups
+            if topic_name in selected_topic_groups
+        ]
+        remaining = [
+            topic_name
+            for topic_name in selected_topic_groups
+            if topic_name not in set(prioritized)
+        ]
+        return tuple([*prioritized, *remaining])
+
     def query_specs_for_region(
         self,
         region: str,
@@ -310,6 +414,48 @@ class TrackerConfig:
                     query_specs.append((normalized_query, competitor))
         return query_specs
 
+    def prioritized_query_specs_for_region(
+        self,
+        region: str,
+        *,
+        topic_groups: Optional[Sequence[str]] = None,
+        competitors: Optional[Sequence[str]] = None,
+    ) -> List[tuple[str, str, str]]:
+        """Expand query strings in priority order and preserve topic ownership."""
+        if region not in self.regions:
+            raise ValueError(f"Unknown region '{region}'")
+
+        region_config = self.regions[region]
+        selected_competitors = _dedupe_keep_order(
+            competitors or self.competitors_by_region[region]
+        )
+        selected_topic_groups = self.prioritized_topic_groups(topic_groups)
+
+        unknown_topics = set(selected_topic_groups) - set(self.topic_groups)
+        if unknown_topics:
+            missing_list = ", ".join(sorted(unknown_topics))
+            raise ValueError(f"Unknown topic groups: {missing_list}")
+
+        query_specs: List[tuple[str, str, str]] = []
+        seen_queries = set()
+        for topic_name in selected_topic_groups:
+            keyword_list = self.topic_groups[topic_name]
+            for competitor in selected_competitors:
+                expanded = self._expand_template_values(
+                    competitor=competitor,
+                    topic_name=topic_name,
+                    topic_keywords=keyword_list,
+                    region_config=region_config,
+                )
+                for template in self.keyword_templates:
+                    query = template.format(**expanded).strip()
+                    normalized_query = " ".join(query.split())
+                    if not normalized_query or normalized_query in seen_queries:
+                        continue
+                    seen_queries.add(normalized_query)
+                    query_specs.append((normalized_query, competitor, topic_name))
+        return query_specs
+
     def queries_for_regions(
         self,
         regions: Optional[Sequence[str]] = None,
@@ -344,6 +490,20 @@ class TrackerConfig:
                 query_specs.append((query, competitor))
         return query_specs
 
+    def competitor_aliases_for(self, competitor: str) -> Tuple[str, ...]:
+        """Return configured aliases for a competitor."""
+        if not competitor:
+            return ()
+        alias_map = self.competitor_aliases or {}
+        return alias_map.get(competitor.strip(), ())
+
+    def regional_rss_feeds_for_region(self, region: str) -> Tuple[RssFeedConfig, ...]:
+        """Return curated RSS feeds for one region."""
+        if region not in self.regions:
+            raise ValueError(f"Unknown region '{region}'")
+        feed_map = self.regional_rss_feeds or {}
+        return feed_map.get(region, ())
+
     @staticmethod
     def _expand_template_values(
         *,
@@ -375,6 +535,10 @@ class TrackerRuntimeConfig:
     llm_top_n: int = 15
     telegram_top_n: int = 15
     article_context_max_chars: int = 8000
+    enable_newsapi_full_run: bool = False
+    newsapi_max_queries_per_run: int = 25
+    guardian_max_queries_per_run: int = 40
+    historical_precision_half_life_days: int = 30
 
     @classmethod
     def from_env(cls) -> "TrackerRuntimeConfig":
@@ -403,6 +567,27 @@ class TrackerRuntimeConfig:
             0,
             int(os.getenv("COMPETITOR_TRACKER_ARTICLE_CONTEXT_MAX_CHARS", "8000")),
         )
+        enable_newsapi_full_run = _env_flag(
+            "COMPETITOR_TRACKER_ENABLE_NEWSAPI_FULL_RUN",
+            False,
+        )
+        newsapi_max_queries_per_run = max(
+            0,
+            int(os.getenv("COMPETITOR_TRACKER_NEWSAPI_MAX_QUERIES_PER_RUN", "25")),
+        )
+        guardian_max_queries_per_run = max(
+            0,
+            int(os.getenv("COMPETITOR_TRACKER_GUARDIAN_MAX_QUERIES_PER_RUN", "40")),
+        )
+        historical_precision_half_life_days = max(
+            1,
+            int(
+                os.getenv(
+                    "COMPETITOR_TRACKER_HISTORICAL_PRECISION_HALF_LIFE_DAYS",
+                    "30",
+                )
+            ),
+        )
         return cls(
             output_dir=output_dir,
             database_path=database_path,
@@ -413,4 +598,8 @@ class TrackerRuntimeConfig:
             llm_top_n=llm_top_n,
             telegram_top_n=telegram_top_n,
             article_context_max_chars=article_context_max_chars,
+            enable_newsapi_full_run=enable_newsapi_full_run,
+            newsapi_max_queries_per_run=newsapi_max_queries_per_run,
+            guardian_max_queries_per_run=guardian_max_queries_per_run,
+            historical_precision_half_life_days=historical_precision_half_life_days,
         )

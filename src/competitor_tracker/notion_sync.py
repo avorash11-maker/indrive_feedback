@@ -12,6 +12,7 @@ import requests
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from .analyzer import resolve_final_publication_date
+from .environment import get_env_value
 from .models import Alert
 
 
@@ -49,7 +50,7 @@ class CompetitorNotionMirrorSync:
         property_names: Optional[dict[str, str]] = None,
         session: Optional[requests.Session] = None,
     ) -> None:
-        self.token = token or os.getenv("NOTION_TOKEN", "")
+        self.token = token or get_env_value("NOTION_TOKEN")
         self.database_id = database_id or self._resolve_database_id()
         self.property_names = property_names or DEFAULT_PROPERTY_NAMES
         self.session = session or requests.Session()
@@ -66,11 +67,11 @@ class CompetitorNotionMirrorSync:
 
     @staticmethod
     def _resolve_database_id() -> str:
-        primary_database_id = os.getenv("COMPETITOR_TRACKER_NOTION_DATABASE_ID", "")
+        primary_database_id = get_env_value("COMPETITOR_TRACKER_NOTION_DATABASE_ID")
         if primary_database_id:
             return primary_database_id
 
-        fallback_database_id = os.getenv("NOTION_DATABASE_ID", "")
+        fallback_database_id = get_env_value("NOTION_DATABASE_ID")
         if fallback_database_id:
             logger.warning(
                 "Competitor tracker Notion mirror is using legacy NOTION_DATABASE_ID as fallback. "

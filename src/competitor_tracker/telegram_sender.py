@@ -10,6 +10,7 @@ from typing import Any, Mapping, Optional, Sequence
 import requests
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from .environment import get_env_value
 from .formatter import format_alert_card, format_daily_digest
 from .models import Alert, DeliveryRecord
 from .storage import SQLiteTrackerStorage
@@ -28,8 +29,8 @@ class TelegramSender:
         dry_run: bool = False,
     ) -> None:
         self.storage = storage
-        self.bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
-        self.chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
+        self.bot_token = bot_token or get_env_value("TELEGRAM_BOT_TOKEN")
+        self.chat_id = chat_id or get_env_value("TELEGRAM_CHAT_ID")
         self.session = session or requests.Session()
         self.dry_run = dry_run
 

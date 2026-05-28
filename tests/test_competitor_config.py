@@ -42,7 +42,14 @@ def test_load_default_competitor_tracker_config():
     assert "ride-hailing" in config.topic_groups["industry_context"]
     assert "bidding model" in config.topic_groups["product_features_innovation"]
     assert config.daily_digest_limit == 12
-    assert config.enabled_providers == ("newsapi", "gdelt", "google_news_rss")
+    assert config.enabled_providers == ("gdelt", "google_news_rss", "regional_rss", "guardian")
+    assert config.topic_priority_groups[:3] == (
+        "market_expansion",
+        "campaign_launches",
+        "pricing_promo",
+    )
+    assert "regional_rss" in config.enabled_providers
+    assert "guardian" in config.enabled_providers
     assert config.ignored_geo_terms == (
         "USA",
         "United States",
@@ -50,6 +57,12 @@ def test_load_default_competitor_tracker_config():
         "Europe",
         "UK",
     )
+    assert config.competitor_aliases_for("Yandex Go") == ("Yango", "Yandex Taxi")
+    assert len(config.regional_rss_feeds_for_region("latam")) >= 4
+    assert len(config.regional_rss_feeds_for_region("africa")) >= 3
+    assert len(config.regional_rss_feeds_for_region("mea")) >= 2
+    assert len(config.regional_rss_feeds_for_region("sea")) >= 1
+    assert len(config.regional_rss_feeds_for_region("cis_central_asia")) >= 3
     assert config.competitors_for_region("latam") == ("Uber", "DiDi", "Cabify", "99")
     assert config.competitors_for_region("sea") == ("Grab", "Gojek", "Maxim", "Bolt")
     assert config.competitors_for_region("africa") == ("Bolt", "Uber", "Careem", "Yassir", "Heetch")
@@ -206,6 +219,75 @@ def test_queries_for_region_rejects_unknown_topic_group():
         config.queries_for_region("latam", topic_groups=["impossible_topic"])
 
 
+def test_prioritized_topic_groups_keep_business_priority_first():
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "latam": {
+                    "label": "Latin America",
+                    "geo_terms": ["Mexico"],
+                    "language_hints": ["es"],
+                }
+            },
+            "competitors_by_region": {"latam": ["Uber"]},
+            "topic_groups": {
+                "low_signal": ["industry"],
+                "market_expansion": ["launch"],
+                "pricing_promo": ["discount"],
+            },
+            "topic_priority_groups": ["market_expansion", "pricing_promo"],
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "daily_digest_limit": 7,
+            "enabled_providers": ["gdelt"],
+        }
+    )
+
+    assert config.prioritized_topic_groups() == (
+        "market_expansion",
+        "pricing_promo",
+        "low_signal",
+    )
+    prioritized_specs = config.prioritized_query_specs_for_region("latam")
+    assert prioritized_specs[0][2] == "market_expansion"
+    assert prioritized_specs[1][2] == "pricing_promo"
+
+
+def test_from_dict_accepts_competitor_aliases_and_regional_rss_feeds():
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "sea": {
+                    "label": "Southeast Asia",
+                    "geo_terms": ["Indonesia", "Thailand"],
+                    "language_hints": ["en", "id", "th"],
+                }
+            },
+            "competitors_by_region": {"sea": ["Grab", "Gojek"]},
+            "topic_groups": {"pricing": ["price", "fare"]},
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "daily_digest_limit": 7,
+            "enabled_providers": ["gdelt", "regional_rss"],
+            "competitor_aliases": {
+                "Grab": ["GrabTaxi", "GrabFood"],
+            },
+            "regional_rss_feeds": {
+                "sea": [
+                    {
+                        "name": "CNA Asia",
+                        "url": "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml&category=6511",
+                        "language": "en",
+                    }
+                ]
+            },
+        }
+    )
+
+    assert config.competitor_aliases_for("Grab") == ("GrabTaxi", "GrabFood")
+    feeds = config.regional_rss_feeds_for_region("sea")
+    assert feeds[0].name == "CNA Asia"
+    assert feeds[0].language == "en"
+
+
 def test_runtime_config_reads_llm_settings_from_env(monkeypatch):
     monkeypatch.setenv("COMPETITOR_TRACKER_OUTPUT_DIR", "custom/output")
     monkeypatch.setenv("COMPETITOR_TRACKER_DB_PATH", "custom/output/tracker.db")
@@ -216,6 +298,10 @@ def test_runtime_config_reads_llm_settings_from_env(monkeypatch):
     monkeypatch.setenv("COMPETITOR_TRACKER_LLM_TOP_N", "7")
     monkeypatch.setenv("COMPETITOR_TRACKER_TELEGRAM_TOP_N", "9")
     monkeypatch.setenv("COMPETITOR_TRACKER_ARTICLE_CONTEXT_MAX_CHARS", "1234")
+    monkeypatch.setenv("COMPETITOR_TRACKER_ENABLE_NEWSAPI_FULL_RUN", "true")
+    monkeypatch.setenv("COMPETITOR_TRACKER_NEWSAPI_MAX_QUERIES_PER_RUN", "11")
+    monkeypatch.setenv("COMPETITOR_TRACKER_GUARDIAN_MAX_QUERIES_PER_RUN", "13")
+    monkeypatch.setenv("COMPETITOR_TRACKER_HISTORICAL_PRECISION_HALF_LIFE_DAYS", "21")
 
     runtime = TrackerRuntimeConfig.from_env()
 
@@ -228,6 +314,10 @@ def test_runtime_config_reads_llm_settings_from_env(monkeypatch):
     assert runtime.llm_top_n == 7
     assert runtime.telegram_top_n == 9
     assert runtime.article_context_max_chars == 1234
+    assert runtime.enable_newsapi_full_run is True
+    assert runtime.newsapi_max_queries_per_run == 11
+    assert runtime.guardian_max_queries_per_run == 13
+    assert runtime.historical_precision_half_life_days == 21
 
 
 def test_runtime_config_defaults_llm_settings_to_safe_non_llm_mode(monkeypatch):
@@ -235,6 +325,10 @@ def test_runtime_config_defaults_llm_settings_to_safe_non_llm_mode(monkeypatch):
     monkeypatch.delenv("COMPETITOR_TRACKER_LLM_TOP_N", raising=False)
     monkeypatch.delenv("COMPETITOR_TRACKER_TELEGRAM_TOP_N", raising=False)
     monkeypatch.delenv("COMPETITOR_TRACKER_ARTICLE_CONTEXT_MAX_CHARS", raising=False)
+    monkeypatch.delenv("COMPETITOR_TRACKER_ENABLE_NEWSAPI_FULL_RUN", raising=False)
+    monkeypatch.delenv("COMPETITOR_TRACKER_NEWSAPI_MAX_QUERIES_PER_RUN", raising=False)
+    monkeypatch.delenv("COMPETITOR_TRACKER_GUARDIAN_MAX_QUERIES_PER_RUN", raising=False)
+    monkeypatch.delenv("COMPETITOR_TRACKER_HISTORICAL_PRECISION_HALF_LIFE_DAYS", raising=False)
 
     runtime = TrackerRuntimeConfig.from_env()
 
@@ -242,3 +336,16 @@ def test_runtime_config_defaults_llm_settings_to_safe_non_llm_mode(monkeypatch):
     assert runtime.llm_top_n == 15
     assert runtime.telegram_top_n == 15
     assert runtime.article_context_max_chars == 8000
+    assert runtime.enable_newsapi_full_run is False
+    assert runtime.newsapi_max_queries_per_run == 25
+    assert runtime.guardian_max_queries_per_run == 40
+    assert runtime.historical_precision_half_life_days == 30
+
+
+def test_default_provider_stack_keeps_guardian_as_quality_api_and_newsapi_as_opt_in():
+    config = TrackerConfig.load_default()
+    runtime = TrackerRuntimeConfig()
+
+    assert "guardian" in config.enabled_providers
+    assert "newsapi" not in config.enabled_providers
+    assert runtime.enable_newsapi_full_run is False

@@ -105,6 +105,7 @@ def test_run_summary_and_delivery_record_are_serializable():
         daily_digest_limit=12,
         provider_errors={"gdelt": "timeout"},
         provider_diagnostics={"gdelt": {"status": "error", "items_found": 0}},
+        provider_metrics={"gdelt": {"cache_hits": 1, "source_tier_wins": 2}},
     )
     delivery = DeliveryRecord(
         alert_key="grab::product_launch::https://example.com/grab-tier",
@@ -119,5 +120,6 @@ def test_run_summary_and_delivery_record_are_serializable():
     assert summary_payload["providers"] == ("newsapi", "gdelt")
     assert summary_payload["provider_errors"] == {"gdelt": "timeout"}
     assert summary_payload["provider_diagnostics"]["gdelt"]["status"] == "error"
+    assert summary_payload["provider_metrics"]["gdelt"]["cache_hits"] == 1
     assert delivery_payload["status"] == "pending"
     assert delivery_payload["destination"] == "digest@example.com"

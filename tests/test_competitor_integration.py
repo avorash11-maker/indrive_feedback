@@ -14,6 +14,11 @@ from competitor_tracker.providers import ProviderError
 from competitor_tracker.storage import SQLiteTrackerStorage
 
 
+@pytest.fixture(autouse=True)
+def freeze_integration_today(monkeypatch):
+    monkeypatch.setattr(cli, "_today", lambda: date.fromisoformat("2026-05-26"))
+
+
 def freeze_cli_today(monkeypatch, *, iso_date: str = "2026-05-21") -> None:
     monkeypatch.setattr(cli, "_today", lambda: date.fromisoformat(iso_date))
 
@@ -401,6 +406,89 @@ def test_duplicate_suppression_across_runs_uses_sqlite_history(tmp_path, monkeyp
 
     assert len(first["digest"].alerts) == 1
     assert len(second["digest"].alerts) == 0
+
+
+def test_run_pipeline_persists_rss_feed_metrics_for_later_qa(tmp_path, monkeypatch):
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "mea": {
+                    "label": "Middle East",
+                    "geo_terms": ["Qatar"],
+                    "country_validation_terms": ["Qatar", "QA", "UAE", "AE"],
+                    "language_hints": ["en"],
+                }
+            },
+            "competitors_by_region": {"mea": ["Uber"]},
+            "topic_groups": {"pricing_promo": ["discount"]},
+            "topic_priority_groups": ["pricing_promo"],
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "daily_digest_limit": 10,
+            "enabled_providers": ["regional_rss"],
+        }
+    )
+    runtime = patch_runtime(monkeypatch, tmp_path, config)
+
+    class RegionalFeedProvider:
+        name = "regional_rss"
+
+        def fetch_with_diagnostics(self, request):
+            article_item = RawArticle(
+                title="Uber launches rider discount partnership in Doha",
+                url="https://example.com/uber-doha-discount",
+                provider="regional_rss",
+                source="Doha News",
+                published_at="2026-05-19T09:00:00Z",
+                snippet="Uber launches a new rider promotion in Doha.",
+                query="regional_rss::mea::Uber",
+                region="mea",
+                language="en",
+                competitor_hints=("Uber",),
+                metadata={
+                    "query_owner_competitor": "Uber",
+                    "query_owner_region": "mea",
+                    "source_tier": "tier2_direct",
+                    "direct_feed_name": "Doha News",
+                    "direct_feed_url": "https://dohanews.co/feed/",
+                },
+            )
+            return [article_item], {
+                "provider": self.name,
+                "status": "ok",
+                "queries": [
+                    {
+                        "provider": self.name,
+                        "query": "mea:Doha News",
+                        "request_url": "https://dohanews.co/feed/",
+                        "http_status": 200,
+                        "exception": "",
+                        "items_found": 9,
+                        "items_after_filter": 1,
+                        "status": "ok",
+                        "feed_name": "Doha News",
+                        "feed_url": "https://dohanews.co/feed/",
+                        "feed_region": "mea",
+                    }
+                ],
+                "items_found": 9,
+                "items_after_filter": 1,
+                "items_after_global_dedup": 0,
+                "feeds_skipped": 0,
+            }
+
+    monkeypatch.setattr(cli, "build_providers", lambda names: [RegionalFeedProvider()])
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["mea"])
+
+    assert result["feed_metrics"][0]["feed_name"] == "Doha News"
+    assert result["feed_metrics"][0]["alerts_created"] == 1
+
+    storage = SQLiteTrackerStorage(runtime.database_path)
+    report = storage.get_feed_health_report(days=365, min_items_found=1, limit=10)
+
+    assert report["feed_count"] == 1
+    assert report["feeds"][0]["feed_name"] == "Doha News"
+    assert report["feeds"][0]["alerts_created"] == 1
 
 
 def test_pipeline_filters_out_grab_article_from_usa_even_when_found_by_sea_query(tmp_path, monkeypatch):
@@ -2147,7 +2235,20 @@ def test_unsent_telegram_alert_is_carried_over_on_next_run(tmp_path, monkeypatch
         provider_calls["count"] += 1
         if provider_calls["count"] == 1:
             return [StaticProvider("mock_news", articles)]
-        return [StaticProvider("mock_news", [])]
+        return [
+            StaticProvider(
+                "mock_news",
+                [
+                    article(
+                        competitor="Comp0",
+                        title="Comp0 launches new airport pricing program in the United States",
+                        url="https://example.com/comp0-united-states-pricing",
+                        query='"Comp0" pricing Southeast Asia',
+                        snippet="Comp0 is piloting discount airport rides across the USA market.",
+                    )
+                ],
+            )
+        ]
 
     class FakeAlertAnalyzer:
         def __init__(self, use_llm, model=None):
@@ -2211,6 +2312,616 @@ def test_unsent_telegram_alert_is_carried_over_on_next_run(tmp_path, monkeypatch
         max_age_days=2,
     )
     assert deferred_candidates == []
+
+
+def test_no_fresh_ingest_does_not_replay_deferred_backlog_into_fresh_digest(
+    tmp_path, monkeypatch
+):
+    articles = build_capped_articles(16)
+    config = build_config(
+        daily_digest_limit=16,
+        competitors_by_region={"sea": [item.competitor_hints[0] for item in articles]},
+    )
+    patch_runtime(monkeypatch, tmp_path, config)
+
+    provider_calls = {"count": 0}
+
+    def fake_build_providers(names):
+        provider_calls["count"] += 1
+        if provider_calls["count"] == 1:
+            return [StaticProvider("mock_news", articles)]
+        return [StaticProvider("mock_news", [])]
+
+    class FakeAlertAnalyzer:
+        def __init__(self, use_llm, model=None):
+            self.use_llm = use_llm
+
+        def analyze_candidate(self, candidate, *, article_context=None):
+            return {
+                "competitor": candidate.competitor,
+                "region": candidate.region or "",
+                "country": candidate.country_hint or "",
+                "topic": candidate.topic_group,
+                "priority": "MEDIUM",
+                "what_happened": candidate.title,
+                "why_it_matters": "llm" if self.use_llm else "fallback",
+                "potential_impact": "impact",
+                "recommended_action": "act",
+                "confidence": 0.7,
+            }
+
+    class FakeTelegramSender:
+        def __init__(self, storage, dry_run):
+            self.storage = storage
+            self.chat_id = "12345"
+
+        def send_daily_digest(self, alert_schemas, alerts, source_urls, generated_at):
+            for alert in alerts:
+                self.storage.mark_delivered(
+                    alert_key=alert.digest_key,
+                    channel="telegram",
+                    delivered_at="2026-05-20T09:00:00Z",
+                    destination=self.chat_id,
+                )
+            return {"ok": True, "dry_run": False, "message_id": "1"}
+
+    monkeypatch.setattr(cli, "build_providers", fake_build_providers)
+    monkeypatch.setattr(cli, "CompetitorAlertAnalyzer", FakeAlertAnalyzer)
+    monkeypatch.setattr(cli, "TelegramSender", FakeTelegramSender)
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
+
+    first = cli.run_pipeline(
+        days=7,
+        min_score=5,
+        regions=["sea"],
+        telegram_mode="send",
+    )
+    second = cli.run_pipeline(
+        days=7,
+        min_score=5,
+        regions=["sea"],
+        telegram_mode="send",
+    )
+
+    assert len(first["digest"].alerts) == 16
+    assert second["digest"].alerts == ()
+    assert second["telegram_result"] == {
+        "ok": True,
+        "skipped": True,
+        "reason": "no_fresh_ingest",
+        "message_id": None,
+    }
+
+    summary_payload = json.loads(second["summary_path"].read_text(encoding="utf-8"))
+    assert summary_payload["raw_articles_fetched"] == 0
+    assert summary_payload["alerts_created"] == 0
+    assert summary_payload["status"] == "success_no_fresh_ingest"
+    assert (
+        summary_payload["provider_diagnostics"]["pipeline"]["warning"]
+        == "No fresh ingest available for this run; deferred backlog was not used to build a fresh daily digest."
+    )
+
+    storage = SQLiteTrackerStorage(tmp_path / "output" / "tracker.db")
+    deferred_candidates = storage.get_deferred_candidates(
+        channel="telegram",
+        destination="12345",
+        max_age_days=2,
+    )
+    assert len(deferred_candidates) == 1
+    assert deferred_candidates[0].raw_article.metadata["deferred_digest_key"] == first["digest"].alerts[-1].digest_key
+
+
+def test_daily_marketing_digest_excludes_generic_industry_context_noise(tmp_path, monkeypatch):
+    config = build_config(
+        extra_topics={
+            "industry_context": [
+                "ride-hailing",
+                "e-hailing",
+                "on-demand mobility",
+                "ride-sharing",
+            ]
+        }
+    )
+    patch_runtime(monkeypatch, tmp_path, config)
+
+    raw_articles = [
+        article(
+            competitor="Grab",
+            title="Shared mobility market to reach record growth by 2032",
+            url="https://example.com/shared-mobility-forecast",
+            query='"Grab" industry_context Southeast Asia',
+            snippet="A broad ride-hailing market forecast mentions several platforms in passing.",
+        )
+    ]
+
+    def fake_collect_raw_articles(**kwargs):
+        return raw_articles, ("mock_news",), {}, len(raw_articles), {}
+
+    def fake_prefilter(self, raw_articles, regions=None):
+        return AnalysisResult(
+            candidates=[
+                CandidateArticle(
+                    raw_article=raw_articles[0],
+                    competitor="Grab",
+                    topic_group="industry_context",
+                    score=8,
+                    matched_keywords=("ride-hailing",),
+                    summary="Generic shared mobility market forecast.",
+                    region="sea",
+                    country_hint=None,
+                    language_hint="en",
+                    reasons=("competitor_mentioned", "topic_match:industry_context"),
+                )
+            ],
+            dropped_count=0,
+            dropped_articles=[],
+        )
+
+    monkeypatch.setattr(cli, "collect_raw_articles", fake_collect_raw_articles)
+    monkeypatch.setattr(cli.CompetitorAnalyzer, "prefilter_raw_articles", fake_prefilter)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
+
+    assert result["digest"].alerts == ()
+    assert len(result["analysis"].candidates) == 1
+
+
+def test_daily_marketing_digest_keeps_actionable_industry_context(tmp_path, monkeypatch):
+    config = build_config(
+        extra_topics={
+            "industry_context": [
+                "ride-hailing",
+                "e-hailing",
+                "on-demand mobility",
+                "ride-sharing",
+            ]
+        }
+    )
+    patch_runtime(monkeypatch, tmp_path, config)
+
+    raw_articles = [
+        article(
+            competitor="Grab",
+            title="Grab launches new driver recruitment campaign in Manila",
+            url="https://example.com/grab-driver-recruitment",
+            query='"Grab" industry_context Southeast Asia',
+            snippet="Grab expands its ride-hailing operations with a new driver recruitment push.",
+        )
+    ]
+
+    def fake_collect_raw_articles(**kwargs):
+        return raw_articles, ("mock_news",), {}, len(raw_articles), {}
+
+    def fake_prefilter(self, raw_articles, regions=None):
+        return AnalysisResult(
+            candidates=[
+                CandidateArticle(
+                    raw_article=raw_articles[0],
+                    competitor="Grab",
+                    topic_group="industry_context",
+                    score=8,
+                    matched_keywords=("ride-hailing", "driver recruitment campaign"),
+                    summary="Grab launches new driver recruitment campaign in Manila.",
+                    region="sea",
+                    country_hint="Philippines",
+                    language_hint="en",
+                    reasons=("competitor_mentioned", "priority_signal"),
+                )
+            ],
+            dropped_count=0,
+            dropped_articles=[],
+        )
+
+    monkeypatch.setattr(cli, "collect_raw_articles", fake_collect_raw_articles)
+    monkeypatch.setattr(cli.CompetitorAnalyzer, "prefilter_raw_articles", fake_prefilter)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
+
+    assert len(result["digest"].alerts) == 1
+    assert result["digest"].alerts[0].topic_group == "industry_context"
+
+
+def test_daily_marketing_digest_excludes_non_marketing_topic_groups_by_default(tmp_path, monkeypatch):
+    config = build_config(
+        extra_topics={
+            "industry_context": ["ride-hailing"],
+            "product_features_innovation": ["safety features", "fixed price"],
+        }
+    )
+    patch_runtime(monkeypatch, tmp_path, config)
+
+    raw_articles = [
+        article(
+            competitor="Grab",
+            title="Grab broad industry mention in policy round-up",
+            url="https://example.com/grab-policy-roundup",
+            query='"Grab" industry_context Southeast Asia',
+        ),
+        article(
+            competitor="Grab",
+            title="Grab pilots new fixed price airport rides in Manila",
+            url="https://example.com/grab-fixed-price-manila",
+            query='"Grab" product_features_innovation Southeast Asia',
+        ),
+    ]
+
+    def fake_collect_raw_articles(**kwargs):
+        return raw_articles, ("mock_news",), {}, len(raw_articles), {}
+
+    def fake_prefilter(self, raw_articles, regions=None):
+        return AnalysisResult(
+            candidates=[
+                CandidateArticle(
+                    raw_article=raw_articles[0],
+                    competitor="Grab",
+                    topic_group="industry_context",
+                    score=7,
+                    matched_keywords=("ride-hailing",),
+                    summary="Broad policy round-up.",
+                    region="sea",
+                    country_hint=None,
+                    language_hint="en",
+                    reasons=("competitor_mentioned",),
+                ),
+                CandidateArticle(
+                    raw_article=raw_articles[1],
+                    competitor="Grab",
+                    topic_group="product_features_innovation",
+                    score=8,
+                    matched_keywords=("fixed price",),
+                    summary="Grab pilots new fixed price airport rides in Manila.",
+                    region="sea",
+                    country_hint="Philippines",
+                    language_hint="en",
+                    reasons=("competitor_mentioned", "priority_signal"),
+                ),
+            ],
+            dropped_count=0,
+            dropped_articles=[],
+        )
+
+    monkeypatch.setattr(cli, "collect_raw_articles", fake_collect_raw_articles)
+    monkeypatch.setattr(cli.CompetitorAnalyzer, "prefilter_raw_articles", fake_prefilter)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
+
+    assert len(result["digest"].alerts) == 1
+    assert result["digest"].alerts[0].topic_group == "product_features_innovation"
+
+
+def test_daily_marketing_digest_rejects_off_region_article_for_latam(tmp_path, monkeypatch):
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "latam": {
+                    "label": "Latin America",
+                    "geo_terms": ["Mexico", "Brazil", "Colombia", "LATAM"],
+                    "country_validation_terms": ["Mexico", "Brazil", "Colombia", "Argentina"],
+                    "language_hints": ["en", "es", "pt"],
+                }
+            },
+            "competitors_by_region": {"latam": ["Uber"]},
+            "topic_groups": {"campaign_launches": ["campaign", "partnership"]},
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "daily_digest_limit": 10,
+            "enabled_providers": ["google_news_rss"],
+        }
+    )
+    patch_runtime(monkeypatch, tmp_path, config)
+
+    raw_articles = [
+        article(
+            competitor="Uber",
+            title="Uber launches Pune Metro partnership in India",
+            url="https://example.com/uber-pune-metro-india",
+            query='"Uber" campaign_launches Latin America',
+            source="Transit India",
+            region="latam",
+        )
+    ]
+
+    def fake_collect_raw_articles(**kwargs):
+        return raw_articles, ("mock_news",), {}, len(raw_articles), {}
+
+    def fake_prefilter(self, raw_articles, regions=None):
+        return AnalysisResult(
+            candidates=[
+                CandidateArticle(
+                    raw_article=raw_articles[0],
+                    competitor="Uber",
+                    topic_group="campaign_launches",
+                    score=8,
+                    matched_keywords=("partnership",),
+                    summary="Uber launches Pune Metro partnership in India.",
+                    region="latam",
+                    country_hint=None,
+                    language_hint="en",
+                    reasons=("competitor_mentioned", "priority_signal"),
+                )
+            ],
+            dropped_count=0,
+            dropped_articles=[],
+        )
+
+    monkeypatch.setattr(cli, "collect_raw_articles", fake_collect_raw_articles)
+    monkeypatch.setattr(cli.CompetitorAnalyzer, "prefilter_raw_articles", fake_prefilter)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["latam"])
+
+    assert result["digest"].alerts == ()
+    assert len(result["analysis"].candidates) == 1
+
+
+def test_daily_marketing_digest_keeps_valid_in_region_article_for_latam(tmp_path, monkeypatch):
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "latam": {
+                    "label": "Latin America",
+                    "geo_terms": ["Mexico", "Brazil", "Colombia", "LATAM"],
+                    "country_validation_terms": ["Mexico", "Brazil", "Colombia", "Argentina"],
+                    "language_hints": ["en", "es", "pt"],
+                }
+            },
+            "competitors_by_region": {"latam": ["Uber"]},
+            "topic_groups": {"campaign_launches": ["campaign", "partnership"]},
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "daily_digest_limit": 10,
+            "enabled_providers": ["google_news_rss"],
+        }
+    )
+    patch_runtime(monkeypatch, tmp_path, config)
+
+    raw_articles = [
+        article(
+            competitor="Uber",
+            title="Uber launches airport partnership in Mexico City",
+            url="https://example.com/uber-mexico-airport",
+            query='"Uber" campaign_launches Latin America',
+            source="El Financiero",
+            region="latam",
+        )
+    ]
+
+    def fake_collect_raw_articles(**kwargs):
+        return raw_articles, ("mock_news",), {}, len(raw_articles), {}
+
+    def fake_prefilter(self, raw_articles, regions=None):
+        return AnalysisResult(
+            candidates=[
+                CandidateArticle(
+                    raw_article=raw_articles[0],
+                    competitor="Uber",
+                    topic_group="campaign_launches",
+                    score=8,
+                    matched_keywords=("partnership",),
+                    summary="Uber launches airport partnership in Mexico City.",
+                    region="latam",
+                    country_hint="Mexico",
+                    language_hint="en",
+                    reasons=("competitor_mentioned", "priority_signal"),
+                )
+            ],
+            dropped_count=0,
+            dropped_articles=[],
+        )
+
+    monkeypatch.setattr(cli, "collect_raw_articles", fake_collect_raw_articles)
+    monkeypatch.setattr(cli.CompetitorAnalyzer, "prefilter_raw_articles", fake_prefilter)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["latam"])
+
+    assert len(result["digest"].alerts) == 1
+    assert result["digest"].alerts[0].candidate.country_hint == "Mexico"
+
+
+def test_daily_marketing_digest_handles_ambiguous_geography_conservatively(tmp_path, monkeypatch):
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "latam": {
+                    "label": "Latin America",
+                    "geo_terms": ["Mexico", "Brazil", "Colombia", "LATAM"],
+                    "country_validation_terms": ["Mexico", "Brazil", "Colombia", "Argentina"],
+                    "language_hints": ["en", "es", "pt"],
+                }
+            },
+            "competitors_by_region": {"latam": ["Uber"]},
+            "topic_groups": {"campaign_launches": ["campaign", "partnership"]},
+            "keyword_templates": ['"{competitor}" {topic_name} {region_label}'],
+            "daily_digest_limit": 10,
+            "enabled_providers": ["google_news_rss"],
+        }
+    )
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Uber launches airport partnership for commuters",
+            url="https://example.com/uber-ambiguous-airport",
+            provider="mock_provider",
+            source="Mobility Brief",
+            snippet="Uber launches airport partnership for commuters",
+            query='"Uber" campaign_launches Latin America',
+            region=None,
+        ),
+        competitor="Uber",
+        topic_group="campaign_launches",
+        score=8,
+        matched_keywords=("partnership",),
+        summary="Uber launches airport partnership for commuters.",
+        region=None,
+        country_hint=None,
+        language_hint="en",
+        reasons=("competitor_mentioned", "priority_signal"),
+    )
+
+    digest = cli.DigestBuilder().build(
+        competitors=["Uber"],
+        candidates=[candidate],
+        regions=["latam"],
+        apply_marketing_filters=True,
+        marketing_config=config,
+    )
+
+    assert digest.alerts == ()
+
+
+def test_daily_marketing_digest_rejects_noise_domains_and_forecast_sources(tmp_path, monkeypatch):
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config)
+
+    raw_articles = [
+        article(
+            competitor="Grab",
+            title="DiDi Ride Hailing Market Forecast 2032",
+            url="https://www.openpr.com/news/123456/didi-forecast-2032",
+            query='"Grab" campaign_launches Southeast Asia',
+            source="openPR",
+        ),
+        article(
+            competitor="Grab",
+            title="Uber expands points and miles travel rewards tie-up",
+            url="https://thepointsguy.com/news/uber-points-miles-tie-up",
+            query='"Grab" campaign_launches Southeast Asia',
+            source="The Points Guy",
+        ),
+        article(
+            competitor="Grab",
+            title="Grab launches airport partnership in Manila",
+            url="https://example.com/grab-manila-airport",
+            query='"Grab" campaign_launches Southeast Asia',
+            source="CNA Asia",
+        ),
+    ]
+
+    def fake_collect_raw_articles(**kwargs):
+        return raw_articles, ("mock_news",), {}, len(raw_articles), {}
+
+    def fake_prefilter(self, raw_articles, regions=None):
+        return AnalysisResult(
+            candidates=[
+                CandidateArticle(
+                    raw_article=raw_articles[0],
+                    competitor="DiDi",
+                    topic_group="campaign_launches",
+                    score=7,
+                    matched_keywords=("campaign",),
+                    summary="Forecast page.",
+                    region="sea",
+                    country_hint="Philippines",
+                    language_hint="en",
+                    reasons=("competitor_mentioned",),
+                ),
+                CandidateArticle(
+                    raw_article=raw_articles[1],
+                    competitor="Uber",
+                    topic_group="campaign_launches",
+                    score=7,
+                    matched_keywords=("partnership",),
+                    summary="Travel rewards lifestyle page.",
+                    region="sea",
+                    country_hint="Philippines",
+                    language_hint="en",
+                    reasons=("competitor_mentioned",),
+                ),
+                CandidateArticle(
+                    raw_article=raw_articles[2],
+                    competitor="Grab",
+                    topic_group="campaign_launches",
+                    score=8,
+                    matched_keywords=("partnership",),
+                    summary="Grab launches airport partnership in Manila.",
+                    region="sea",
+                    country_hint="Philippines",
+                    language_hint="en",
+                    reasons=("competitor_mentioned", "priority_signal"),
+                ),
+            ],
+            dropped_count=0,
+            dropped_articles=[],
+        )
+
+    monkeypatch.setattr(cli, "collect_raw_articles", fake_collect_raw_articles)
+    monkeypatch.setattr(cli.CompetitorAnalyzer, "prefilter_raw_articles", fake_prefilter)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
+
+    assert len(result["digest"].alerts) == 1
+    assert result["digest"].alerts[0].candidate.url == "https://example.com/grab-manila-airport"
+
+
+def test_daily_marketing_digest_rejects_noisy_google_news_secondary_item(tmp_path, monkeypatch):
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config)
+
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Uber mobility trends update for urban commuters",
+            url="https://news.google.com/rss/articles/secondary-noise",
+            provider="google_news_rss",
+            source="Google News",
+            snippet="A broad mobility commentary mentions Uber in passing.",
+            query='"Uber" campaign_launches Southeast Asia',
+            region="sea",
+            metadata={"source_tier": "tier1_aggregator"},
+        ),
+        competitor="Uber",
+        topic_group="campaign_launches",
+        score=7,
+        matched_keywords=("campaign",),
+        summary="Broad commentary mention.",
+        region="sea",
+        country_hint=None,
+        language_hint="en",
+        reasons=("competitor_mentioned",),
+    )
+
+    digest = cli.DigestBuilder().build(
+        competitors=["Uber"],
+        candidates=[candidate],
+        regions=["sea"],
+        apply_marketing_filters=True,
+        marketing_config=config,
+    )
+
+    assert digest.alerts == ()
+
+
+def test_daily_marketing_digest_keeps_actionable_google_news_secondary_item(tmp_path, monkeypatch):
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config)
+
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Grab launches airport partnership in Manila",
+            url="https://news.google.com/rss/articles/grab-manila-airport",
+            provider="google_news_rss",
+            source="Google News",
+            snippet="Grab launches a new airport partnership in Manila with driver incentives.",
+            query='"Grab" campaign_launches Southeast Asia',
+            region="sea",
+            metadata={"source_tier": "tier1_aggregator"},
+        ),
+        competitor="Grab",
+        topic_group="campaign_launches",
+        score=8,
+        matched_keywords=("campaign", "partnership"),
+        summary="Grab launches airport partnership in Manila.",
+        region="sea",
+        country_hint="Philippines",
+        language_hint="en",
+        reasons=("competitor_mentioned", "priority_signal"),
+    )
+
+    digest = cli.DigestBuilder().build(
+        competitors=["Grab"],
+        candidates=[candidate],
+        regions=["sea"],
+        apply_marketing_filters=True,
+        marketing_config=config,
+    )
+
+    assert len(digest.alerts) == 1
+    assert digest.alerts[0].candidate.provider == "google_news_rss"
 
 
 def test_articles_older_than_seven_days_are_archived_but_filtered_from_digest_and_telegram(

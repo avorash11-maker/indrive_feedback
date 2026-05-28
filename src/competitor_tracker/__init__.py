@@ -1,5 +1,9 @@
 """Competitor tracker package."""
 
+from .environment import bootstrap_env
+
+bootstrap_env()
+
 from .config import TrackerConfig, TrackerRuntimeConfig
 from .models import (
     Alert,

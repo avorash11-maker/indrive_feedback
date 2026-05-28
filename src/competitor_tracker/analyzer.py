@@ -13,6 +13,7 @@ from typing import Any, Iterable, List, Mapping, Optional, Sequence
 import openai
 
 from .config import TrackerConfig
+from .environment import get_env_value
 from .formatter import format_alert_card
 from .geo_policy import GeoPolicy
 from .models import (
@@ -466,7 +467,15 @@ class CompetitorAnalyzer:
             return bool(NINETY_NINE_CONTEXT_PATTERN.search(content_casefold))
         if normalized_competitor == "maxim":
             return bool(MAXIM_CONTEXT_PATTERN.search(article_content))
-        return normalized_competitor in text_blob
+        if normalized_competitor in text_blob:
+            return True
+        if self.config is None:
+            return False
+        for alias in self.config.competitor_aliases_for(competitor):
+            normalized_alias = alias.casefold()
+            if normalized_alias and normalized_alias in text_blob:
+                return True
+        return False
 
     def _validate_candidate_region(
         self,
@@ -729,14 +738,14 @@ class CompetitorAlertAnalyzer:
         model: Optional[str] = None,
         config: Optional[TrackerConfig] = None,
     ) -> None:
-        self.use_llm = use_llm and bool(os.getenv("OPENAI_API_KEY"))
+        self.use_llm = use_llm and bool(get_env_value("OPENAI_API_KEY"))
         self.client = None
-        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.model = model or get_env_value("OPENAI_MODEL", default="gpt-4o-mini")
         self.config = config
 
         if self.use_llm:
             try:
-                self.client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+                self.client = openai.OpenAI(api_key=get_env_value("OPENAI_API_KEY"))
             except Exception as exc:
                 logger.warning(
                     "Competitor alert LLM client initialization failed; using rule-based fallback. error=%s",

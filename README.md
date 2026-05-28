@@ -148,6 +148,7 @@ The new CLI supports:
 - `sync-notion`
 - `backfill`
 - `test-provider`
+- `qa-feeds`
 
 Examples:
 
@@ -157,6 +158,7 @@ Examples:
 .\.venv\Scripts\competitor-tracker sync-notion --dry-run --region sea
 .\.venv\Scripts\competitor-tracker backfill --days 30 --region sea --export-csv
 .\.venv\Scripts\competitor-tracker test-provider --provider google_news_rss --query "Grab launch Philippines"
+.\.venv\Scripts\competitor-tracker qa-feeds --days 30 --min-feed-items 5 --limit 15
 ```
 
 `test-provider` is the fastest way to separate `no data` from `provider/network/parser` failures during live ingestion checks. It prints structured JSON diagnostics with:
@@ -169,6 +171,17 @@ Examples:
 - items found before provider-side filtering
 - items kept after provider-side filtering
 - items left after global deduplication
+
+`qa-feeds` reads stored feed-level QA snapshots from SQLite and highlights:
+
+- how many items each curated RSS feed published
+- how many survived provider-side competitor matching
+- how many survived the tracker prefilter
+- how many became final alerts
+- which feeds currently have the highest noise ratio
+- which feeds should be reviewed or removed from the whitelist
+
+For quick local automation you can also run [qa_competitor_feeds.py](/abs/path/C:/Users/shar0/Desktop/indrive_feedback/scripts/qa_competitor_feeds.py).
 
 ## Configuration
 
@@ -234,6 +247,17 @@ COMPETITOR_TRACKER_USE_LLM_ALERTS=
 COMPETITOR_TRACKER_LLM_TOP_N=
 COMPETITOR_TRACKER_TELEGRAM_TOP_N=
 COMPETITOR_TRACKER_ARTICLE_CONTEXT_MAX_CHARS=
+COMPETITOR_TRACKER_ENABLE_NEWSAPI_FULL_RUN=false
+COMPETITOR_TRACKER_NEWSAPI_MAX_QUERIES_PER_RUN=25
+COMPETITOR_TRACKER_NEWSAPI_DAILY_REQUEST_LIMIT=90
+COMPETITOR_TRACKER_NEWSAPI_CACHE_TTL_SECONDS=600
+COMPETITOR_TRACKER_NEWSAPI_COOLDOWN_SECONDS=900
+COMPETITOR_TRACKER_GUARDIAN_MAX_QUERIES_PER_RUN=40
+COMPETITOR_TRACKER_GUARDIAN_DAILY_REQUEST_LIMIT=450
+COMPETITOR_TRACKER_GUARDIAN_CACHE_TTL_SECONDS=900
+COMPETITOR_TRACKER_GUARDIAN_COOLDOWN_SECONDS=900
+COMPETITOR_TRACKER_HISTORICAL_PRECISION_HALF_LIFE_DAYS=30
+GUARDIAN_API_KEY=
 
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
@@ -242,6 +266,32 @@ NOTION_TOKEN=
 NOTION_DATABASE_ID=
 COMPETITOR_TRACKER_NOTION_DATABASE_ID=
 ```
+
+NewsAPI is now treated as an opt-in provider for full pipeline runs. By default, the repository config uses `gdelt`, `google_news_rss`, and a curated `regional_rss` tier, while `newsapi` remains available for `test-provider` and manual diagnostics. If you explicitly enable NewsAPI for a full run, the tracker applies a local query cap, daily request budget, TTL cache, and cooldown after `429 rateLimited` responses.
+
+`competitor_tracker` now loads `.env` automatically, so the CLI reads keys from one place without manual shell export. Canonical names are:
+
+- `OPENAI_API_KEY`
+- `NEWS_API_KEY`
+- `GUARDIAN_API_KEY`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `NOTION_TOKEN`
+- `COMPETITOR_TRACKER_NOTION_DATABASE_ID`
+
+`NOTION_DATABASE_ID` is still accepted only as a legacy fallback.
+
+`guardian` is enabled in the default provider stack as an additional tier-2 direct source whenever `GUARDIAN_API_KEY` is configured. Full runs apply the same safety pattern there too: per-run query caps, daily request budget, local TTL cache, and cooldown after `429` responses.
+
+`regional_rss` now ships with a wider curated whitelist by zone:
+
+- `LATAM`: EL PAIS America, Mexico News Daily, Buenos Aires Times, MercoPress
+- `Africa`: AllAfrica Kenya, Nigeria, and South Africa slices
+- `MEA`: AGBI, Doha News
+- `SEA`: CNA Asia
+- `CIS / Central Asia`: Civil Georgia, Astana Times, The Times of Central Asia
+
+Query generation now follows `topic_priority_groups`, and equal-priority queries are further reordered by historical precision from SQLite so providers spend caps on the queries that have produced the best candidate and alert yield in past runs. That score now uses time decay plus a confidence factor on recent evidence volume, so a query that was great months ago does not permanently outrank fresher winners.
 
 Important:
 
@@ -266,6 +316,8 @@ Important ingestion diagnostics detail:
 
 - `provider_errors` is the compact high-level failure map.
 - `provider_diagnostics` is the structured per-provider payload with query-level request and count details.
+- `provider_metrics` is the compact per-provider KPI block with values such as `cache_hits`, `skipped_items`, `budget_hits`, `cooldown_hits`, `feeds_skipped`, `items_after_global_dedup`, and `source_tier_wins`.
+- `rss_feed_metrics` in SQLite stores per-run feed QA snapshots for curated RSS sources, including `items_found`, `provider_matches`, `prefilter_passed`, `candidates_kept`, `alerts_created`, `noise_ratio`, and auto-generated cleanup recommendations.
 - If `test-provider` fails for several providers and queries with connection or DNS-style errors, that points to the environment or network path, not necessarily to tracker code.
 
 The markdown preview intentionally uses readable Russian section labels where helpful for manual review:
