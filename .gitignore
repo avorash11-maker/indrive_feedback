@@ -1,5 +1,8 @@
 # Секреты и локальные переменные окружения
 .env
+.env.exemple
+.env.local
+.env.*.local
 
 # Виртуальные окружения Python
 .venv/

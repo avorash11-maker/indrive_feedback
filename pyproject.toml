@@ -3,13 +3,13 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "indrive-media-intelligence"
+name = "competitor-tracker"
 version = "0.1.0"
-description = "AI-powered media monitoring system for inDrive mentions"
+description = "Telegram-first competitor monitoring pipeline with an optional Notion mirror"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
-keywords = ["media-monitoring", "ai", "news-analysis", "indrive"]
+keywords = ["competitor-tracker", "competitor-monitoring", "telegram-digest", "market-monitoring", "news-analysis"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -39,8 +39,9 @@ dev = [
 ]
 
 [project.scripts]
-indrive-media = "indrive_media.main:main"
 competitor-tracker = "competitor_tracker.cli:main"
+indrive-media = "indrive_media.main:main"
+legacy-indrive-media = "indrive_media.main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

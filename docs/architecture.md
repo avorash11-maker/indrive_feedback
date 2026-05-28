@@ -9,6 +9,17 @@ This repository currently contains two product branches:
 
 This document describes the new `competitor_tracker` architecture first. The legacy pipeline is summarized briefly at the end.
 
+## Release Path
+
+For MVP release purposes, treat `competitor_tracker` as the only primary product path:
+
+- repository root `main.py` defaults to `competitor_tracker`
+- `competitor-tracker` is the primary packaged CLI
+- `Telegram` is the primary delivery channel
+- `Notion` is only an optional mirror
+
+`indrive_media` remains in the repository as a legacy/deprecated path and should not be used as the default operational entrypoint for the MVP.
+
 ## MVP Goal
 
 Build a low-cost daily competitor digest that:
@@ -19,6 +30,13 @@ Build a low-cost daily competitor digest that:
 - delivers a compact operational digest instead of a firehose
 - keeps local state in `SQLite`
 - optionally mirrors final alerts into `Notion`
+
+Non-goals for this MVP release:
+
+- `Slack` delivery
+- reels / short-video monitoring
+- banner or logo recognition
+- generic visual brand-detection workflows
 
 ## Design Principles
 
@@ -113,6 +131,8 @@ graph TD
 
     C --> C1[Google News RSS]
     C --> C2[GDELT]
+    C --> C3[regional_rss]
+    C --> C4[optional Guardian]
 
     K --> K1[run_summary.json]
     K --> K2[digest.json]
@@ -163,6 +183,8 @@ Current providers:
 
 - `Google News RSS`
 - `GDELT`
+- `regional_rss`
+- `guardian`
 
 ### Normalization and Deduplication
 
@@ -251,6 +273,7 @@ Current `SQLite` tables:
 - `alerts`
 - `runs`
 - `delivery_log`
+- `rss_feed_metrics`
 
 Archive-oriented article metadata can also include:
 
@@ -448,4 +471,4 @@ Its responsibilities are different:
 - legacy export/reporting flow
 - separate CLI and legacy integration path
 
-It should not be treated as the architecture of the new competitor tracker MVP.
+It should not be treated as the architecture of the new competitor tracker MVP, and it is intentionally excluded from the default release path.

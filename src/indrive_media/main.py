@@ -1,5 +1,6 @@
 import argparse
 import logging
+import sys
 from typing import List, Optional
 
 from .notion_integration import NotionExporter
@@ -9,7 +10,10 @@ from .scraper import DEFAULT_QUERIES, InDriveMentionScraper
 def parse_args() -> argparse.Namespace:
     """Описывает параметры запуска из командной строки."""
     parser = argparse.ArgumentParser(
-        description="Собирает и анализирует упоминания inDrive в новостях."
+        description=(
+            "LEGACY / deprecated path: собирает и анализирует упоминания inDrive в новостях. "
+            "Для MVP competitor monitoring используйте competitor_tracker."
+        )
     )
     parser.add_argument(
         "--days",
@@ -92,6 +96,11 @@ def run_pipeline(
 def main() -> None:
     # INFO-логи показывают ход сбора, но не перегружают вывод техническими деталями.
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    print(
+        "WARNING: `indrive_media` is a legacy/deprecated pipeline. "
+        "Primary MVP release path is `competitor_tracker`.",
+        file=sys.stderr,
+    )
     args = parse_args()
     run_pipeline(
         days=args.days,

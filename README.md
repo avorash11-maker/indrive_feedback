@@ -5,7 +5,23 @@ Config-driven competitor intelligence pipeline for daily market monitoring. The 
 ## Product Split
 
 - `competitor_tracker` is the new MVP product branch in this repository.
-- `legacy pipeline` (`indrive_media`) stays in place and is not the source of truth for the new competitor tracker.
+- `competitor_tracker` is the default release path, default CLI, and default root entrypoint for this repository.
+- `legacy pipeline` (`indrive_media`) stays in place only as a legacy/deprecated path and is not the source of truth for the MVP.
+
+## Default Entry Points
+
+Use these commands for the MVP:
+
+- `python main.py run --days 7 --export-csv`
+- `python -m competitor_tracker run --days 7 --export-csv`
+- `competitor-tracker run --days 7 --export-csv`
+
+Legacy commands are still available, but intentionally not default:
+
+- `python main.py legacy-indrive-media --days 30`
+- `python -m indrive_media --days 30`
+- `indrive-media --days 30` (`legacy` backward-compat alias)
+- `legacy-indrive-media --days 30`
 
 ## What This MVP Does
 
@@ -51,6 +67,21 @@ The current MVP is optimized for a practical daily monitoring loop:
   - sent to `Telegram`
   - mirrored to `Notion` as a showcase/archive layer
 
+## Current MVP Scope
+
+In scope for the product freeze:
+
+- `Telegram` as the primary delivery channel
+- optional `Notion` mirror
+- config-driven competitor monitoring for the configured regions and providers
+
+Explicitly out of scope for this MVP release:
+
+- `Slack`
+- reels or short-video monitoring
+- banner/logo recognition
+- visual brand detection workflows
+
 ## Why This Architecture
 
 The design goal is not “use AI everywhere”, but “use AI only where it helps”.
@@ -68,7 +99,7 @@ The design goal is not “use AI everywhere”, but “use AI only where it help
 
 - Python
 - `SQLite` for operational storage
-- `Google News RSS` and `GDELT` for ingestion
+- `GDELT`, `Google News RSS`, curated `regional_rss`, and optional `guardian` direct-source ingestion
 - optional `OpenAI` step for richer alert narratives
 - `Telegram` for delivery
 - optional `Notion` mirror for archive / portfolio presentation
@@ -79,7 +110,7 @@ The design goal is not “use AI everywhere”, but “use AI only where it help
 ```text
 Config
   -> Query Expansion
-  -> Providers (Google News RSS, GDELT)
+  -> Providers (GDELT, Google News RSS, regional_rss, optional Guardian)
   -> Normalization + Raw Deduplication
   -> Rule-Based Prefilter
   -> SQLite History Checks
@@ -97,7 +128,7 @@ Detailed architecture: [docs/architecture.md](/C:/Users/shar0/Desktop/indrive_fe
 - [src/competitor_tracker/config.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/config.py)
   Config loader, validation, and query expansion.
 - [src/competitor_tracker/providers.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/providers.py)
-  Low-cost provider adapters for `Google News RSS` and `GDELT`.
+  Low-cost provider adapters for `GDELT`, `Google News RSS`, curated `regional_rss`, and optional `guardian`.
 - [src/competitor_tracker/analyzer.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/analyzer.py)
   Rule-based prefilter plus alert analyzer.
 - [src/competitor_tracker/digest.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/digest.py)
@@ -120,13 +151,15 @@ python -m venv .venv
 .\.venv\Scripts\python -m pip install -e .[dev]
 ```
 
+That install exposes `competitor-tracker` as the primary CLI for the MVP.
+
 Run all tests:
 
 ```powershell
 .\.venv\Scripts\python -m pytest
 ```
 
-Run the new tracker locally:
+Run the MVP tracker locally:
 
 ```powershell
 .\.venv\Scripts\python -m competitor_tracker run --days 7 --export-csv
@@ -136,6 +169,14 @@ Or use the packaged entrypoint:
 
 ```powershell
 .\.venv\Scripts\competitor-tracker run --days 7 --export-csv
+```
+
+`python main.py` now routes to `competitor_tracker` by default. To launch the old pipeline from the repository root, prepend `legacy-indrive-media`.
+
+Recommended MVP product path after install:
+
+```powershell
+.\.venv\Scripts\competitor-tracker dry-run --days 7 --export-csv
 ```
 
 ## CLI Commands
@@ -384,7 +425,7 @@ Run them with:
 
 ## GitHub Actions
 
-The legacy CI workflow stays untouched.
+The legacy CI workflow stays untouched and is outside the main MVP release path.
 
 The new tracker has its own workflow:
 
@@ -421,12 +462,18 @@ Behavior:
 
 ## Legacy Pipeline
 
-The repository still contains the original `indrive_media` pipeline and its CLI:
+The repository still contains the original `indrive_media` pipeline and its explicit legacy CLI path:
 
 - [src/indrive_media/main.py](/C:/Users/shar0/Desktop/indrive_feedback/src/indrive_media/main.py)
-- [main.py](/C:/Users/shar0/Desktop/indrive_feedback/main.py)
+- [src/indrive_media/__main__.py](/C:/Users/shar0/Desktop/indrive_feedback/src/indrive_media/__main__.py)
 
-That legacy flow remains available and should not be assumed to behave like the new competitor tracker MVP.
+How to access it intentionally:
+
+- `python main.py legacy-indrive-media ...`
+- `python -m indrive_media ...`
+- `indrive-media ...`
+
+That legacy flow remains available for continuity and regression safety, but it is explicitly deprecated as a product path and should not be assumed to behave like the new competitor tracker MVP.
 
 ## Portfolio Framing
 
