@@ -53,7 +53,7 @@ class JsonFileStorage:
 
     def save_candidates(self, candidates: Sequence[CandidateArticle]) -> Path:
         output_path = self.base_dir / "candidates.json"
-        payload = [asdict(candidate) for candidate in candidates]
+        payload = [self._serialize_candidate(candidate) for candidate in candidates]
         output_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -184,6 +184,21 @@ class JsonFileStorage:
                     }
                 )
         return output_path
+
+    @staticmethod
+    def _serialize_candidate(candidate: CandidateArticle) -> dict[str, Any]:
+        payload = asdict(candidate)
+        payload.update(
+            {
+                "title": candidate.title,
+                "url": candidate.url,
+                "provider": candidate.provider,
+                "source": candidate.raw_article.source,
+                "published_at": candidate.raw_article.published_at,
+                "query": candidate.raw_article.query,
+            }
+        )
+        return payload
 
 
 def _json_dumps(value: Any) -> str:
@@ -945,7 +960,13 @@ class SQLiteTrackerStorage:
             )
         return int(cursor.rowcount or 0)
 
-    def get_recent_alert_history(self, limit: int = 200) -> list[dict[str, Any]]:
+    def get_recent_alert_history(
+        self,
+        *,
+        channel: str,
+        destination: str = "",
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
                 """
@@ -965,10 +986,18 @@ class SQLiteTrackerStorage:
                 FROM alerts a
                 JOIN article_candidates c ON c.id = a.candidate_id
                 JOIN articles_raw r ON r.id = c.raw_article_id
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM delivery_log d
+                    WHERE d.alert_key = a.digest_key
+                      AND d.channel = ?
+                      AND d.destination = ?
+                      AND d.status = 'delivered'
+                )
                 ORDER BY COALESCE(r.published_at, a.created_at) DESC, a.id DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (channel, destination, limit),
             ).fetchall()
         return [dict(row) for row in rows]
 

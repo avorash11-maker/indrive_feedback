@@ -453,7 +453,11 @@ class DigestBuilder:
         delivery_channel: str,
         delivery_destination: str,
     ) -> list:
-        history = storage.get_recent_alert_history(limit=200)
+        history = storage.get_recent_alert_history(
+            channel=delivery_channel,
+            destination=delivery_destination,
+            limit=200,
+        )
         kept = []
         for alert in alerts:
             if storage.has_sent_alert(

@@ -29,15 +29,21 @@ class FakeSession:
         return FakeResponse(self.payload)
 
 
-def build_alert(storage: SQLiteTrackerStorage):
+def build_alert(
+    storage: SQLiteTrackerStorage,
+    *,
+    title: str = "Grab launches driver support in the Philippines",
+    url: str = "https://example.com/grab-ph",
+    snippet: str = "Grab promotes driver support and fuel subsidies.",
+):
     candidate = CandidateArticle(
         raw_article=RawArticle(
-            title="Grab launches driver support in the Philippines",
-            url="https://example.com/grab-ph",
+            title=title,
+            url=url,
             provider="google_news_rss",
             source="Example News",
             published_at="2026-05-18",
-            snippet="Grab promotes driver support and fuel subsidies.",
+            snippet=snippet,
         ),
         competitor="Grab / Move It",
         topic_group="marketing + policy narrative",
@@ -94,10 +100,49 @@ def test_telegram_sender_posts_and_marks_delivered(tmp_path):
         generated_at="2026-05-18T09:00:00Z",
     )
 
-    assert result == {"ok": True, "dry_run": False, "message_id": "777"}
+    assert result == {
+        "ok": True,
+        "dry_run": False,
+        "message_id": "777",
+        "message_ids": ["777"],
+        "messages_sent": 1,
+    }
     assert len(session.calls) == 1
     assert "sendMessage" in session.calls[0]["url"]
+    assert "🚨 Competitor Alert — Philippines" in session.calls[0]["json"]["text"]
+    assert "Конкурент: Grab / Move It" in session.calls[0]["json"]["text"]
     assert storage.has_sent_alert(alert.digest_key, "telegram", "12345") is True
+
+
+def test_telegram_sender_daily_digest_sends_alerts_as_separate_messages(tmp_path):
+    storage = SQLiteTrackerStorage(tmp_path / "tracker.db")
+    first_alert, first_schema = build_alert(storage)
+    second_alert, second_schema = build_alert(
+        storage,
+        title="Grab expands partner care in Manila",
+        url="https://example.com/grab-ph-2",
+        snippet="Grab expands partner care messaging in Manila.",
+    )
+    session = FakeSession({"ok": True, "result": {"message_id": 777}})
+    sender = TelegramSender(
+        storage=storage,
+        bot_token="token",
+        chat_id="12345",
+        session=session,
+    )
+
+    result = sender.send_daily_digest(
+        [first_schema, second_schema],
+        alerts=[first_alert, second_alert],
+        source_urls=[first_alert.candidate.url, second_alert.candidate.url],
+        generated_at="2026-05-18T09:00:00Z",
+    )
+
+    assert result["ok"] is True
+    assert result["messages_sent"] == 2
+    assert result["message_ids"] == ["777", "777"]
+    assert len(session.calls) == 2
+    assert all("🚨 Competitor Alert — Philippines" in call["json"]["text"] for call in session.calls)
 
 
 def test_telegram_sender_requires_env_or_explicit_credentials(tmp_path, monkeypatch):

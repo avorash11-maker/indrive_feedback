@@ -1,6 +1,12 @@
 import os
 
-from competitor_tracker.environment import bootstrap_env, get_env_value, get_optional_env_names
+from competitor_tracker.environment import (
+    bootstrap_env,
+    build_env_preflight_report,
+    get_env_value,
+    get_optional_env_names,
+    get_runtime_env_names,
+)
 
 
 def test_bootstrap_env_loads_nearby_dotenv_without_overriding_existing_values(
@@ -40,3 +46,57 @@ def test_get_optional_env_names_lists_canonical_keys_and_aliases():
         "COMPETITOR_TRACKER_NOTION_DATABASE_ID",
         "NOTION_DATABASE_ID",
     )
+
+
+def test_get_runtime_env_names_lists_supported_runtime_overrides():
+    names = get_runtime_env_names()
+
+    assert names["config_path"] == ("COMPETITOR_TRACKER_CONFIG_PATH",)
+    assert names["newsapi_cache_path"] == ("COMPETITOR_TRACKER_NEWSAPI_CACHE_PATH",)
+    assert names["guardian_budget_path"] == ("COMPETITOR_TRACKER_GUARDIAN_BUDGET_PATH",)
+
+
+def test_build_env_preflight_report_requires_only_selected_delivery_env(monkeypatch):
+    monkeypatch.setattr(
+        "competitor_tracker.environment.bootstrap_env",
+        lambda: "",
+    )
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    monkeypatch.delenv("NOTION_TOKEN", raising=False)
+    monkeypatch.delenv("COMPETITOR_TRACKER_NOTION_DATABASE_ID", raising=False)
+    monkeypatch.delenv("NOTION_DATABASE_ID", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    report = build_env_preflight_report(telegram_delivery=True, notion_sync=False)
+
+    assert report["ok"] is False
+    assert report["required_missing"] == [
+        {
+            "key": "telegram_bot_token",
+            "required_for": "Telegram delivery",
+            "expected_names": "TELEGRAM_BOT_TOKEN",
+        },
+        {
+            "key": "telegram_chat_id",
+            "required_for": "Telegram delivery",
+            "expected_names": "TELEGRAM_CHAT_ID",
+        },
+    ]
+
+
+def test_build_env_preflight_report_accepts_legacy_notion_fallback_with_warning(monkeypatch):
+    monkeypatch.setattr(
+        "competitor_tracker.environment.bootstrap_env",
+        lambda: "",
+    )
+    monkeypatch.setenv("NOTION_TOKEN", "token")
+    monkeypatch.delenv("COMPETITOR_TRACKER_NOTION_DATABASE_ID", raising=False)
+    monkeypatch.setenv("NOTION_DATABASE_ID", "legacy-db")
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+    report = build_env_preflight_report(notion_sync=True)
+
+    assert report["ok"] is True
+    assert any("legacy NOTION_DATABASE_ID fallback" in item for item in report["warnings"])

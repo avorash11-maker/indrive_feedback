@@ -87,6 +87,28 @@ def test_json_file_storage_saves_markdown_preview_and_csv(tmp_path):
     assert rows[0]["matched_keywords"] == "driver support | bonus"
 
 
+def test_json_file_storage_saves_candidates_with_readable_top_level_fields(tmp_path):
+    storage = JsonFileStorage(tmp_path)
+    candidate = build_candidate()
+
+    path = storage.save_candidates([candidate])
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert len(payload) == 1
+    assert payload[0]["competitor"] == "Grab"
+    assert payload[0]["topic_group"] == "driver_support"
+    assert payload[0]["title"] == "Grab launches a new driver support package in Manila"
+    assert payload[0]["url"] == "https://example.com/grab-driver-support"
+    assert payload[0]["provider"] == "google_news_rss"
+    assert payload[0]["source"] == "Example News"
+    assert payload[0]["published_at"] == "2026-05-19T08:00:00Z"
+    assert payload[0]["query"] == ""
+    assert payload[0]["raw_article"]["title"] == payload[0]["title"]
+    assert payload[0]["raw_article"]["url"] == payload[0]["url"]
+    assert payload[0]["raw_article"]["provider"] == payload[0]["provider"]
+
+
 def test_json_file_storage_keeps_run_summary_json_readable(tmp_path):
     storage = JsonFileStorage(tmp_path)
     from competitor_tracker.models import RunSummary

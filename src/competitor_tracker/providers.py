@@ -170,6 +170,30 @@ class BaseHttpProvider:
         return getattr(response, "status_code", None)
 
     @staticmethod
+    def _response_text(response: Optional[requests.Response]) -> str:
+        if response is None:
+            return ""
+        text = getattr(response, "text", None)
+        if isinstance(text, str):
+            return text
+        content = getattr(response, "content", b"")
+        if isinstance(content, bytes):
+            return content.decode("utf-8", errors="replace")
+        if isinstance(content, str):
+            return content
+        return ""
+
+    @staticmethod
+    def _response_content_type(response: Optional[requests.Response]) -> str:
+        if response is None:
+            return ""
+        headers = getattr(response, "headers", {}) or {}
+        if isinstance(headers, dict):
+            value = headers.get("Content-Type") or headers.get("content-type") or ""
+            return str(value).strip().lower()
+        return ""
+
+    @staticmethod
     def _query_diagnostic(
         *,
         provider: str,
@@ -1360,6 +1384,35 @@ class GdeltProvider(BaseHttpProvider):
         days: int,
         competitor_hints: Sequence[str],
     ) -> tuple[List[RawArticle], dict[str, object]]:
+        def _build_gdelt_diagnostic(
+            *,
+            exception: str = "",
+            status: str = "ok",
+            items_found: int = 0,
+            items_after_filter: int = 0,
+            response_body_kind: str = "",
+            response_parse_stage: str = "",
+        ) -> dict[str, object]:
+            raw_body = self._response_text(response)
+            normalized_body = raw_body.strip()
+            diagnostic = self._query_diagnostic(
+                provider=self.name,
+                query=query,
+                request_url=request_url,
+                http_status=self._http_status(response),
+                exception=exception,
+                status=status,
+                items_found=items_found,
+                items_after_filter=items_after_filter,
+            )
+            diagnostic["response_content_type"] = self._response_content_type(response)
+            diagnostic["response_body_length"] = len(raw_body.encode("utf-8", errors="replace"))
+            diagnostic["response_body_empty"] = not bool(normalized_body)
+            diagnostic["response_body_kind"] = response_body_kind
+            diagnostic["response_preview"] = clean_text(normalized_body[:240])
+            diagnostic["response_parse_stage"] = response_parse_stage
+            return diagnostic
+
         url = "https://api.gdeltproject.org/api/v2/doc/doc"
         params = {
             "query": query,
@@ -1374,7 +1427,137 @@ class GdeltProvider(BaseHttpProvider):
         try:
             response = self.session.get(url, params=params, timeout=25)
             response.raise_for_status()
-            data = response.json()
+            raw_text = self._response_text(response)
+            normalized_text = raw_text.strip()
+            content_type = self._response_content_type(response)
+            if not normalized_text:
+                diagnostic = _build_gdelt_diagnostic(
+                    exception="empty response body",
+                    status="error",
+                    response_body_kind="empty",
+                    response_parse_stage="body_validation",
+                )
+                raise ProviderError(
+                    f"Failed to fetch from gdelt for query '{query}': empty response body [{self._http_status(response)}]",
+                    diagnostics={
+                        "provider": self.name,
+                        "status": "error",
+                        "queries": [diagnostic],
+                        "items_found": 0,
+                        "items_after_filter": 0,
+                        "items_after_global_dedup": 0,
+                    },
+                )
+            if content_type and "json" not in content_type and normalized_text.startswith("<"):
+                diagnostic = _build_gdelt_diagnostic(
+                    exception="non-JSON response body",
+                    status="error",
+                    response_body_kind="html",
+                    response_parse_stage="body_validation",
+                )
+                raise ProviderError(
+                    f"Failed to fetch from gdelt for query '{query}': non-JSON response body [{self._http_status(response)}]",
+                    diagnostics={
+                        "provider": self.name,
+                        "status": "error",
+                        "queries": [diagnostic],
+                        "items_found": 0,
+                        "items_after_filter": 0,
+                        "items_after_global_dedup": 0,
+                    },
+                )
+            if normalized_text.startswith("<"):
+                diagnostic = _build_gdelt_diagnostic(
+                    exception="non-JSON response body",
+                    status="error",
+                    response_body_kind="html",
+                    response_parse_stage="body_validation",
+                )
+                raise ProviderError(
+                    f"Failed to fetch from gdelt for query '{query}': non-JSON response body [{self._http_status(response)}]",
+                    diagnostics={
+                        "provider": self.name,
+                        "status": "error",
+                        "queries": [diagnostic],
+                        "items_found": 0,
+                        "items_after_filter": 0,
+                        "items_after_global_dedup": 0,
+                    },
+                )
+            if not normalized_text.startswith(("{", "[")):
+                diagnostic = _build_gdelt_diagnostic(
+                    exception="non-JSON response body",
+                    status="error",
+                    response_body_kind="text",
+                    response_parse_stage="body_validation",
+                )
+                raise ProviderError(
+                    f"Failed to fetch from gdelt for query '{query}': non-JSON response body [{self._http_status(response)}]",
+                    diagnostics={
+                        "provider": self.name,
+                        "status": "error",
+                        "queries": [diagnostic],
+                        "items_found": 0,
+                        "items_after_filter": 0,
+                        "items_after_global_dedup": 0,
+                    },
+                )
+            try:
+                data = response.json()
+            except json.JSONDecodeError as exc:
+                diagnostic = _build_gdelt_diagnostic(
+                    exception="invalid JSON response",
+                    status="error",
+                    response_body_kind="invalid_json",
+                    response_parse_stage="json_decode",
+                )
+                raise ProviderError(
+                    f"Failed to fetch from gdelt for query '{query}': invalid JSON response [{self._http_status(response)}]",
+                    diagnostics={
+                        "provider": self.name,
+                        "status": "error",
+                        "queries": [diagnostic],
+                        "items_found": 0,
+                        "items_after_filter": 0,
+                        "items_after_global_dedup": 0,
+                    },
+                ) from exc
+            except ValueError as exc:
+                diagnostic = _build_gdelt_diagnostic(
+                    exception="invalid JSON response",
+                    status="error",
+                    response_body_kind="invalid_json",
+                    response_parse_stage="json_decode",
+                )
+                raise ProviderError(
+                    f"Failed to fetch from gdelt for query '{query}': invalid JSON response [{self._http_status(response)}]",
+                    diagnostics={
+                        "provider": self.name,
+                        "status": "error",
+                        "queries": [diagnostic],
+                        "items_found": 0,
+                        "items_after_filter": 0,
+                        "items_after_global_dedup": 0,
+                    },
+                ) from exc
+            if not isinstance(data, dict) or not isinstance(data.get("articles", []), list):
+                diagnostic = _build_gdelt_diagnostic(
+                    exception="unexpected JSON structure",
+                    status="error",
+                    response_body_kind="json",
+                    response_parse_stage="schema_validation",
+                )
+                raise ProviderError(
+                    f"Failed to fetch from gdelt for query '{query}': unexpected JSON structure [{self._http_status(response)}]",
+                    diagnostics={
+                        "provider": self.name,
+                        "status": "error",
+                        "queries": [diagnostic],
+                        "items_found": 0,
+                        "items_after_filter": 0,
+                        "items_after_global_dedup": 0,
+                    },
+                )
             found_items = list(data.get("articles", []))
             articles = [
                 self._article(
@@ -1391,23 +1574,21 @@ class GdeltProvider(BaseHttpProvider):
                 for item in found_items
                 if item.get("url")
             ]
-            diagnostic = self._query_diagnostic(
-                provider=self.name,
-                query=query,
-                request_url=request_url,
-                http_status=self._http_status(response),
+            diagnostic = _build_gdelt_diagnostic(
                 items_found=len(found_items),
                 items_after_filter=len(articles),
+                response_body_kind="json",
+                response_parse_stage="schema_validation",
             )
             return articles, diagnostic
+        except ProviderError:
+            raise
         except Exception as exc:
-            diagnostic = self._query_diagnostic(
-                provider=self.name,
-                query=query,
-                request_url=request_url,
-                http_status=self._http_status(response),
+            diagnostic = _build_gdelt_diagnostic(
                 exception=str(exc),
                 status="error",
+                response_body_kind="unknown",
+                response_parse_stage="http",
             )
             self._raise_provider_error(
                 provider=self.name,

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Iterable, List, Mapping, Optional, Sequence
 
+import httpx
 import openai
 
 from .config import TrackerConfig
@@ -41,6 +42,34 @@ NINETY_NINE_CONTEXT_PATTERN = re.compile(
 MAXIM_CONTEXT_PATTERN = re.compile(
     r"(?:\bMaxim\b(?:\W+\w+){0,3}\W+\b(taxi|service|services|app|ride|rides|driver|drivers|transport)\b)"
     r"|(?:\b(taxi|service|services|app|ride|rides|driver|drivers|transport)\b(?:\W+\w+){0,3}\W+\bMaxim\b)"
+)
+GRAB_BRAND_PATTERN = re.compile(r"\bGrab\b")
+GRAB_BRAND_CONTEXT_TOKEN_PATTERN = re.compile(
+    r"\b("
+    r"app|apps|airport|bank|banking|bonus|brand|campaign|career|commission|courier|delivery|discount|"
+    r"driver|drivers|fare|fares|feature|features|financial|fintech|fuel|graduate|graduates|launch|launches|"
+    r"launched|mobility|operations|open|opens|opened|partnership|pilot|pilots|platform|pricing|promo|"
+    r"recruitment|rider|riders|ride|rides|service|services|stake|strategic|subsidies|subscription|superapp|"
+    r"superbank|support|taxi|transport"
+    r")\b",
+    re.IGNORECASE,
+)
+GRAB_BRAND_NEAR_CONTEXT_PATTERN = re.compile(
+    r"(?:\bgrab\b(?:\W+\w+){0,4}\W+\b("
+    r"app|apps|airport|bank|banking|bonus|brand|campaign|career|commission|courier|delivery|discount|"
+    r"driver|drivers|fare|fares|feature|features|financial|fintech|fuel|graduate|graduates|launch|launches|"
+    r"launched|mobility|operations|open|opens|opened|partnership|pilot|pilots|platform|pricing|promo|"
+    r"recruitment|rider|riders|ride|rides|service|services|stake|strategic|subsidies|subscription|superapp|"
+    r"superbank|support|taxi|transport"
+    r")\b)"
+    r"|(?:\b("
+    r"app|apps|airport|bank|banking|bonus|brand|campaign|career|commission|courier|delivery|discount|"
+    r"driver|drivers|fare|fares|feature|features|financial|fintech|fuel|graduate|graduates|launch|launches|"
+    r"launched|mobility|operations|open|opens|opened|partnership|pilot|pilots|platform|pricing|promo|"
+    r"recruitment|rider|riders|ride|rides|service|services|stake|strategic|subsidies|subscription|superapp|"
+    r"superbank|support|taxi|transport"
+    r")\b(?:\W+\w+){0,4}\W+\bgrab\b)",
+    re.IGNORECASE,
 )
 
 
@@ -467,6 +496,8 @@ class CompetitorAnalyzer:
             return bool(NINETY_NINE_CONTEXT_PATTERN.search(content_casefold))
         if normalized_competitor == "maxim":
             return bool(MAXIM_CONTEXT_PATTERN.search(article_content))
+        if normalized_competitor == "grab":
+            return self._matches_grab_brand(article=article, article_content=article_content)
         if normalized_competitor in text_blob:
             return True
         if self.config is None:
@@ -475,6 +506,19 @@ class CompetitorAnalyzer:
             normalized_alias = alias.casefold()
             if normalized_alias and normalized_alias in text_blob:
                 return True
+        return False
+
+    @staticmethod
+    def _matches_grab_brand(*, article: RawArticle, article_content: str) -> bool:
+        if not GRAB_BRAND_PATTERN.search(article_content):
+            return False
+
+        if GRAB_BRAND_NEAR_CONTEXT_PATTERN.search(article_content):
+            return True
+
+        if article.competitor_hints:
+            return bool(GRAB_BRAND_NEAR_CONTEXT_PATTERN.search(article.title or ""))
+
         return False
 
     def _validate_candidate_region(
@@ -740,17 +784,27 @@ class CompetitorAlertAnalyzer:
     ) -> None:
         self.use_llm = use_llm and bool(get_env_value("OPENAI_API_KEY"))
         self.client = None
+        self._http_client: Optional[httpx.Client] = None
         self.model = model or get_env_value("OPENAI_MODEL", default="gpt-4o-mini")
         self.config = config
 
         if self.use_llm:
             try:
-                self.client = openai.OpenAI(api_key=get_env_value("OPENAI_API_KEY"))
+                # Pass an explicit httpx client to avoid OpenAI/httpx constructor
+                # mismatches in environments with httpx>=0.28.
+                self._http_client = httpx.Client(trust_env=True)
+                self.client = openai.OpenAI(
+                    api_key=get_env_value("OPENAI_API_KEY"),
+                    http_client=self._http_client,
+                )
             except Exception as exc:
                 logger.warning(
                     "Competitor alert LLM client initialization failed; using rule-based fallback. error=%s",
                     exc,
                 )
+                if self._http_client is not None:
+                    self._http_client.close()
+                    self._http_client = None
                 self.client = None
                 self.use_llm = False
 

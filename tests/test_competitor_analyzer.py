@@ -302,6 +302,99 @@ def test_prefilter_does_not_treat_maximize_as_maxim_brand():
     assert result.dropped_articles[0].reason == "no_competitor_match"
 
 
+def test_prefilter_does_not_treat_grab_verb_as_grab_brand():
+    analyzer = CompetitorAnalyzer(min_score=5, config=build_config())
+    raw_article = RawArticle(
+        title="High stakes: who’s leading the fight against Labor’s CGT reform – and what’s in it for them?",
+        url="https://example.com/cgt-reform",
+        provider="guardian",
+        source="The Guardian",
+        snippet="Tax critics turn to AI memes and airport billboards in addition to traditional lobbying tactics.",
+        query='"Grab" market expansion Southeast Asia',
+        competitor_hints=("Grab",),
+    )
+
+    result = analyzer.prefilter_raw_articles([raw_article], regions=("sea",))
+
+    assert result.candidates == []
+    assert result.dropped_count == 1
+    assert result.dropped_articles[0].reason == "no_competitor_match"
+
+
+def test_prefilter_does_not_treat_generic_grab_discount_copy_as_grab_brand():
+    analyzer = CompetitorAnalyzer(min_score=5, config=build_config())
+    raw_article = RawArticle(
+        title="How to grab discounted airport rides this summer",
+        url="https://example.com/grab-discounted-rides",
+        provider="guardian",
+        source="The Guardian",
+        snippet="Travelers can grab discounted rides and airport perks during the summer campaign.",
+        query='"Grab" pricing Southeast Asia',
+        competitor_hints=("Grab",),
+    )
+
+    result = analyzer.prefilter_raw_articles([raw_article], regions=("sea",))
+
+    assert result.candidates == []
+    assert result.dropped_count == 1
+    assert result.dropped_articles[0].reason == "no_competitor_match"
+
+
+def test_prefilter_keeps_real_grab_superbank_article():
+    analyzer = CompetitorAnalyzer(min_score=5, config=build_config())
+    raw_article = RawArticle(
+        title="Grab raises Indonesia’s Superbank stake to 16.14%",
+        url="https://example.com/grab-superbank",
+        provider="google_news_rss",
+        source="Tech in Asia",
+        snippet="Grab raises Indonesia’s Superbank stake as its financial services strategy expands.",
+        query='"Grab" launching in Indonesia',
+        competitor_hints=("Grab",),
+    )
+
+    result = analyzer.prefilter_raw_articles([raw_article], regions=("sea",))
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0].competitor == "Grab"
+    assert result.candidates[0].country_hint == "Indonesia"
+
+
+def test_prefilter_keeps_real_grab_qoo_media_article():
+    analyzer = CompetitorAnalyzer(min_score=5, config=build_config())
+    raw_article = RawArticle(
+        title="Grab Opens a Tech Career Path for Female Graduates, After Gender Gaps Persist",
+        url="https://example.com/grab-qoo-media",
+        provider="google_news_rss",
+        source="Qoo Media",
+        snippet="Grab opens a new tech career path initiative as the platform expands employer branding.",
+        query='"Grab" partnership Indonesia',
+        competitor_hints=("Grab",),
+    )
+
+    result = analyzer.prefilter_raw_articles([raw_article], regions=("sea",))
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0].competitor == "Grab"
+
+
+def test_prefilter_keeps_real_grab_driver_recruitment_article():
+    analyzer = CompetitorAnalyzer(min_score=5, config=build_config())
+    raw_article = RawArticle(
+        title="Grab launches driver recruitment campaign in Manila",
+        url="https://example.com/grab-driver-recruitment",
+        provider="google_news_rss",
+        source="Example News",
+        snippet="Grab expands its ride-hailing operations with a new driver recruitment push.",
+        query='"Grab" campaign Southeast Asia',
+        competitor_hints=("Grab",),
+    )
+
+    result = analyzer.prefilter_raw_articles([raw_article], regions=("sea",))
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0].competitor == "Grab"
+
+
 def test_prefilter_drops_ignored_geo_article_and_records_reason():
     analyzer = CompetitorAnalyzer(min_score=5, config=build_config())
     raw_article = RawArticle(
@@ -470,6 +563,35 @@ def test_competitor_alert_analyzer_uses_openai_response_shape(monkeypatch):
     assert "if the article is ambiguous, preserve the provided pipeline `competitor` and `region`" in captured["messages"][1]["content"]
     assert '"why_it_matters" should explain the strategic meaning, not just restate the article' in captured["messages"][1]["content"]
     assert '"recommended_action" should give specific next moves for inDrive' in captured["messages"][1]["content"]
+
+
+def test_competitor_alert_analyzer_initializes_openai_with_explicit_http_client(
+    monkeypatch,
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    captured = {}
+
+    class FakeHttpClient:
+        def __init__(self, **kwargs):
+            captured["httpx_kwargs"] = kwargs
+
+        def close(self):
+            captured["httpx_closed"] = True
+
+    class FakeOpenAIClient:
+        def __init__(self, **kwargs):
+            captured["openai_kwargs"] = kwargs
+
+    monkeypatch.setattr("competitor_tracker.analyzer.httpx.Client", FakeHttpClient)
+    monkeypatch.setattr("competitor_tracker.analyzer.openai.OpenAI", FakeOpenAIClient)
+
+    analyzer = CompetitorAlertAnalyzer(use_llm=True, config=build_config())
+
+    assert analyzer.use_llm is True
+    assert isinstance(analyzer.client, FakeOpenAIClient)
+    assert captured["httpx_kwargs"] == {"trust_env": True}
+    assert captured["openai_kwargs"]["api_key"] == "test-key"
+    assert isinstance(captured["openai_kwargs"]["http_client"], FakeHttpClient)
 
 
 def test_competitor_alert_analyzer_skips_llm_when_article_body_is_unavailable():

@@ -146,6 +146,98 @@ def test_digest_limit_and_suppression_of_sent_and_similar_alerts(tmp_path):
     assert digest.alerts[0].headline == "Gojek: Gojek expands courier rewards in Indonesia"
 
 
+def test_digest_history_suppression_ignores_dry_run_only_delivery_history(tmp_path):
+    storage = SQLiteTrackerStorage(tmp_path / "tracker.db")
+    historical = build_candidate(
+        title="Grab launches driver support in the Philippines",
+        url="https://example.com/grab-historical",
+        competitor="Grab",
+        topic_group="product_launch",
+        score=8,
+        published_at="2026-05-17",
+        country_hint="Philippines",
+    ).to_alert()
+    storage.insert_alert(historical)
+    storage.log_delivery(
+        DeliveryRecord(
+            alert_key=historical.digest_key,
+            channel="telegram",
+            status="dry_run",
+            destination="chat-1",
+        )
+    )
+
+    rerun_candidate = build_candidate(
+        title="Grab launches driver support program in the Philippines | Another Publisher",
+        url="https://example.com/grab-similar",
+        competitor="Grab",
+        topic_group="product_launch",
+        score=9,
+        published_at="2026-05-18",
+        country_hint="Philippines",
+    )
+
+    digest = DigestBuilder().build(
+        competitors=["Grab"],
+        candidates=[rerun_candidate],
+        regions=["sea"],
+        digest_limit=5,
+        storage=storage,
+        delivery_channel="telegram",
+        delivery_destination="chat-1",
+    )
+
+    assert len(digest.alerts) == 1
+    assert digest.alerts[0].headline == (
+        "Grab: Grab launches driver support program in the Philippines | Another Publisher"
+    )
+
+
+def test_digest_history_suppression_ignores_deliveries_for_other_destination(tmp_path):
+    storage = SQLiteTrackerStorage(tmp_path / "tracker.db")
+    historical = build_candidate(
+        title="Grab launches driver support in the Philippines",
+        url="https://example.com/grab-historical",
+        competitor="Grab",
+        topic_group="product_launch",
+        score=8,
+        published_at="2026-05-17",
+        country_hint="Philippines",
+    ).to_alert()
+    storage.insert_alert(historical)
+    storage.mark_delivered(
+        alert_key=historical.digest_key,
+        channel="telegram",
+        delivered_at="2026-05-17T09:00:00Z",
+        destination="chat-1",
+    )
+
+    rerun_candidate = build_candidate(
+        title="Grab launches driver support program in the Philippines | Another Publisher",
+        url="https://example.com/grab-similar",
+        competitor="Grab",
+        topic_group="product_launch",
+        score=9,
+        published_at="2026-05-18",
+        country_hint="Philippines",
+    )
+
+    digest = DigestBuilder().build(
+        competitors=["Grab"],
+        candidates=[rerun_candidate],
+        regions=["sea"],
+        digest_limit=5,
+        storage=storage,
+        delivery_channel="telegram",
+        delivery_destination="chat-2",
+    )
+
+    assert len(digest.alerts) == 1
+    assert digest.alerts[0].headline == (
+        "Grab: Grab launches driver support program in the Philippines | Another Publisher"
+    )
+
+
 def test_digest_ranking_prefers_resolved_publication_date_from_schema():
     builder = DigestBuilder()
     missing_provider_date = build_candidate(

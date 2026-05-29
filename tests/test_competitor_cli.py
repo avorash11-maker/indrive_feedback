@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from competitor_tracker import cli
 
 
@@ -160,6 +162,44 @@ def test_cli_test_provider_prints_structured_diagnostics(monkeypatch, capsys):
     assert '"status": "error"' in output
 
 
+def test_test_provider_marks_skipped_provider_as_not_ok_with_warning(monkeypatch):
+    class FakeSkippedProvider:
+        name = "guardian"
+
+        def fetch_with_diagnostics(self, request):
+            return [], {
+                "provider": self.name,
+                "status": "skipped",
+                "queries": [
+                    {
+                        "provider": self.name,
+                        "query": "guardian-content-api",
+                        "request_url": "https://content.guardianapis.com/search",
+                        "http_status": None,
+                        "exception": "GUARDIAN_API_KEY is missing; Guardian provider skipped.",
+                        "items_found": 0,
+                        "items_after_filter": 0,
+                        "status": "skipped",
+                    }
+                ],
+                "items_found": 0,
+                "items_after_filter": 0,
+                "items_after_global_dedup": 0,
+            }
+
+    monkeypatch.setattr(cli, "build_providers", lambda names: [FakeSkippedProvider()])
+
+    result = cli.test_provider(
+        provider_name="guardian",
+        queries=["inDrive"],
+        days=7,
+    )
+
+    assert result["ok"] is False
+    assert result["skipped"] is True
+    assert result["warning"] == "GUARDIAN_API_KEY is missing; Guardian provider skipped."
+
+
 def test_cli_qa_feeds_prints_stored_feed_health_report(monkeypatch, capsys):
     monkeypatch.setattr(
         cli,
@@ -178,3 +218,62 @@ def test_cli_qa_feeds_prints_stored_feed_health_report(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert '"days": 14' in output
     assert '"feed_name": "MercoPress"' in output
+
+
+def test_cli_preflight_prints_readiness_report(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "run_preflight",
+        lambda **kwargs: {
+            "ok": True,
+            "mode": kwargs["mode"],
+            "required_missing": [],
+            "warnings": [],
+            "checks": [],
+        },
+    )
+
+    cli.main(["preflight", "--mode", "local-dry-run"])
+
+    output = capsys.readouterr().out
+    assert '"ok": true' in output
+    assert '"mode": "local-dry-run"' in output
+
+
+def test_cli_preflight_exits_non_zero_when_env_is_not_ready(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "run_preflight",
+        lambda **kwargs: {
+            "ok": False,
+            "mode": kwargs["mode"],
+            "required_missing": [{"key": "telegram_bot_token"}],
+            "warnings": [],
+            "checks": [],
+        },
+    )
+
+    with pytest.raises(SystemExit, match="1"):
+        cli.main(["preflight", "--mode", "github-actions-production"])
+
+    output = capsys.readouterr().out
+    assert '"telegram_bot_token"' in output
+
+
+def test_cli_fail_fast_for_real_telegram_delivery_when_env_is_missing(monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "build_env_preflight_report",
+        lambda **kwargs: {
+            "ok": False,
+            "required_missing": [
+                {
+                    "expected_names": "TELEGRAM_BOT_TOKEN",
+                    "required_for": "Telegram delivery",
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(ValueError, match="TELEGRAM_BOT_TOKEN required for Telegram delivery"):
+        cli.main(["send-digest"])

@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 import pytest
@@ -26,17 +27,31 @@ class FakeResponse:
         content: bytes = b"",
         payload: dict | None = None,
         status_code: int = 200,
+        headers: dict | None = None,
+        json_error: Exception | None = None,
     ) -> None:
         self.content = content
         self._payload = payload or {}
         self.status_code = status_code
+        self.headers = headers or {}
+        self._json_error = json_error
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             raise RuntimeError(f"http {self.status_code}")
 
     def json(self) -> dict:
+        if self._json_error is not None:
+            raise self._json_error
         return self._payload
+
+    @property
+    def text(self) -> str:
+        if self.content:
+            return self.content.decode("utf-8", errors="replace")
+        if self._payload:
+            return json.dumps(self._payload)
+        return self.content.decode("utf-8", errors="replace")
 
 
 class FakeSession:
@@ -125,7 +140,17 @@ def test_gdelt_provider_fetches_raw_articles():
             }
         ]
     }
-    provider = GdeltProvider(session=FakeSession([FakeResponse(payload=payload)]))
+    provider = GdeltProvider(
+        session=FakeSession(
+            [
+                FakeResponse(
+                    payload=payload,
+                    content=b'{"articles":[{"title":"Bolt expands courier partnership in Kenya"}]}',
+                    headers={"Content-Type": "application/json"},
+                )
+            ]
+        )
+    )
 
     articles, diagnostics = provider.fetch_with_diagnostics(
         ProviderRequest(
@@ -142,6 +167,182 @@ def test_gdelt_provider_fetches_raw_articles():
     assert diagnostics["items_found"] == 1
     assert diagnostics["items_after_filter"] == 1
     assert "api.gdeltproject.org" in diagnostics["queries"][0]["request_url"]
+    assert diagnostics["queries"][0]["http_status"] == 200
+    assert diagnostics["queries"][0]["response_content_type"] == "application/json"
+    assert diagnostics["queries"][0]["response_body_empty"] is False
+    assert diagnostics["queries"][0]["response_body_kind"] == "json"
+    assert diagnostics["queries"][0]["response_parse_stage"] == "schema_validation"
+
+
+def test_gdelt_provider_surfaces_empty_response_body():
+    provider = GdeltProvider(
+        session=FakeSession(
+            [
+                FakeResponse(
+                    content=b"",
+                    payload={},
+                    headers={"Content-Type": "application/json"},
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(ProviderError, match="empty response body") as exc_info:
+        provider.fetch(
+            ProviderRequest(
+                competitors=("Bolt",),
+                days=7,
+                queries=['"Bolt" partnership Kenya'],
+            )
+        )
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics["status"] == "error"
+    assert diagnostics["queries"][0]["http_status"] == 200
+    assert "api.gdeltproject.org" in diagnostics["queries"][0]["request_url"]
+    assert diagnostics["queries"][0]["exception"] == "empty response body"
+    assert diagnostics["queries"][0]["response_content_type"] == "application/json"
+    assert diagnostics["queries"][0]["response_body_empty"] is True
+    assert diagnostics["queries"][0]["response_body_length"] == 0
+    assert diagnostics["queries"][0]["response_body_kind"] == "empty"
+    assert diagnostics["queries"][0]["response_parse_stage"] == "body_validation"
+    assert diagnostics["queries"][0]["response_preview"] == ""
+
+
+def test_gdelt_provider_surfaces_invalid_json_response():
+    provider = GdeltProvider(
+        session=FakeSession(
+            [
+                FakeResponse(
+                    content=b'{"articles": [}',
+                    payload={},
+                    headers={"Content-Type": "application/json"},
+                    json_error=json.JSONDecodeError("Expecting value", '{"articles": [}', 14),
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(ProviderError, match="invalid JSON response") as exc_info:
+        provider.fetch(
+            ProviderRequest(
+                competitors=("Bolt",),
+                days=7,
+                queries=['"Bolt" partnership Kenya'],
+            )
+        )
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics["status"] == "error"
+    assert diagnostics["queries"][0]["http_status"] == 200
+    assert "api.gdeltproject.org" in diagnostics["queries"][0]["request_url"]
+    assert diagnostics["queries"][0]["exception"] == "invalid JSON response"
+    assert diagnostics["queries"][0]["response_content_type"] == "application/json"
+    assert diagnostics["queries"][0]["response_body_empty"] is False
+    assert diagnostics["queries"][0]["response_body_kind"] == "invalid_json"
+    assert diagnostics["queries"][0]["response_parse_stage"] == "json_decode"
+    assert '{"articles": [}' in diagnostics["queries"][0]["response_preview"]
+
+
+def test_gdelt_provider_surfaces_non_json_text_response():
+    provider = GdeltProvider(
+        session=FakeSession(
+            [
+                FakeResponse(
+                    content=b"The specified phrase is too short.",
+                    payload={},
+                    json_error=ValueError("not json"),
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(ProviderError, match="non-JSON response body") as exc_info:
+        provider.fetch(
+            ProviderRequest(
+                competitors=("Bolt",),
+                days=7,
+                queries=['"Bolt" partnership Kenya'],
+            )
+        )
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics["status"] == "error"
+    assert diagnostics["queries"][0]["http_status"] == 200
+    assert "api.gdeltproject.org" in diagnostics["queries"][0]["request_url"]
+    assert diagnostics["queries"][0]["exception"] == "non-JSON response body"
+    assert diagnostics["queries"][0]["response_content_type"] == ""
+    assert diagnostics["queries"][0]["response_body_empty"] is False
+    assert diagnostics["queries"][0]["response_body_kind"] == "text"
+    assert diagnostics["queries"][0]["response_parse_stage"] == "body_validation"
+    assert "The specified phrase is too short." in diagnostics["queries"][0]["response_preview"]
+
+
+def test_gdelt_provider_surfaces_non_json_html_response():
+    provider = GdeltProvider(
+        session=FakeSession(
+            [
+                FakeResponse(
+                    content=b"<html><body>temporary upstream page</body></html>",
+                    payload={},
+                    headers={"Content-Type": "text/html"},
+                    json_error=ValueError("not json"),
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(ProviderError, match="non-JSON response body") as exc_info:
+        provider.fetch(
+            ProviderRequest(
+                competitors=("Bolt",),
+                days=7,
+                queries=['"Bolt" partnership Kenya'],
+            )
+        )
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics["queries"][0]["http_status"] == 200
+    assert "api.gdeltproject.org" in diagnostics["queries"][0]["request_url"]
+    assert diagnostics["queries"][0]["exception"] == "non-JSON response body"
+    assert diagnostics["queries"][0]["response_body_empty"] is False
+    assert diagnostics["queries"][0]["response_body_kind"] == "html"
+    assert diagnostics["queries"][0]["response_content_type"] == "text/html"
+    assert diagnostics["queries"][0]["response_parse_stage"] == "body_validation"
+    assert "temporary upstream page" in diagnostics["queries"][0]["response_preview"]
+
+
+def test_gdelt_provider_surfaces_unexpected_json_structure():
+    provider = GdeltProvider(
+        session=FakeSession(
+            [
+                FakeResponse(
+                    content=b'{"articles": {}}',
+                    payload={"articles": {}},
+                    headers={"Content-Type": "application/json"},
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(ProviderError, match="unexpected JSON structure") as exc_info:
+        provider.fetch(
+            ProviderRequest(
+                competitors=("Bolt",),
+                days=7,
+                queries=['"Bolt" partnership Kenya'],
+            )
+        )
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics["queries"][0]["http_status"] == 200
+    assert "api.gdeltproject.org" in diagnostics["queries"][0]["request_url"]
+    assert diagnostics["queries"][0]["exception"] == "unexpected JSON structure"
+    assert diagnostics["queries"][0]["response_content_type"] == "application/json"
+    assert diagnostics["queries"][0]["response_body_empty"] is False
+    assert diagnostics["queries"][0]["response_body_kind"] == "json"
+    assert diagnostics["queries"][0]["response_parse_stage"] == "schema_validation"
+    assert '{"articles": {}}' in diagnostics["queries"][0]["response_preview"]
 
 
 def test_newsapi_provider_fetches_raw_articles(tmp_path, monkeypatch):

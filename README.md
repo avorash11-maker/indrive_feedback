@@ -190,6 +190,7 @@ The new CLI supports:
 - `backfill`
 - `test-provider`
 - `qa-feeds`
+- `preflight`
 
 Examples:
 
@@ -200,6 +201,8 @@ Examples:
 .\.venv\Scripts\competitor-tracker backfill --days 30 --region sea --export-csv
 .\.venv\Scripts\competitor-tracker test-provider --provider google_news_rss --query "Grab launch Philippines"
 .\.venv\Scripts\competitor-tracker qa-feeds --days 30 --min-feed-items 5 --limit 15
+.\.venv\Scripts\competitor-tracker preflight --mode local-dry-run
+.\.venv\Scripts\competitor-tracker preflight --mode github-actions-production
 ```
 
 `test-provider` is the fastest way to separate `no data` from `provider/network/parser` failures during live ingestion checks. It prints structured JSON diagnostics with:
@@ -223,6 +226,8 @@ Examples:
 - which feeds should be reviewed or removed from the whitelist
 
 For quick local automation you can also run [qa_competitor_feeds.py](/abs/path/C:/Users/shar0/Desktop/indrive_feedback/scripts/qa_competitor_feeds.py).
+
+`preflight` is a safe readiness check. It inspects local env presence for the selected mode, prints JSON, and never sends a Telegram message or calls the Notion API.
 
 ## Configuration
 
@@ -298,6 +303,10 @@ COMPETITOR_TRACKER_GUARDIAN_DAILY_REQUEST_LIMIT=450
 COMPETITOR_TRACKER_GUARDIAN_CACHE_TTL_SECONDS=900
 COMPETITOR_TRACKER_GUARDIAN_COOLDOWN_SECONDS=900
 COMPETITOR_TRACKER_HISTORICAL_PRECISION_HALF_LIFE_DAYS=30
+COMPETITOR_TRACKER_NEWSAPI_CACHE_PATH=
+COMPETITOR_TRACKER_NEWSAPI_BUDGET_PATH=
+COMPETITOR_TRACKER_GUARDIAN_CACHE_PATH=
+COMPETITOR_TRACKER_GUARDIAN_BUDGET_PATH=
 GUARDIAN_API_KEY=
 
 TELEGRAM_BOT_TOKEN=
@@ -308,17 +317,51 @@ NOTION_DATABASE_ID=
 COMPETITOR_TRACKER_NOTION_DATABASE_ID=
 ```
 
+## Env Contract
+
+Primary production delivery path:
+
+- Real Telegram delivery requires `TELEGRAM_BOT_TOKEN`
+- Real Telegram delivery requires `TELEGRAM_CHAT_ID`
+
+Optional integrations and features:
+
+- `NOTION_TOKEN` is required only when you explicitly enable real Notion sync
+- `COMPETITOR_TRACKER_NOTION_DATABASE_ID` is required only when you explicitly enable real Notion sync
+- `NOTION_DATABASE_ID` is accepted only as a legacy fallback for Notion
+- `OPENAI_API_KEY` is required only when you want LLM-generated alert narratives
+- `GUARDIAN_API_KEY` is optional and only activates Guardian ingestion when present
+- `NEWS_API_KEY` is optional and mainly used for `test-provider` or explicit NewsAPI opt-in runs
+
+Safe preflight checks:
+
+- Local dry-run readiness:
+  `competitor-tracker preflight --mode local-dry-run`
+- Telegram production readiness:
+  `competitor-tracker preflight --mode telegram-delivery`
+- Notion mirror readiness:
+  `competitor-tracker preflight --mode notion-sync`
+- GitHub Actions production readiness:
+  `competitor-tracker preflight --mode github-actions-production`
+
+Important behavior:
+
+- `dry-run` can run without Telegram secrets because it does not send a message
+- explicit real Telegram delivery fails fast when `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` is missing
+- explicit real Notion sync fails fast when `NOTION_TOKEN` or the competitor tracker Notion database id is missing
+- missing Notion secrets never block the Telegram-only release path unless you explicitly request Notion sync
+
 NewsAPI is now treated as an opt-in provider for full pipeline runs. By default, the repository config uses `gdelt`, `google_news_rss`, and a curated `regional_rss` tier, while `newsapi` remains available for `test-provider` and manual diagnostics. If you explicitly enable NewsAPI for a full run, the tracker applies a local query cap, daily request budget, TTL cache, and cooldown after `429 rateLimited` responses.
 
 `competitor_tracker` now loads `.env` automatically, so the CLI reads keys from one place without manual shell export. Canonical names are:
 
-- `OPENAI_API_KEY`
-- `NEWS_API_KEY`
-- `GUARDIAN_API_KEY`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
+- `OPENAI_API_KEY`
 - `NOTION_TOKEN`
 - `COMPETITOR_TRACKER_NOTION_DATABASE_ID`
+- `GUARDIAN_API_KEY`
+- `NEWS_API_KEY`
 
 `NOTION_DATABASE_ID` is still accepted only as a legacy fallback.
 
@@ -384,6 +427,8 @@ Important QA detail:
 
 Telegram is the main delivery channel for the MVP.
 
+- sends one separate Telegram message per alert instead of one combined digest wall
+- keeps user-facing Telegram cards in Russian with a fixed operator-friendly structure
 - supports `dry-run`
 - logs delivery history into `SQLite`
 - enables suppression of already sent alerts
@@ -440,17 +485,19 @@ It supports:
 - secrets for Telegram / Notion / OpenAI
 - artifact upload from `output/competitor_tracker/`
 
-Required GitHub Secrets for scheduled production delivery:
+Required GitHub Secrets for scheduled production Telegram delivery:
 
-- `OPENAI_API_KEY`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
 Optional GitHub Secrets:
 
+- `OPENAI_API_KEY`
 - `NOTION_TOKEN`
 - `COMPETITOR_TRACKER_NOTION_DATABASE_ID`
 - `NOTION_DATABASE_ID`
+- `GUARDIAN_API_KEY`
+- `NEWS_API_KEY`
 
 Behavior:
 

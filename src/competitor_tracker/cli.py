@@ -20,7 +20,7 @@ from .analyzer import (
 )
 from .config import TrackerConfig, TrackerRuntimeConfig
 from .digest import DigestBuilder
-from .environment import get_env_value
+from .environment import build_env_preflight_report, get_env_value
 from .geo_policy import GeoPolicy
 from .models import CompetitorDigest, RunSummary
 from .normalization import (
@@ -41,7 +41,7 @@ from .providers import (
 from .storage import JsonFileStorage, SQLiteTrackerStorage
 from .telegram_sender import TelegramSender
 
-COMMAND_NAMES = {"run", "dry-run", "send-digest", "sync-notion", "backfill", "test-provider", "qa-feeds"}
+COMMAND_NAMES = {"run", "dry-run", "send-digest", "sync-notion", "backfill", "test-provider", "qa-feeds", "preflight"}
 MAX_ARTICLE_AGE_DAYS = 7
 HIGH_SIGNAL_SCORE_THRESHOLD = 7
 logger = logging.getLogger(__name__)
@@ -383,6 +383,83 @@ def run_feed_qa(
     return report
 
 
+def run_preflight(
+    *,
+    mode: str,
+    require_openai: bool = False,
+) -> dict[str, object]:
+    """Check local env readiness for a selected operating mode without external side effects."""
+
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode == "local-dry-run":
+        return {
+            "mode": normalized_mode,
+            **build_env_preflight_report(
+                telegram_delivery=False,
+                notion_sync=False,
+                require_openai=require_openai,
+            ),
+        }
+    if normalized_mode == "telegram-delivery":
+        return {
+            "mode": normalized_mode,
+            **build_env_preflight_report(
+                telegram_delivery=True,
+                notion_sync=False,
+                require_openai=require_openai,
+            ),
+        }
+    if normalized_mode == "notion-sync":
+        return {
+            "mode": normalized_mode,
+            **build_env_preflight_report(
+                telegram_delivery=False,
+                notion_sync=True,
+                require_openai=require_openai,
+            ),
+        }
+    if normalized_mode == "github-actions-production":
+        return {
+            "mode": normalized_mode,
+            **build_env_preflight_report(
+                telegram_delivery=True,
+                notion_sync=False,
+                require_openai=require_openai,
+            ),
+        }
+    raise ValueError(
+        "Unsupported preflight mode. Use one of: "
+        "local-dry-run, telegram-delivery, notion-sync, github-actions-production."
+    )
+
+
+def _ensure_requested_delivery_readiness(
+    *,
+    telegram_mode: Optional[str],
+    notion_mode: Optional[str],
+    require_openai: bool = False,
+) -> None:
+    """Fail fast only for explicitly requested real delivery modes."""
+
+    report = build_env_preflight_report(
+        telegram_delivery=telegram_mode == "send",
+        notion_sync=notion_mode == "sync",
+        require_openai=require_openai,
+    )
+    if report.get("ok"):
+        return
+    missing_rows = report.get("required_missing", [])
+    parts = []
+    for item in missing_rows:
+        if not isinstance(item, dict):
+            continue
+        parts.append(
+            f"{item.get('expected_names', '')} required for {item.get('required_for', 'selected mode')}"
+        )
+    joined = "; ".join(part for part in parts if part)
+    raise ValueError(f"Environment is not ready for the selected mode: {joined}")
+
+
 def _configure_runtime_providers(
     providers: Sequence[Provider],
     *,
@@ -552,6 +629,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=20,
         help="Maximum number of feeds to return in the QA report.",
+    )
+
+    preflight_parser = subparsers.add_parser(
+        "preflight",
+        help="Check local env readiness for a selected mode without sending anything.",
+    )
+    preflight_parser.add_argument(
+        "--mode",
+        choices=(
+            "local-dry-run",
+            "telegram-delivery",
+            "notion-sync",
+            "github-actions-production",
+        ),
+        default="local-dry-run",
+        help="Readiness mode to validate.",
+    )
+    preflight_parser.add_argument(
+        "--require-openai",
+        action="store_true",
+        help="Treat OPENAI_API_KEY as required for this readiness check.",
     )
 
     return parser
@@ -838,14 +936,29 @@ def test_provider(
                 "items_after_global_dedup": len(articles),
             }
         diagnostics["items_after_global_dedup"] = len(deduplicate_raw_articles(articles))
+        provider_status = str(diagnostics.get("status") or "").strip().lower()
+        skipped = provider_status == "skipped"
+        query_rows = diagnostics.get("queries")
+        if not isinstance(query_rows, list):
+            query_rows = []
+        skip_reason = ""
+        if skipped:
+            for item in query_rows:
+                if not isinstance(item, dict):
+                    continue
+                skip_reason = str(item.get("exception") or "").strip()
+                if skip_reason:
+                    break
         return {
-            "ok": True,
+            "ok": not skipped,
+            "skipped": skipped,
             "provider": provider.name,
             "query_count": len(queries),
             "raw_articles_fetched": len(articles),
             "raw_articles_after_global_dedup": diagnostics["items_after_global_dedup"],
             "diagnostics": diagnostics,
             "sample_urls": [article.url for article in articles[:5]],
+            **({"warning": skip_reason} if skipped and skip_reason else {}),
         }
     except ProviderError as exc:
         diagnostics = (
@@ -1511,17 +1624,6 @@ def run_pipeline(
             article_contexts,
             telegram_top_n=effective_telegram_top_n,
         )
-        if telegram_mode == "send":
-            for alert in digest.alerts:
-                sqlite_storage.mark_deferred(
-                    alert_key=alert.digest_key,
-                    channel="telegram",
-                    destination=get_env_value("TELEGRAM_CHAT_ID"),
-                    metadata={
-                        "mode": "daily_digest",
-                        "generated_at": digest.generated_at,
-                    },
-                )
         sender = TelegramSender(
             storage=sqlite_storage,
             dry_run=telegram_mode == "dry",
@@ -1532,6 +1634,18 @@ def run_pipeline(
             source_urls=[alert.candidate.url for alert in telegram_alerts],
             generated_at=digest.generated_at,
         )
+        if telegram_mode == "send":
+            deferred_alerts = list(digest.alerts[len(telegram_alerts) :])
+            for alert in deferred_alerts:
+                sqlite_storage.mark_deferred(
+                    alert_key=alert.digest_key,
+                    channel="telegram",
+                    destination=get_env_value("TELEGRAM_CHAT_ID"),
+                    metadata={
+                        "mode": "daily_digest",
+                        "generated_at": digest.generated_at,
+                    },
+                )
     elif telegram_mode in {"dry", "send"}:
         telegram_result = {
             "ok": True,
@@ -1692,6 +1806,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
+    elif command == "preflight":
+        result = run_preflight(
+            mode=args.mode,
+            require_openai=args.require_openai,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if not result.get("ok"):
+            raise SystemExit(1)
+        return
+
+    _ensure_requested_delivery_readiness(
+        telegram_mode=telegram_mode,
+        notion_mode=notion_mode,
+        require_openai=False,
+    )
 
     result = run_pipeline(
         days=args.days,

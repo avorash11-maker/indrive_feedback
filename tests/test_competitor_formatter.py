@@ -36,7 +36,7 @@ def test_build_alert_headline_prefers_country():
 
     headline = build_alert_headline(alert)
 
-    assert headline == "Competitor Alert — Philippines"
+    assert headline == "🚨 Competitor Alert — Philippines"
 
 
 def test_format_alert_card_matches_brief_sections():
@@ -50,26 +50,26 @@ def test_format_alert_card_matches_brief_sections():
         ),
     )
 
-    assert "Competitor Alert — Philippines" in card
-    assert "Competitor: Grab / Move It" in card
-    assert "Event/Topic: Marketing + Policy Narrative" in card
-    assert "Priority: MEDIUM" in card
-    assert "What happened:" in card
-    assert "Where: Philippines" in card
-    assert "Source link:" in card
-    assert "Why it matters:" in card
-    assert "Potential impact:" in card
-    assert "What to do:" in card
-    assert card.index("Competitor: Grab / Move It") < card.index("Event/Topic: Marketing + Policy Narrative")
-    assert card.index("Event/Topic: Marketing + Policy Narrative") < card.index("Priority: MEDIUM")
-    assert card.index("Priority: MEDIUM") < card.index("What happened:")
-    assert card.index("What happened:") < card.index("Where: Philippines")
-    assert card.index("Where: Philippines") < card.index("Source link:")
-    assert card.index("Source link:") < card.index("Why it matters:")
-    assert card.index("Why it matters:") < card.index("Potential impact:")
-    assert card.index("Potential impact:") < card.index("What to do:")
-    assert "\n\nWhat happened:\n" in card
-    assert "\n\nSource link:\n" in card
+    assert "🚨 Competitor Alert — Philippines" in card
+    assert "Конкурент: Grab / Move It" in card
+    assert "Событие: Marketing + Policy Narrative" in card
+    assert "Приоритет: MEDIUM" in card
+    assert "Что произошло:" in card
+    assert "Где: Philippines" in card
+    assert "Источник:" in card
+    assert "Почему это важно:" in card
+    assert "Потенциальное влияние:" in card
+    assert "Что делать:" in card
+    assert card.index("Конкурент: Grab / Move It") < card.index("Событие: Marketing + Policy Narrative")
+    assert card.index("Событие: Marketing + Policy Narrative") < card.index("Приоритет: MEDIUM")
+    assert card.index("Приоритет: MEDIUM") < card.index("Что произошло:")
+    assert card.index("Что произошло:") < card.index("Где: Philippines")
+    assert card.index("Где: Philippines") < card.index("Источник:")
+    assert card.index("Источник:") < card.index("Почему это важно:")
+    assert card.index("Почему это важно:") < card.index("Потенциальное влияние:")
+    assert card.index("Потенциальное влияние:") < card.index("Что делать:")
+    assert "\n\nЧто произошло:\n" in card
+    assert "\n\nИсточник:\n" in card
 
 
 def test_format_daily_digest_renders_local_digest_view():
@@ -85,8 +85,8 @@ def test_format_daily_digest_renders_local_digest_view():
     assert "Competitor Daily Digest — Morning" in digest
     assert "Generated at: 2026-05-18T09:00:00Z" in digest
     assert "Alerts: 1" in digest
-    assert "1. Competitor Alert — Philippines" in digest
-    assert "Source link:\nhttps://example.com/grab-ph" in digest
+    assert "1. 🚨 Competitor Alert — Philippines" in digest
+    assert "Источник:\nhttps://example.com/grab-ph" in digest
 
 
 def test_format_daily_digest_handles_empty_alerts():
@@ -120,6 +120,6 @@ def test_format_alert_card_uses_business_region_name_when_country_is_missing():
 
     card = format_alert_card(alert, source_url="https://example.com/careem-mea")
 
-    assert "Where: Africa & MEA" in card
-    assert "Competitor Alert — Africa & MEA" in card
-    assert "Source link:\nhttps://example.com/careem-mea" in card
+    assert "Где: Africa & MEA" in card
+    assert "🚨 Competitor Alert — Africa & MEA" in card
+    assert "Источник:\nhttps://example.com/careem-mea" in card

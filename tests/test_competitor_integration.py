@@ -389,7 +389,9 @@ def test_run_summary_uses_consistent_utc_timestamps_in_json_and_sqlite(
     assert finished_at > started_at
 
 
-def test_duplicate_suppression_across_runs_uses_sqlite_history(tmp_path, monkeypatch):
+def test_duplicate_suppression_across_runs_does_not_use_non_delivered_history(
+    tmp_path, monkeypatch
+):
     config = build_config()
     patch_runtime(monkeypatch, tmp_path, config)
     shared_articles = [
@@ -405,7 +407,7 @@ def test_duplicate_suppression_across_runs_uses_sqlite_history(tmp_path, monkeyp
     second = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
 
     assert len(first["digest"].alerts) == 1
-    assert len(second["digest"].alerts) == 0
+    assert len(second["digest"].alerts) == 1
 
 
 def test_run_pipeline_persists_rss_feed_metrics_for_later_qa(tmp_path, monkeypatch):
@@ -524,6 +526,43 @@ def test_pipeline_filters_out_grab_article_from_usa_even_when_found_by_sea_query
     assert dropped_payload[0]["details"]["ignored_geo_terms"] == "USA | United States"
     summary_payload = json.loads(result["summary_path"].read_text(encoding="utf-8"))
     assert summary_payload["drop_reasons"] == {"ignored_geo_without_target_confirmation": 1}
+
+
+def test_run_pipeline_filters_guardian_grab_false_positive_without_brand_context(
+    tmp_path, monkeypatch
+):
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config)
+    providers = [
+        StaticProvider(
+            "guardian",
+            [
+                RawArticle(
+                    title="High stakes: who’s leading the fight against Labor’s CGT reform – and what’s in it for them?",
+                    url="https://example.com/cgt-reform",
+                    provider="guardian",
+                    source="The Guardian",
+                    published_at="2026-05-19T09:00:00Z",
+                    snippet=(
+                        "Tax critics turn to AI memes and airport billboards in addition to traditional lobbying tactics."
+                    ),
+                    query='"Grab" market expansion Southeast Asia',
+                    region=None,
+                    language="en",
+                    competitor_hints=("Grab",),
+                    metadata={"source_tier": "tier2_direct"},
+                )
+            ],
+        )
+    ]
+    monkeypatch.setattr(cli, "build_providers", lambda names: providers)
+
+    result = cli.run_pipeline(days=7, min_score=5, regions=["sea"])
+
+    assert result["digest"].alerts == ()
+    assert result["analysis"].candidates == []
+    assert result["analysis"].dropped_count == 1
+    assert result["analysis"].dropped_articles[0].reason == "no_competitor_match"
 
 
 def test_already_sent_suppression_filters_next_run(tmp_path, monkeypatch):
@@ -794,7 +833,7 @@ def test_run_pipeline_falls_back_to_candidate_truth_layer_on_bad_llm_geo_output(
             return self.extract(candidate)
 
     class FakeOpenAIClient:
-        def __init__(self, api_key=None):
+        def __init__(self, api_key=None, http_client=None):
             self.chat = type(
                 "ChatNamespace",
                 (),
@@ -1006,7 +1045,7 @@ def test_run_pipeline_llm_enriches_only_top_n_with_extended_article_context(
             )
 
     class FakeOpenAIClient:
-        def __init__(self, api_key=None):
+        def __init__(self, api_key=None, http_client=None):
             self.chat = type(
                 "ChatNamespace",
                 (),
@@ -1127,7 +1166,7 @@ def test_run_pipeline_invalid_llm_json_falls_back_to_rule_based_alert(
             return self.extract(candidate)
 
     class FakeOpenAIClient:
-        def __init__(self, api_key=None):
+        def __init__(self, api_key=None, http_client=None):
             self.chat = type(
                 "ChatNamespace",
                 (),
@@ -1226,7 +1265,7 @@ def test_run_pipeline_no_body_context_uses_insufficient_source_fallback(
             return self.extract(candidate)
 
     class FakeOpenAIClient:
-        def __init__(self, api_key=None):
+        def __init__(self, api_key=None, http_client=None):
             self.chat = type(
                 "ChatNamespace",
                 (),
@@ -1310,7 +1349,7 @@ def test_telegram_delivery_uses_enriched_alert_cards_from_llm_output(
             return self.extract(candidate)
 
     class FakeOpenAIClient:
-        def __init__(self, api_key=None):
+        def __init__(self, api_key=None, http_client=None):
             self.chat = type(
                 "ChatNamespace",
                 (),
@@ -1480,7 +1519,7 @@ def test_run_pipeline_does_not_call_llm_for_low_priority_noise(
             )
 
     class FakeOpenAIClient:
-        def __init__(self, api_key=None):
+        def __init__(self, api_key=None, http_client=None):
             self.chat = type(
                 "ChatNamespace",
                 (),
@@ -2409,6 +2448,141 @@ def test_no_fresh_ingest_does_not_replay_deferred_backlog_into_fresh_digest(
     )
     assert len(deferred_candidates) == 1
     assert deferred_candidates[0].raw_article.metadata["deferred_digest_key"] == first["digest"].alerts[-1].digest_key
+
+
+def test_failed_telegram_send_does_not_create_deferred_history(tmp_path, monkeypatch):
+    articles = build_capped_articles(16)
+    config = build_config(
+        daily_digest_limit=16,
+        competitors_by_region={"sea": [item.competitor_hints[0] for item in articles]},
+    )
+    patch_runtime(monkeypatch, tmp_path, config)
+
+    def fake_build_providers(names):
+        return [StaticProvider("mock_news", articles)]
+
+    class FakeAlertAnalyzer:
+        def __init__(self, use_llm, model=None):
+            self.use_llm = use_llm
+
+        def analyze_candidate(self, candidate, *, article_context=None):
+            return {
+                "competitor": candidate.competitor,
+                "region": candidate.region or "",
+                "country": candidate.country_hint or "",
+                "topic": candidate.topic_group,
+                "priority": "MEDIUM",
+                "what_happened": candidate.title,
+                "why_it_matters": "llm" if self.use_llm else "fallback",
+                "potential_impact": "impact",
+                "recommended_action": "act",
+                "confidence": 0.7,
+            }
+
+    class FailingTelegramSender:
+        def __init__(self, storage, dry_run):
+            self.storage = storage
+
+        def send_daily_digest(self, alert_schemas, alerts, source_urls, generated_at):
+            raise RuntimeError("telegram send failed")
+
+    monkeypatch.setattr(cli, "build_providers", fake_build_providers)
+    monkeypatch.setattr(cli, "CompetitorAlertAnalyzer", FakeAlertAnalyzer)
+    monkeypatch.setattr(cli, "TelegramSender", FailingTelegramSender)
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
+
+    with pytest.raises(RuntimeError, match="telegram send failed"):
+        cli.run_pipeline(days=7, min_score=5, regions=["sea"], telegram_mode="send")
+
+    storage = SQLiteTrackerStorage(tmp_path / "output" / "tracker.db")
+    deferred_candidates = storage.get_deferred_candidates(
+        channel="telegram",
+        destination="12345",
+        max_age_days=2,
+    )
+    assert deferred_candidates == []
+
+
+def test_wrong_destination_delivery_does_not_block_next_configured_chat_run(
+    tmp_path, monkeypatch
+):
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config)
+    shared_articles = [
+        article(
+            competitor="Grab",
+            title="Grab launches driver support program in Manila",
+            url="https://example.com/grab-driver-support-manila",
+        )
+    ]
+
+    def fake_build_providers(names):
+        return [StaticProvider("mock_news", shared_articles)]
+
+    class FakeTelegramSender:
+        def __init__(self, storage, dry_run):
+            self.storage = storage
+
+        def send_daily_digest(self, alert_schemas, alerts, source_urls, generated_at):
+            for alert in alerts:
+                self.storage.mark_delivered(
+                    alert_key=alert.digest_key,
+                    channel="telegram",
+                    delivered_at="2026-05-20T09:00:00Z",
+                    destination="wrong-chat",
+                )
+            return {"ok": True, "dry_run": False, "message_id": "1"}
+
+    monkeypatch.setattr(cli, "build_providers", fake_build_providers)
+    monkeypatch.setattr(cli, "TelegramSender", FakeTelegramSender)
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
+
+    first = cli.run_pipeline(days=7, min_score=5, regions=["sea"], telegram_mode="send")
+    second = cli.run_pipeline(days=7, min_score=5, regions=["sea"], telegram_mode="send")
+
+    assert len(first["digest"].alerts) == 1
+    assert len(second["digest"].alerts) == 1
+
+
+def test_successful_telegram_delivery_suppresses_repeat_for_same_destination(
+    tmp_path, monkeypatch
+):
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config)
+    shared_articles = [
+        article(
+            competitor="Grab",
+            title="Grab launches driver support program in Manila",
+            url="https://example.com/grab-driver-support-manila",
+        )
+    ]
+
+    def fake_build_providers(names):
+        return [StaticProvider("mock_news", shared_articles)]
+
+    class FakeTelegramSender:
+        def __init__(self, storage, dry_run):
+            self.storage = storage
+
+        def send_daily_digest(self, alert_schemas, alerts, source_urls, generated_at):
+            for alert in alerts:
+                self.storage.mark_delivered(
+                    alert_key=alert.digest_key,
+                    channel="telegram",
+                    delivered_at="2026-05-20T09:00:00Z",
+                    destination="12345",
+                )
+            return {"ok": True, "dry_run": False, "message_id": "1"}
+
+    monkeypatch.setattr(cli, "build_providers", fake_build_providers)
+    monkeypatch.setattr(cli, "TelegramSender", FakeTelegramSender)
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
+
+    first = cli.run_pipeline(days=7, min_score=5, regions=["sea"], telegram_mode="send")
+    second = cli.run_pipeline(days=7, min_score=5, regions=["sea"], telegram_mode="send")
+
+    assert len(first["digest"].alerts) == 1
+    assert len(second["digest"].alerts) == 0
 
 
 def test_daily_marketing_digest_excludes_generic_industry_context_noise(tmp_path, monkeypatch):

@@ -11,7 +11,7 @@ import requests
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from .environment import get_env_value
-from .formatter import format_alert_card, format_daily_digest
+from .formatter import format_alert_card
 from .models import Alert, DeliveryRecord
 from .storage import SQLiteTrackerStorage
 
@@ -68,23 +68,39 @@ class TelegramSender:
         title: str = "Competitor Daily Digest",
         generated_at: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Send one daily digest message and log delivery for each included alert."""
-        text = format_daily_digest(
-            alert_schemas,
-            source_urls=source_urls,
-            title=title,
-            generated_at=generated_at,
-        )
-        return self._send_text(
-            text=text,
-            alert_keys=[alert.digest_key for alert in alerts],
-            metadata={
-                "mode": "daily_digest",
-                "title": title,
-                "generated_at": generated_at or "",
-                "count": str(len(alerts)),
-            },
-        )
+        """Send one Telegram card per alert while preserving digest delivery logging."""
+        message_ids: list[str] = []
+        total = min(len(alert_schemas), len(alerts))
+        for index in range(total):
+            alert_schema = alert_schemas[index]
+            alert = alerts[index]
+            source_url = ""
+            if source_urls is not None and index < len(source_urls):
+                source_url = source_urls[index]
+            text = format_alert_card(alert_schema, source_url=source_url)
+            result = self._send_text(
+                text=text,
+                alert_keys=[alert.digest_key],
+                metadata={
+                    "mode": "daily_digest_card",
+                    "title": title,
+                    "generated_at": generated_at or "",
+                    "count": str(total),
+                    "sequence": str(index + 1),
+                    "source_url": source_url,
+                },
+            )
+            message_id = str(result.get("message_id") or "")
+            if message_id:
+                message_ids.append(message_id)
+
+        return {
+            "ok": True,
+            "dry_run": self.dry_run,
+            "message_id": message_ids[-1] if message_ids else None,
+            "message_ids": message_ids,
+            "messages_sent": total,
+        }
 
     def _send_text(
         self,

@@ -404,6 +404,12 @@ And optionally:
 - sends digest to Telegram
 - mirrors alerts to Notion
 
+Telegram delivery for the MVP is intentionally card-based:
+
+- each alert is sent as a separate Telegram message
+- the outward-facing Telegram card stays in Russian
+- the card structure is fixed and concise, separate from richer local review artifacts
+
 Telegram-specific carry-over only applies to the delivery path. Local-only runs still produce artifacts and history, but they do not keep building an endless retry queue.
 Stale alerts that fail the final `7-day` gate do not reach Telegram or the main digest, but they remain visible in archive artifacts and `SQLite` metadata for auditability.
 

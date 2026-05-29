@@ -13,7 +13,7 @@ def build_alert_headline(alert: Mapping[str, Any]) -> str:
         or alert.get("region")
         or "Unknown Market"
     )
-    return f"Competitor Alert — {market}"
+    return f"🚨 Competitor Alert — {market}"
 
 
 def format_alert_card(
@@ -25,29 +25,34 @@ def format_alert_card(
     """Format one alert card in a Telegram-friendly delivery style."""
     resolved_source_url = _clean(source_url or alert.get("source_url"))
     resolved_market = _clean(alert.get("country") or alert.get("region") or "Unknown")
+    what_happened = _clean(alert.get("what_happened"))
+    if what_happened and not what_happened.endswith("."):
+        what_happened = f"{what_happened}."
+    why_it_matters = _clean(alert.get("why_it_matters"))
+    potential_impact = _clean(alert.get("potential_impact"))
+    recommended_action = _clean(alert.get("recommended_action"))
     lines = [
         headline or build_alert_headline(alert),
         "",
-        f"Competitor: {_clean(alert.get('competitor'))}",
-        f"Event/Topic: {_clean(alert.get('topic'))}",
-        f"Priority: {_clean(str(alert.get('priority', '')).upper())}",
+        f"Конкурент: {_clean(alert.get('competitor'))}",
+        f"Событие: {_clean(alert.get('topic'))}",
+        f"Приоритет: {_clean(str(alert.get('priority', '')).upper())}",
         "",
-        "What happened:",
-        _clean(alert.get("what_happened")),
+        "Что произошло:",
+        what_happened,
+        f"Где: {resolved_market}",
         "",
-        f"Where: {resolved_market}",
-        "",
-        "Source link:",
+        "Источник:",
         resolved_source_url,
         "",
-        "Why it matters:",
-        _clean(alert.get("why_it_matters")),
+        "Почему это важно:",
+        why_it_matters,
         "",
-        "Potential impact:",
-        _clean(alert.get("potential_impact")),
+        "Потенциальное влияние:",
+        potential_impact,
         "",
-        "What to do:",
-        _clean(alert.get("recommended_action")),
+        "Что делать:",
+        recommended_action,
     ]
     return "\n".join(lines)
 
