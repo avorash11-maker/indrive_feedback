@@ -757,7 +757,9 @@ class CompetitorAnalyzer:
 
 
 class CompetitorAlertAnalyzer:
-    """LLM-powered alert analyzer for competitor tracker candidates."""
+    """inDrive Marcom Editor agent for competitor tracker candidates."""
+
+    ROLE_NAME = "indrive_marcom_editor"
 
     INSUFFICIENT_SOURCE_DATA_MESSAGE = (
         "Недостаточно данных для анализа, так как сайт источника недоступен"
@@ -808,7 +810,7 @@ class CompetitorAlertAnalyzer:
         *,
         article_context: Optional[ArticleContext] = None,
     ) -> AlertSchema:
-        """Return normalized competitor alert schema for one candidate."""
+        """Return a Marcom-edited competitor alert schema for one candidate."""
         fallback = self._fallback_alert(candidate, article_context=article_context)
         if not self.use_llm or self.client is None:
             return fallback
@@ -854,30 +856,37 @@ class CompetitorAlertAnalyzer:
         article_context: Optional[ArticleContext] = None,
     ) -> Optional[dict[str, Any]]:
         reference_today = self._reference_today_iso()
-        system_prompt = """You are a senior international marketing strategist for inDrive with deep experience in ride-hailing, mobility marketplaces, regional go-to-market, growth, brand strategy, and competitor response.
+        system_prompt = """You are the inDrive Marcom Editor: a senior internal competitor-alert editor with deep experience in ride-hailing, mobility marketplaces, regional go-to-market, growth, brand strategy, and competitor response.
 
-Your task is to analyze a competitor article and produce a sharp, practical alert for the inDrive Marcom and growth team.
+Your task is to turn one accepted competitor news item into a sharp, practical internal alert for the inDrive Marcom and growth team.
 
 Your output must help the team:
 - understand exactly what happened
 - understand why it matters strategically
 - estimate likely impact on perception, positioning, growth, driver/rider trust, or market narrative
-- decide what inDrive should do better, faster, or differently
+- see the news in a concise internal alert format without journalistic filler
 
-Think like a senior operator responsible for competitor response, local market messaging, regional GTM, and strategic brand reaction.
+Think like a senior Marcom/Growth editor responsible for competitor response, local market messaging, regional GTM, and strategic brand reaction.
 
 Rules:
 - Use only evidence from the provided article context.
 - Do not invent facts, metrics, partnerships, timelines, internal intent, or campaign performance.
 - If evidence is limited, be explicit and stay cautious.
 - Do not overstate strategic meaning when the source signal is weak.
+- Keep the writing concise, concrete, and directly useful for internal decision-making.
+- Write like an editor, not like a journalist and not like a product strategist.
+- Do not add product-heavy analysis unless the article clearly justifies it.
 - Treat `competitor` and `region` from candidate metadata as pre-detected pipeline signals, not as free fields for guesswork.
 - Do not override the provided `competitor` or `region` unless the article contains explicit evidence that the pipeline signal is wrong.
+- Do not override the provided `country` signal unless the article contains explicit evidence that the pipeline signal is wrong.
 - If the signal is ambiguous, mixed, or weak, preserve the provided pipeline `competitor` and `region`.
 - Resolve the final publication date with this priority: LLM inference from article evidence, then HTML-scraped date, then provider-normalized metadata, then undated fallback when nothing trustworthy exists.
 - If the provider `published_at` field is None or missing, carefully inspect the article body for publication dates or temporal markers such as "last Thursday", "yesterday", or "two days ago". Resolve them relative to today's date: {reference_today}. Write the final date into `published_date` using YYYY-MM-DD format.
-- Think like a high-level international marketer, not a generic summarizer.
-- Recommended actions must be concrete and useful for brand, growth, communications, partnerships, creative strategy, regional GTM, or driver/rider messaging.
+- `event` must be a short, concrete naming of the move, suitable for a Telegram internal alert line.
+- `what_happened` must be concise and factual.
+- `why_it_matters` must explain the strategic meaning for inDrive, not restate the article.
+- `potential_impact` must describe a real likely effect on growth, brand, messaging, or supply-demand narrative.
+- Recommended actions may be included for backward compatibility, but keep them short and practical.
 - Recommended actions must be applicable to inDrive, not generic advice for "a company".
 - Avoid vague advice like "monitor this" unless no stronger action is justified by the article.
 - Keep wording concise, executive-friendly, and actionable.
@@ -892,6 +901,7 @@ Return this schema:
   "region": "string",
   "country": "string",
   "topic": "string",
+  "event": "string",
   "priority": "LOW|MEDIUM|HIGH",
   "published_date": "YYYY-MM-DD",
   "published_date_source": "provider|html_scraped|llm|undated_fallback",
@@ -914,7 +924,7 @@ Source URL: {url}
 
 Today's date for reference: {reference_today}. Если точной даты нет, используй контекст текста для вычисления.
 
-Write the alert for the inDrive Marcom / growth team.
+Write the alert as the inDrive Marcom Editor for the internal Telegram digest.
 
 Focus especially on:
 - competitor strategy
@@ -925,12 +935,14 @@ Focus especially on:
 
 When writing:
 - treat candidate `competitor` and `region` as pipeline-detected inputs that should stay unchanged by default
+- treat candidate `country_hint` as a pipeline-owned geo hint and preserve it unless the article clearly disproves it
 - change `competitor` or `region` only if the article explicitly proves the pipeline signal is wrong
 - if the article is ambiguous, preserve the provided pipeline `competitor` and `region`
+- "event" should be a short internal label for the move, not a generic topic name
 - "what_happened" should state the event clearly and concretely
 - "why_it_matters" should explain the strategic meaning, not just restate the article
 - "potential_impact" should focus on likely effects on trust, perception, positioning, growth, or supply-demand narrative
-- "recommended_action" should give specific next moves for inDrive, ideally in messaging, creative, partnerships, GTM, driver/rider value proposition, or local communications""".replace(
+- "recommended_action" may be brief, but if included it should give specific next moves for inDrive, ideally in messaging, creative, partnerships, GTM, driver/rider value proposition, or local communications""".replace(
             "{reference_today}", reference_today
         )
 
@@ -960,6 +972,7 @@ When writing:
                 "region": candidate.region or "",
                 "country": candidate.country_hint or "",
                 "topic": presentable_topic_name(candidate.topic_group),
+                "event": self._fallback_event_name(candidate),
                 "priority": self._priority_from_score(candidate.score),
                 "published_date": self._normalize_published_date(
                     context.published_at or candidate.raw_article.published_at
@@ -1026,21 +1039,20 @@ When writing:
         country = candidate.country_hint or ""
         region = self._presentable_region(candidate.region or "")
         matched = ", ".join(candidate.matched_keywords) or topic
+        event = self._fallback_event_name(candidate)
         what_happened = (
-            f"{candidate.competitor} appears in coverage related to {topic}. "
-            f"Detected signals: {matched}."
+            f"{candidate.competitor} is reported to have made a {topic} move. Detected signals: {matched}."
         )
         why_it_matters = (
-            f"This may indicate a competitor move in {topic} that can influence local market messaging, "
-            "supply dynamics, regulation, or user perception."
+            f"This signal may affect local market messaging, competitive positioning, or supply-demand narrative in "
+            f"{country or region or 'the market'}."
         )
         potential_impact = (
-            f"Potential impact on {candidate.competitor}'s positioning in "
-            f"{country or region or 'the market'}, with possible downstream effects on driver or rider perception."
+            f"Possible impact on brand narrative, growth messaging, or driver/rider perception around "
+            f"{country or region or 'the market'}."
         )
         recommended_action = (
-            f"Review the signal, validate local market context, and decide whether {topic} needs a response "
-            "in messaging, product, pricing, or operations."
+            f"Review whether this move needs a local response in messaging, creative, pricing, or partnerships."
         )
         confidence = min(0.95, max(0.35, candidate.score / 10))
         fallback_alert: dict[str, Any] = {
@@ -1048,6 +1060,7 @@ When writing:
             "region": region,
             "country": country,
             "topic": topic,
+            "event": event,
             "priority": priority,
             "published_date": self._normalize_published_date(candidate.published_date),
             "what_happened": what_happened,
@@ -1092,6 +1105,9 @@ When writing:
             normalized.get("topic") or "general movement"
         )
         normalized["topic"] = presentable_topic_name(normalized["topic"])
+        normalized["event"] = CompetitorAlertAnalyzer._clean_text(
+            normalized.get("event") or normalized.get("topic") or "Competitor move"
+        )
         priority = str(normalized.get("priority") or "LOW").upper()
         if priority not in {"LOW", "MEDIUM", "HIGH"}:
             priority = "LOW"
@@ -1352,6 +1368,14 @@ When writing:
         return re.sub(r"\s+", " ", str(value or "")).strip()
 
     @staticmethod
+    def _fallback_event_name(candidate: CandidateArticle) -> str:
+        topic = presentable_topic_name(candidate.topic_group)
+        competitor = CompetitorAlertAnalyzer._clean_text(candidate.competitor)
+        if candidate.country_hint:
+            return f"{competitor} {topic} move in {candidate.country_hint}"
+        return f"{competitor} {topic} move"
+
+    @staticmethod
     def _normalize_published_date(value: Any) -> str:
         if not value:
             return ""
@@ -1365,3 +1389,6 @@ When writing:
             return datetime.fromisoformat(candidate.replace("Z", "+00:00")).date().isoformat()
         except ValueError:
             return ""
+
+
+InDriveMarcomEditor = CompetitorAlertAnalyzer

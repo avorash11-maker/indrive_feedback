@@ -37,7 +37,7 @@ class StorageBackend(Protocol):
         alert_schemas: Sequence[dict[str, Any]],
         *,
         generated_at: str,
-        title: str = "Ежедневный превью-дайджест competitor tracker",
+        title: str = "Competitor Tracker Digest Preview",
     ) -> Path:
         """Persist a human-readable markdown preview and return the output path."""
 
@@ -96,7 +96,7 @@ class JsonFileStorage:
         alert_schemas: Sequence[dict[str, Any]],
         *,
         generated_at: str,
-        title: str = "Ежедневный превью-дайджест competitor tracker",
+        title: str = "Competitor Tracker Digest Preview",
     ) -> Path:
         output_path = self.base_dir / "digest_preview.md"
         source_urls = [alert.candidate.url for alert in alerts]
@@ -144,6 +144,11 @@ class JsonFileStorage:
                     "news_gatekeeper_relevance_reason",
                     "news_gatekeeper_priority_hint",
                     "news_gatekeeper_rejection_reason",
+                    "product_take",
+                    "product_risk",
+                    "product_follow_up",
+                    "product_strategist_invoked",
+                    "product_strategist_trigger",
                     "title",
                     "source",
                     "published_at",
@@ -196,6 +201,15 @@ class JsonFileStorage:
                         ),
                         "news_gatekeeper_rejection_reason": alert_schema.get(
                             "news_gatekeeper_rejection_reason", ""
+                        ),
+                        "product_take": alert_schema.get("product_take", ""),
+                        "product_risk": alert_schema.get("product_risk", ""),
+                        "product_follow_up": alert_schema.get("product_follow_up", ""),
+                        "product_strategist_invoked": alert_schema.get(
+                            "product_strategist_invoked", ""
+                        ),
+                        "product_strategist_trigger": alert_schema.get(
+                            "product_strategist_trigger", ""
                         ),
                         "title": candidate.title,
                         "source": candidate.raw_article.source,

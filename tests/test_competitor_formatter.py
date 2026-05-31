@@ -12,6 +12,7 @@ def build_alert_payload():
         "region": "Southeast Asia",
         "country": "Philippines",
         "topic": "Marketing + Policy Narrative",
+        "event": "Driver support messaging push",
         "priority": "MEDIUM",
         "what_happened": (
             "Platforms are promoting driver support programs (fuel subsidies, bonuses) "
@@ -27,6 +28,9 @@ def build_alert_payload():
             "Highlight driver benefits in campaigns. Test earn more with us messaging. "
             "Align growth and comms messaging."
         ),
+        "product_take": "This may raise parity expectations for driver-value communication.",
+        "product_risk": "Risk of a stronger driver-care value anchor in-market.",
+        "product_follow_up": "Review whether driver-facing value messaging needs a product-backed response.",
         "confidence": 0.86,
     }
 
@@ -36,7 +40,7 @@ def test_build_alert_headline_prefers_country():
 
     headline = build_alert_headline(alert)
 
-    assert headline == "🚨 Competitor Alert — Philippines"
+    assert headline == "Competitor Alert — Philippines"
 
 
 def test_format_alert_card_matches_brief_sections():
@@ -50,26 +54,31 @@ def test_format_alert_card_matches_brief_sections():
         ),
     )
 
-    assert "🚨 Competitor Alert — Philippines" in card
-    assert "Конкурент: Grab / Move It" in card
-    assert "Событие: Marketing + Policy Narrative" in card
-    assert "Приоритет: MEDIUM" in card
-    assert "Что произошло:" in card
-    assert "Где: Philippines" in card
-    assert "Источник:" in card
-    assert "Почему это важно:" in card
-    assert "Потенциальное влияние:" in card
-    assert "Что делать:" in card
-    assert card.index("Конкурент: Grab / Move It") < card.index("Событие: Marketing + Policy Narrative")
-    assert card.index("Событие: Marketing + Policy Narrative") < card.index("Приоритет: MEDIUM")
-    assert card.index("Приоритет: MEDIUM") < card.index("Что произошло:")
-    assert card.index("Что произошло:") < card.index("Где: Philippines")
-    assert card.index("Где: Philippines") < card.index("Источник:")
-    assert card.index("Источник:") < card.index("Почему это важно:")
-    assert card.index("Почему это важно:") < card.index("Потенциальное влияние:")
-    assert card.index("Потенциальное влияние:") < card.index("Что делать:")
-    assert "\n\nЧто произошло:\n" in card
-    assert "\n\nИсточник:\n" in card
+    assert "Competitor Alert — Philippines" in card
+    assert "Competitor: Grab / Move It" in card
+    assert "Event: Driver support messaging push" in card
+    assert "Priority: MEDIUM" in card
+    assert "What happened:" in card
+    assert "Where: Philippines" in card
+    assert "Source:" in card
+    assert "Why it matters:" in card
+    assert "Potential impact:" in card
+    assert "Recommended action:" not in card
+    assert "Product take:" in card
+    assert "Product risk:" in card
+    assert "Product follow-up:" in card
+    assert card.index("Competitor: Grab / Move It") < card.index("Event: Driver support messaging push")
+    assert card.index("Event: Driver support messaging push") < card.index("Priority: MEDIUM")
+    assert card.index("Priority: MEDIUM") < card.index("What happened:")
+    assert card.index("What happened:") < card.index("Where: Philippines")
+    assert card.index("Where: Philippines") < card.index("Source:")
+    assert card.index("Source:") < card.index("Why it matters:")
+    assert card.index("Why it matters:") < card.index("Potential impact:")
+    assert card.index("Potential impact:") < card.index("Product take:")
+    assert card.index("Product take:") < card.index("Product risk:")
+    assert card.index("Product risk:") < card.index("Product follow-up:")
+    assert "\n\nWhat happened:\n" in card
+    assert "\n\nSource:\n" in card
 
 
 def test_format_daily_digest_renders_local_digest_view():
@@ -85,8 +94,8 @@ def test_format_daily_digest_renders_local_digest_view():
     assert "Competitor Daily Digest — Morning" in digest
     assert "Generated at: 2026-05-18T09:00:00Z" in digest
     assert "Alerts: 1" in digest
-    assert "1. 🚨 Competitor Alert — Philippines" in digest
-    assert "Источник:\nhttps://example.com/grab-ph" in digest
+    assert "1. Competitor Alert — Philippines" in digest
+    assert "Source:\nhttps://example.com/grab-ph" in digest
 
 
 def test_format_daily_digest_handles_empty_alerts():
@@ -105,12 +114,13 @@ def test_format_daily_digest_markdown_renders_russian_review_view():
         generated_at="2026-05-18T09:00:00Z",
     )
 
-    assert "# Ежедневный превью-дайджест competitor tracker" in digest
-    assert "- Сгенерировано: 2026-05-18T09:00:00Z" in digest
-    assert "- Алертов в дайджесте: 1" in digest
-    assert "### Что произошло" in digest
-    assert "### Почему это важно" in digest
-    assert "### Источник" in digest
+    assert "# Competitor Tracker Digest Preview" in digest
+    assert "- Generated at: 2026-05-18T09:00:00Z" in digest
+    assert "- Alerts: 1" in digest
+    assert "### What happened" in digest
+    assert "### Why it matters" in digest
+    assert "### Source" in digest
+    assert "### Product take" in digest
 
 
 def test_format_alert_card_uses_business_region_name_when_country_is_missing():
@@ -120,6 +130,27 @@ def test_format_alert_card_uses_business_region_name_when_country_is_missing():
 
     card = format_alert_card(alert, source_url="https://example.com/careem-mea")
 
-    assert "Где: Africa & MEA" in card
-    assert "🚨 Competitor Alert — Africa & MEA" in card
-    assert "Источник:\nhttps://example.com/careem-mea" in card
+    assert "Where: Africa & MEA" in card
+    assert "Competitor Alert — Africa & MEA" in card
+    assert "Source:\nhttps://example.com/careem-mea" in card
+
+
+def test_format_alert_card_can_render_russian_telegram_labels():
+    alert = build_alert_payload()
+
+    card = format_alert_card(
+        alert,
+        source_url="https://example.com/grab-ph",
+        locale="ru",
+    )
+
+    assert "Алерт по конкуренту — Philippines" in card
+    assert "Конкурент: Grab / Move It" in card
+    assert "Событие: Driver support messaging push" in card
+    assert "Приоритет: MEDIUM" in card
+    assert "Что произошло:" in card
+    assert "Где: Philippines" in card
+    assert "Источник:" in card
+    assert "Почему это важно:" in card
+    assert "Потенциальное влияние:" in card
+    assert "Продуктовый вывод:" in card

@@ -25,6 +25,7 @@ class AlertSchema(TypedDict, total=False):
     country: str
     country_source: str
     topic: str
+    event: str
     priority: str
     published_date: str
     published_date_source: ResolvedPublicationDateSource
@@ -46,6 +47,11 @@ class AlertSchema(TypedDict, total=False):
     news_gatekeeper_relevance_reason: str
     news_gatekeeper_priority_hint: str
     news_gatekeeper_rejection_reason: str
+    product_take: str
+    product_risk: str
+    product_follow_up: str
+    product_strategist_invoked: bool
+    product_strategist_trigger: str
 
 
 def _normalize_tags(values: List[str] | Tuple[str, ...]) -> Tuple[str, ...]:

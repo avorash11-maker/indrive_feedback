@@ -305,8 +305,8 @@ def test_full_dry_run_with_mocked_providers_writes_artifacts(tmp_path, monkeypat
     assert runtime.database_path.exists()
 
     preview_text = result["preview_path"].read_text(encoding="utf-8")
-    assert "Ежедневный превью-дайджест competitor tracker" in preview_text
-    assert "### Что произошло" in preview_text
+    assert "Competitor Tracker Digest Preview" in preview_text
+    assert "### What happened" in preview_text
 
     with sqlite3.connect(runtime.database_path) as connection:
         row = connection.execute(
@@ -1215,9 +1215,9 @@ def test_run_pipeline_invalid_llm_json_falls_back_to_rule_based_alert(
     assert llm_calls["count"] == 1
     assert len(result["alert_schemas"]) == 1
     alert = result["alert_schemas"][0]
-    assert alert["what_happened"].startswith("Grab appears in coverage related to")
-    assert "This may indicate a competitor move" in alert["why_it_matters"]
-    assert alert["recommended_action"].startswith("Review the signal, validate local market context")
+    assert alert["what_happened"].startswith("Grab is reported to have made a")
+    assert "competitive positioning" in alert["why_it_matters"]
+    assert alert["recommended_action"].startswith("Review whether this move needs a local response")
     assert alert["published_date_source"] == "html_scraped"
 
 
@@ -1432,7 +1432,7 @@ def test_telegram_delivery_uses_enriched_alert_cards_from_llm_output(
     assert telegram_capture["schemas"][0]["why_it_matters"] == "LLM telegram strategic angle."
     assert "LLM telegram event summary." in telegram_capture["text"]
     assert "LLM telegram strategic angle." in telegram_capture["text"]
-    assert "LLM telegram action." in telegram_capture["text"]
+    assert "LLM telegram action." not in telegram_capture["text"]
 
 
 def test_run_pipeline_does_not_call_llm_for_low_priority_noise(

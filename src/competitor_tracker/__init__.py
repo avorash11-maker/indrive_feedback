@@ -6,6 +6,7 @@ bootstrap_env()
 
 from .config import TrackerConfig, TrackerRuntimeConfig
 from .agent_contracts import AGENT_CONTRACT_VERSION, AgentRoleContract, default_agent_role_contracts
+from .analyzer import InDriveMarcomEditor
 from .models import (
     Alert,
     AlertSchema,
@@ -25,6 +26,7 @@ __all__ = [
     "AGENT_CONTRACT_VERSION",
     "AgentRoleContract",
     "default_agent_role_contracts",
+    "InDriveMarcomEditor",
     "RawArticle",
     "ArticleContext",
     "CandidateArticle",

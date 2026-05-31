@@ -63,7 +63,7 @@ This foundation is intentionally conservative in the MVP:
 - backward-compatible flow remains unchanged
 - `News Gatekeeper` now runs as an explicit semantic gate over deterministic candidates
 - the existing Marcom-style alert enrichment remains the active editorial agent layer
-- `Product Strategist` is wired as a safe no-op seam for future expansion
+- `Product Strategist` now runs conditionally only for product-sensitive alerts, keeping the default path cheap
 
 ### SQLite as source of truth
 
@@ -364,6 +364,7 @@ Important boundary:
 
 - `Telegram` is the main delivery layer
 - `Notion` is a showcase/archive mirror
+- `Notion` currently mirrors the main editorial alert fields only; the optional `Product Strategist` block is intentionally not mapped there yet
 - neither replaces `SQLite` as the operational state store
 
 ## Data Flow
@@ -540,6 +541,22 @@ Telegram delivery for the MVP is intentionally card-based:
 - each alert is sent as a separate Telegram message
 - the outward-facing Telegram card stays in Russian
 - the card structure is fixed and concise, separate from richer local review artifacts
+
+Pre-production manual check order should start here:
+
+1. run `dry-run` or `send-digest --dry-run` with fresh ingest
+2. visually verify that the outward-facing Telegram cards are in Russian
+3. if the run ends with `no_fresh_ingest`, do not treat it as final presentation validation
+4. then review `digest_preview.md`, `candidates_review.csv`, and when useful `dropped_articles.json` to confirm that `News Gatekeeper` is filtering noise without removing expected high-signal stories
+5. if the same run has `raw_articles_collected = 0`, treat empty artifacts as inconclusive instead of as a gatekeeper failure
+6. verify `OPENAI_API_KEY`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` with `preflight`; use that result as the source of truth because `.env` may be loaded even when raw shell env inspection looks empty
+7. confirm that [product_logic.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/product_logic.py) and [default_config.json](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/default_config.json) still describe the approved scope:
+   `LATAM`: `Uber`, `DiDi`, `Cabify`, `99`;
+   `SEA`: `Grab`, `Gojek`, `Maxim`, `Bolt`;
+   `Africa & MEA`: `Bolt`, `Uber`, `Careem`, `Yassir`, `Heetch`;
+   `CIS / Central Asia`: `Yandex Go`, `Bolt`, `Maxim`;
+   topics: `market_expansion`, `campaign_launches`, `pricing_promo`, `core_industry_terms`, `strategic_operations`, `performance_growth`, `product_features_innovation`
+8. treat `tests/test_competitor_config.py` as the automated drift alarm for this scope contract
 
 Telegram-specific carry-over only applies to the delivery path. Local-only runs still produce artifacts and history, but they do not keep building an endless retry queue.
 Stale alerts that fail the final `7-day` gate do not reach Telegram or the main digest, but they remain visible in archive artifacts and `SQLite` metadata for auditability.

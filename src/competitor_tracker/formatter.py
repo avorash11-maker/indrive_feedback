@@ -6,14 +6,51 @@ from datetime import datetime
 from typing import Any, Mapping, Optional, Sequence
 
 
-def build_alert_headline(alert: Mapping[str, Any]) -> str:
+LABELS = {
+    "en": {
+        "headline": "Competitor Alert",
+        "unknown_market": "Unknown Market",
+        "unknown_where": "Unknown",
+        "competitor": "Competitor",
+        "event": "Event",
+        "priority": "Priority",
+        "what_happened": "What happened",
+        "where": "Where",
+        "source": "Source",
+        "why_it_matters": "Why it matters",
+        "potential_impact": "Potential impact",
+        "product_take": "Product take",
+        "product_risk": "Product risk",
+        "product_follow_up": "Product follow-up",
+    },
+    "ru": {
+        "headline": "Алерт по конкуренту",
+        "unknown_market": "Неизвестный рынок",
+        "unknown_where": "Неизвестно",
+        "competitor": "Конкурент",
+        "event": "Событие",
+        "priority": "Приоритет",
+        "what_happened": "Что произошло",
+        "where": "Где",
+        "source": "Источник",
+        "why_it_matters": "Почему это важно",
+        "potential_impact": "Потенциальное влияние",
+        "product_take": "Продуктовый вывод",
+        "product_risk": "Продуктовый риск",
+        "product_follow_up": "Что проверить продуктово",
+    },
+}
+
+
+def build_alert_headline(alert: Mapping[str, Any], *, locale: str = "en") -> str:
     """Build a brief-style alert headline."""
+    labels = LABELS.get(locale, LABELS["en"])
     market = _clean(
         alert.get("country")
         or alert.get("region")
-        or "Unknown Market"
+        or labels["unknown_market"]
     )
-    return f"🚨 Competitor Alert — {market}"
+    return f"{labels['headline']} — {market}"
 
 
 def format_alert_card(
@@ -21,39 +58,65 @@ def format_alert_card(
     *,
     source_url: str = "",
     headline: Optional[str] = None,
+    locale: str = "en",
 ) -> str:
     """Format one alert card in a Telegram-friendly delivery style."""
+    labels = LABELS.get(locale, LABELS["en"])
     resolved_source_url = _clean(source_url or alert.get("source_url"))
-    resolved_market = _clean(alert.get("country") or alert.get("region") or "Unknown")
+    resolved_market = _clean(alert.get("country") or alert.get("region") or labels["unknown_where"])
+    event = _clean(alert.get("event") or alert.get("topic"))
     what_happened = _clean(alert.get("what_happened"))
     if what_happened and not what_happened.endswith("."):
         what_happened = f"{what_happened}."
     why_it_matters = _clean(alert.get("why_it_matters"))
     potential_impact = _clean(alert.get("potential_impact"))
-    recommended_action = _clean(alert.get("recommended_action"))
+    product_take = _clean(alert.get("product_take"))
+    product_risk = _clean(alert.get("product_risk"))
+    product_follow_up = _clean(alert.get("product_follow_up"))
     lines = [
-        headline or build_alert_headline(alert),
+        headline or build_alert_headline(alert, locale=locale),
         "",
-        f"Конкурент: {_clean(alert.get('competitor'))}",
-        f"Событие: {_clean(alert.get('topic'))}",
-        f"Приоритет: {_clean(str(alert.get('priority', '')).upper())}",
+        f"{labels['competitor']}: {_clean(alert.get('competitor'))}",
+        f"{labels['event']}: {event}",
+        f"{labels['priority']}: {_clean(str(alert.get('priority', '')).upper())}",
         "",
-        "Что произошло:",
+        f"{labels['what_happened']}:",
         what_happened,
-        f"Где: {resolved_market}",
+        f"{labels['where']}: {resolved_market}",
         "",
-        "Источник:",
+        f"{labels['source']}:",
         resolved_source_url,
         "",
-        "Почему это важно:",
+        f"{labels['why_it_matters']}:",
         why_it_matters,
         "",
-        "Потенциальное влияние:",
+        f"{labels['potential_impact']}:",
         potential_impact,
-        "",
-        "Что делать:",
-        recommended_action,
     ]
+    if product_take:
+        lines.extend(
+            [
+                "",
+                f"{labels['product_take']}:",
+                product_take,
+            ]
+        )
+    if product_risk:
+        lines.extend(
+            [
+                "",
+                f"{labels['product_risk']}:",
+                product_risk,
+            ]
+        )
+    if product_follow_up:
+        lines.extend(
+            [
+                "",
+                f"{labels['product_follow_up']}:",
+                product_follow_up,
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -93,19 +156,19 @@ def format_daily_digest_markdown(
     alerts: Sequence[Mapping[str, Any]],
     *,
     source_urls: Optional[Sequence[str]] = None,
-    title: str = "Ежедневный превью-дайджест competitor tracker",
+    title: str = "Competitor Tracker Digest Preview",
     generated_at: Optional[str] = None,
 ) -> str:
-    """Format a markdown digest that is comfortable to review manually."""
+    """Format a markdown digest that mirrors the final alert contract."""
     timestamp = _clean(generated_at) or datetime.utcnow().isoformat(timespec="seconds") + "Z"
     lines = [
         f"# {title}",
         "",
-        f"- Сгенерировано: {timestamp}",
-        f"- Алертов в дайджесте: {len(alerts)}",
+        f"- Generated at: {timestamp}",
+        f"- Alerts: {len(alerts)}",
     ]
     if not alerts:
-        lines.extend(["", "_Сегодня релевантных alert'ов для ручной проверки не нашлось._"])
+        lines.extend(["", "_No alerts were selected for this digest._"])
         return "\n".join(lines)
 
     for index, alert in enumerate(alerts, start=1):
@@ -113,38 +176,45 @@ def format_daily_digest_markdown(
         if source_urls is not None and index - 1 < len(source_urls):
             source_url = source_urls[index - 1]
         market = _clean(alert.get("country") or alert.get("region") or "Unknown")
+        event = _clean(alert.get("event") or alert.get("topic"))
         lines.extend(
             [
                 "",
                 f"## {index}. {build_alert_headline(alert)}",
                 "",
-                f"- Конкурент: {_clean(alert.get('competitor'))}",
-                f"- Тема: {_clean(alert.get('topic'))}",
-                f"- Приоритет: {_clean(str(alert.get('priority', '')).upper())}",
-                f"- Рынок: {market}",
-                f"- Уверенность: {_clean(alert.get('confidence'))}",
-                f"- Валидация geo/date: competitor={_clean(alert.get('competitor_source') or 'n/a')}, "
+                f"- Competitor: {_clean(alert.get('competitor'))}",
+                f"- Event: {event}",
+                f"- Priority: {_clean(str(alert.get('priority', '')).upper())}",
+                f"- Where: {market}",
+                f"- Confidence: {_clean(alert.get('confidence'))}",
+                f"- Validation: competitor={_clean(alert.get('competitor_source') or 'n/a')}, "
                 f"region={_clean(alert.get('region_source') or 'n/a')}, "
                 f"country={_clean(alert.get('country_source') or 'n/a')}, "
                 f"date={_clean(alert.get('published_date_source') or 'unknown')}, "
                 f"fallback={_clean(alert.get('geo_validation_fallback'))}",
                 "",
-                "### Что произошло",
+                "### What happened",
                 _clean(alert.get("what_happened")),
                 "",
-                "### Почему это важно",
+                "### Why it matters",
                 _clean(alert.get("why_it_matters")),
                 "",
-                "### Потенциальное влияние",
+                "### Potential impact",
                 _clean(alert.get("potential_impact")),
                 "",
-                "### Что делать",
-                _clean(alert.get("recommended_action")),
-                "",
-                "### Источник",
+                "### Source",
                 _clean(source_url or alert.get("source_url")),
             ]
         )
+        product_take = _clean(alert.get("product_take"))
+        product_risk = _clean(alert.get("product_risk"))
+        product_follow_up = _clean(alert.get("product_follow_up"))
+        if product_take:
+            lines.extend(["", "### Product take", product_take])
+        if product_risk:
+            lines.extend(["", "### Product risk", product_risk])
+        if product_follow_up:
+            lines.extend(["", "### Product follow-up", product_follow_up])
     return "\n".join(lines)
 
 

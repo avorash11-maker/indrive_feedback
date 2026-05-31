@@ -48,7 +48,7 @@ class TelegramSender:
         source_url: str = "",
     ) -> dict[str, Any]:
         """Send one alert card to Telegram and log the outcome."""
-        text = format_alert_card(alert_schema, source_url=source_url)
+        text = format_alert_card(alert_schema, source_url=source_url, locale="ru")
         return self._send_text(
             text=text,
             alert_keys=[alert.digest_key],
@@ -77,7 +77,7 @@ class TelegramSender:
             source_url = ""
             if source_urls is not None and index < len(source_urls):
                 source_url = source_urls[index]
-            text = format_alert_card(alert_schema, source_url=source_url)
+            text = format_alert_card(alert_schema, source_url=source_url, locale="ru")
             result = self._send_text(
                 text=text,
                 alert_keys=[alert.digest_key],

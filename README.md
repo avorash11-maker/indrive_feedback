@@ -438,12 +438,12 @@ Important ingestion diagnostics detail:
 - `rss_feed_metrics` in SQLite stores per-run feed QA snapshots for curated RSS sources, including `items_found`, `provider_matches`, `prefilter_passed`, `candidates_kept`, `alerts_created`, `noise_ratio`, and auto-generated cleanup recommendations.
 - If `test-provider` fails for several providers and queries with connection or DNS-style errors, that points to the environment or network path, not necessarily to tracker code.
 
-The markdown preview intentionally uses readable Russian section labels where helpful for manual review:
+The markdown preview intentionally mirrors the canonical alert contract in a readable QA-friendly format:
 
-- `Что произошло`
-- `Почему это важно`
-- `Потенциальное влияние`
-- `Что делать`
+- `What happened`
+- `Why it matters`
+- `Potential impact`
+- optional product block for product-sensitive alerts
 
 This makes it easier to validate false positives and signal quality over a 1-2 week test period without querying SQLite by hand.
 
@@ -474,12 +474,48 @@ Telegram is the main delivery channel for the MVP.
 - marks stale deferred alerts as `expired`
 - gives fresh new alerts a slight ranking advantage over yesterday's carry-over alerts
 
+### Pre-Production Checklist
+
+Before a production digest run, start with a Telegram presentation check:
+
+1. Run a tracker `dry-run` or `send-digest --dry-run` against a run that has fresh ingest.
+2. Visually confirm that Telegram-ready alert cards are rendered in Russian.
+3. Treat a `no_fresh_ingest` dry-run as a transport/path check only, not as a final presentation sign-off.
+
+This first manual check validates the operator-facing output contract before reviewing artifacts, env readiness, and config scope.
+
+Next, review local artifacts for gatekeeping quality:
+
+1. Open `digest_preview.md` and `candidates_review.csv`.
+2. Confirm that accepted alerts still look strategically relevant and that expected signals are not being over-filtered by `News Gatekeeper`.
+3. If available, cross-check `dropped_articles.json` for explicit gatekeeper rejection reasons.
+4. If the run summary shows `no_fresh_ingest` or `raw_articles_collected = 0`, treat empty artifacts as inconclusive rather than as evidence that the gate is too strict.
+
+Then verify delivery and enrichment secrets:
+
+1. Check `OPENAI_API_KEY`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` through `preflight`, not only through raw shell env inspection.
+2. Treat `competitor-tracker preflight --mode telegram-delivery --require-openai` as the authoritative readiness check because it also loads `.env`.
+3. If raw shell env looks empty but `preflight` reports `dotenv_loaded` and all required checks as `present`, treat the setup as ready.
+
+Finally, confirm that the runtime scope still matches the approved product contract:
+
+1. Treat [product_logic.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/product_logic.py) as the frozen scope contract and [default_config.json](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/default_config.json) as the default runtime mirror that must stay in sync with it.
+2. Verify that the allowed business regions are still `LATAM`, `SEA`, `Africa & MEA`, and `CIS / Central Asia`.
+3. Verify that the allowed competitor matrix is still:
+   `LATAM`: `Uber`, `DiDi`, `Cabify`, `99`;
+   `SEA`: `Grab`, `Gojek`, `Maxim`, `Bolt`;
+   `Africa & MEA`: `Bolt`, `Uber`, `Careem`, `Yassir`, `Heetch`;
+   `CIS / Central Asia`: `Yandex Go`, `Bolt`, `Maxim`.
+4. Verify that the canonical topic groups are still `market_expansion`, `campaign_launches`, `pricing_promo`, `core_industry_terms`, `strategic_operations`, `performance_growth`, and `product_features_innovation`.
+5. Use `TrackerConfig.load_default()` and `tests/test_competitor_config.py` as the automated backstop: if the default config drifts away from the frozen product contract, the config test suite should fail fast.
+
 ### Notion
 
 Notion is an optional mirror, not the database of record.
 
 - final alerts can be archived to a separate competitor tracker database
 - Notion reads already computed `resolved_publication_date` from the final schema and only falls back to the resolver if that field is unexpectedly missing
+- Notion currently mirrors the core editorial alert contract only; the optional product block (`product_take`, `product_risk`, `product_follow_up`) still stays in Telegram/local artifacts and is not yet mapped into the Notion schema
 - dry-run is supported
 - if env is missing, sync is skipped safely
 

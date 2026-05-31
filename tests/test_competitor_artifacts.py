@@ -36,6 +36,7 @@ def build_alert_schema() -> dict:
         "country": "Philippines",
         "country_source": "pipeline",
         "topic": "driver_support",
+        "event": "Driver support package launch",
         "priority": "medium",
         "published_date": "2026-05-19",
         "published_date_source": "provider",
@@ -45,6 +46,9 @@ def build_alert_schema() -> dict:
         "why_it_matters": "This can strengthen driver loyalty and brand perception.",
         "potential_impact": "Higher driver retention and stronger narrative in the market.",
         "recommended_action": "Compare with local inDrive messaging and benefits.",
+        "product_take": "This may raise parity expectations around driver support positioning.",
+        "product_risk": "Risk of a stronger driver-value anchor in the market.",
+        "product_follow_up": "Review whether driver-facing value needs a product-backed response.",
         "confidence": 0.82,
         "geo_validation_fallback": False,
     }
@@ -63,12 +67,13 @@ def test_json_file_storage_saves_markdown_preview_and_csv(tmp_path):
     csv_path = storage.save_candidates_csv([candidate], alert_schemas=[build_alert_schema()])
 
     preview_text = preview_path.read_text(encoding="utf-8")
-    assert "Ежедневный превью-дайджест competitor tracker" in preview_text
-    assert "### Что произошло" in preview_text
+    assert "Competitor Tracker Digest Preview" in preview_text
+    assert "### What happened" in preview_text
     assert "https://example.com/grab-driver-support" in preview_text
-    assert "Валидация geo/date:" in preview_text
+    assert "Validation:" in preview_text
     assert "competitor=pipeline" in preview_text
     assert "date=provider" in preview_text
+    assert "### Product take" in preview_text
 
     with csv_path.open(encoding="utf-8", newline="") as csv_file:
         rows = list(csv.DictReader(csv_file))

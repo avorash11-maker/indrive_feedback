@@ -109,7 +109,7 @@ def test_telegram_sender_posts_and_marks_delivered(tmp_path):
     }
     assert len(session.calls) == 1
     assert "sendMessage" in session.calls[0]["url"]
-    assert "🚨 Competitor Alert — Philippines" in session.calls[0]["json"]["text"]
+    assert "Алерт по конкуренту — Philippines" in session.calls[0]["json"]["text"]
     assert "Конкурент: Grab / Move It" in session.calls[0]["json"]["text"]
     assert storage.has_sent_alert(alert.digest_key, "telegram", "12345") is True
 
@@ -142,7 +142,7 @@ def test_telegram_sender_daily_digest_sends_alerts_as_separate_messages(tmp_path
     assert result["messages_sent"] == 2
     assert result["message_ids"] == ["777", "777"]
     assert len(session.calls) == 2
-    assert all("🚨 Competitor Alert — Philippines" in call["json"]["text"] for call in session.calls)
+    assert all("Алерт по конкуренту — Philippines" in call["json"]["text"] for call in session.calls)
 
 
 def test_telegram_sender_requires_env_or_explicit_credentials(tmp_path, monkeypatch):

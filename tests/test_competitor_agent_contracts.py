@@ -2,6 +2,7 @@ from competitor_tracker.agent_contracts import (
     AGENT_CONTRACT_VERSION,
     AgentRolePipeline,
     AgentRuntimeContext,
+    ProductStrategistRole,
     default_agent_role_contracts,
 )
 from competitor_tracker.models import ArticleContext, CandidateArticle, RawArticle
@@ -38,15 +39,23 @@ def test_default_agent_role_contracts_define_expected_boundaries():
     }
     assert contracts["news_gatekeeper"].execution_layer == "deterministic_guardrail"
     assert contracts["indrive_marcom_editor"].agent_owned_fields == (
+        "event",
         "what_happened",
         "why_it_matters",
         "potential_impact",
         "recommended_action",
         "confidence",
     )
-    assert contracts["product_strategist"].execution_layer == "advisory_noop"
+    assert contracts["product_strategist"].execution_layer == "agent_runtime"
     assert "competitor" in contracts["indrive_marcom_editor"].pipeline_owned_fields
     assert "resolved_publication_date" in contracts["indrive_marcom_editor"].pipeline_owned_fields
+    assert contracts["product_strategist"].agent_owned_fields == (
+        "product_take",
+        "product_risk",
+        "product_follow_up",
+        "product_strategist_invoked",
+        "product_strategist_trigger",
+    )
 
 
 def test_agent_role_pipeline_adds_contract_metadata_without_mutating_alert_shape():
@@ -101,6 +110,74 @@ def test_agent_role_pipeline_adds_contract_metadata_without_mutating_alert_shape
     assert alert["agent_roles_executed"] == (
         "news_gatekeeper",
         "indrive_marcom_editor",
-        "product_strategist",
     )
     assert alert["truth_layer_owner"] == "deterministic_pipeline"
+
+
+def test_product_strategist_invokes_for_product_sensitive_topic():
+    strategist = ProductStrategistRole()
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Grab launches airport booking feature in Manila",
+            url="https://example.com/grab-airport-feature",
+            provider="mock",
+            source="Example",
+            published_at="2026-05-20",
+            snippet="Grab launches an airport booking feature in Manila.",
+        ),
+        competitor="Grab",
+        topic_group="product_features_innovation",
+        score=8,
+        region="sea",
+        country_hint="Philippines",
+        reasons=("priority_signal",),
+        matched_keywords=("feature",),
+        summary="Grab launches airport booking feature in Manila",
+    )
+    alert = strategist.review_alert(
+        {
+            "competitor": "Grab",
+            "region": "SEA",
+            "country": "Philippines",
+            "topic": "product features innovation",
+            "event": "Airport booking feature launch",
+            "priority": "HIGH",
+            "what_happened": "Grab launched an airport booking feature.",
+            "why_it_matters": "This may shape product expectations.",
+            "potential_impact": "Potential adoption impact.",
+            "recommended_action": "Review locally.",
+            "confidence": 0.8,
+        },
+        candidate=candidate,
+    )
+
+    assert alert["product_strategist_invoked"] is True
+    assert alert["product_strategist_trigger"] == "product_features_innovation"
+    assert "parity" in alert["product_risk"].lower() or "feature-gap" in alert["product_risk"].lower()
+    assert alert["product_take"]
+    assert alert["product_follow_up"]
+
+
+def test_product_strategist_does_not_invoke_for_marketing_only_alert():
+    strategist = ProductStrategistRole()
+    candidate = build_candidate()
+    base_alert = {
+        "competitor": "Grab",
+        "region": "SEA",
+        "country": "Philippines",
+        "topic": "campaign launches",
+        "event": "Driver campaign launch",
+        "priority": "HIGH",
+        "what_happened": "Grab launched a campaign.",
+        "why_it_matters": "Narrative matters.",
+        "potential_impact": "Trust impact.",
+        "recommended_action": "Respond locally.",
+        "confidence": 0.8,
+    }
+
+    assert strategist.should_invoke(candidate, alert_schema=base_alert) is False
+    alert = strategist.review_alert(base_alert, candidate=candidate)
+
+    assert "product_take" not in alert
+    assert "product_risk" not in alert
+    assert "product_follow_up" not in alert

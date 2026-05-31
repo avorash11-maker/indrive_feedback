@@ -503,11 +503,12 @@ def test_competitor_alert_analyzer_uses_openai_response_shape(monkeypatch):
                     message=SimpleNamespace(
                         content="""
                         {
-                          "competitor": "Grab / Move It",
-                          "region": "Southeast Asia",
-                          "country": "Philippines",
-                          "topic": "Marketing + Policy Narrative",
-                          "priority": "MEDIUM",
+                              "competitor": "Grab / Move It",
+                              "region": "Southeast Asia",
+                              "country": "Philippines",
+                              "topic": "Marketing + Policy Narrative",
+                              "event": "Driver support messaging push",
+                              "priority": "MEDIUM",
                           "published_date": "2026-05-19",
                           "published_date_source": "llm",
                           "what_happened": "Platforms are promoting driver support programs as part of public messaging.",
@@ -551,6 +552,7 @@ def test_competitor_alert_analyzer_uses_openai_response_shape(monkeypatch):
 
     assert alert["competitor"] == "Grab / Move It"
     assert alert["country"] == "Philippines"
+    assert alert["event"] == "Driver support messaging push"
     assert alert["priority"] == "MEDIUM"
     assert alert["confidence"] == 0.86
     assert alert["published_date"] == "2026-05-19"
@@ -558,28 +560,33 @@ def test_competitor_alert_analyzer_uses_openai_response_shape(monkeypatch):
     assert alert["resolved_publication_date"].isoformat() == "2026-05-19"
     assert alert["resolved_publication_date_source"] == "llm"
     assert "driver support" in alert["what_happened"].lower()
-    assert "senior international marketing strategist for inDrive" in captured["messages"][0]["content"]
-    assert "Think like a senior operator responsible for competitor response" in captured["messages"][0]["content"]
+    assert "You are the inDrive Marcom Editor" in captured["messages"][0]["content"]
+    assert "Think like a senior Marcom/Growth editor" in captured["messages"][0]["content"]
     assert "Do not invent facts, metrics, partnerships, timelines, internal intent, or campaign performance." in captured["messages"][0]["content"]
     assert "Treat `competitor` and `region` from candidate metadata as pre-detected pipeline signals" in captured["messages"][0]["content"]
     assert "Do not override the provided `competitor` or `region` unless the article contains explicit evidence" in captured["messages"][0]["content"]
+    assert "Do not override the provided `country` signal unless the article contains explicit evidence" in captured["messages"][0]["content"]
     assert "If the signal is ambiguous, mixed, or weak, preserve the provided pipeline `competitor` and `region`." in captured["messages"][0]["content"]
     assert "Resolve the final publication date with this priority" in captured["messages"][0]["content"]
     assert "If the provider `published_at` field is None or missing" in captured["messages"][0]["content"]
+    assert '`event` must be a short, concrete naming of the move' in captured["messages"][0]["content"]
     assert 'Recommended actions must be applicable to inDrive, not generic advice for "a company".' in captured["messages"][0]["content"]
+    assert '"event": "string"' in captured["messages"][0]["content"]
     assert '"published_date": "YYYY-MM-DD"' in captured["messages"][0]["content"]
     assert '"published_date_source": "provider|html_scraped|llm|undated_fallback"' in captured["messages"][0]["content"]
     assert '"recommended_action": "string"' in captured["messages"][0]["content"]
     assert "Today's date for reference: 2026-05-21." in captured["messages"][1]["content"]
     assert "Article published_at metadata:" in captured["messages"][1]["content"]
-    assert "Write the alert for the inDrive Marcom / growth team." in captured["messages"][1]["content"]
+    assert "Write the alert as the inDrive Marcom Editor for the internal Telegram digest." in captured["messages"][1]["content"]
     assert "competitor strategy" in captured["messages"][1]["content"]
     assert "what inDrive can do better or differently" in captured["messages"][1]["content"]
     assert "treat candidate `competitor` and `region` as pipeline-detected inputs that should stay unchanged by default" in captured["messages"][1]["content"]
+    assert "treat candidate `country_hint` as a pipeline-owned geo hint" in captured["messages"][1]["content"]
     assert "change `competitor` or `region` only if the article explicitly proves the pipeline signal is wrong" in captured["messages"][1]["content"]
     assert "if the article is ambiguous, preserve the provided pipeline `competitor` and `region`" in captured["messages"][1]["content"]
+    assert '"event" should be a short internal label for the move' in captured["messages"][1]["content"]
     assert '"why_it_matters" should explain the strategic meaning, not just restate the article' in captured["messages"][1]["content"]
-    assert '"recommended_action" should give specific next moves for inDrive' in captured["messages"][1]["content"]
+    assert '"recommended_action" may be brief' in captured["messages"][1]["content"]
 
 
 def test_competitor_alert_analyzer_initializes_openai_with_explicit_http_client(
@@ -685,6 +692,35 @@ def test_competitor_alert_analyzer_marks_provider_date_source_for_fallback():
     assert alert["published_date_source"] == "provider"
     assert alert["resolved_publication_date"].isoformat() == "2026-05-20"
     assert alert["resolved_publication_date_source"] == "provider"
+
+
+def test_competitor_alert_analyzer_fallback_output_includes_marcom_editor_fields():
+    analyzer = CompetitorAlertAnalyzer(use_llm=False, config=build_config())
+    candidate = CandidateArticle(
+        raw_article=RawArticle(
+            title="Grab expands driver fuel support program in the Philippines",
+            url="https://example.com/grab-ph-fallback",
+            provider="google_news_rss",
+            snippet="Grab promotes driver support and subsidies in the Philippines.",
+            published_at="2026-05-20T09:00:00Z",
+        ),
+        competitor="Grab / Move It",
+        topic_group="campaign_launches",
+        score=7,
+        region="sea",
+        country_hint="Philippines",
+        language_hint="en",
+        matched_keywords=("support", "subsidies"),
+        reasons=("priority_signal", "region_match:sea"),
+    )
+
+    alert = analyzer.analyze_candidate(candidate)
+
+    assert alert["event"]
+    assert alert["what_happened"]
+    assert "market messaging" in alert["why_it_matters"].lower() or "competitive positioning" in alert["why_it_matters"].lower()
+    assert "brand narrative" in alert["potential_impact"].lower() or "growth messaging" in alert["potential_impact"].lower()
+    assert alert["recommended_action"]
 
 
 def test_competitor_alert_analyzer_prefers_llm_date_when_provider_is_missing_even_if_html_exists():
