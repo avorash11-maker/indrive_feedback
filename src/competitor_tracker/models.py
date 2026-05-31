@@ -36,6 +36,16 @@ class AlertSchema(TypedDict, total=False):
     recommended_action: str
     confidence: float
     geo_validation_fallback: bool
+    agent_contract_version: str
+    agent_roles_available: Tuple[str, ...]
+    agent_roles_executed: Tuple[str, ...]
+    truth_layer_owner: str
+    safety_layer_owner: str
+    news_gatekeeper_accept: bool
+    news_gatekeeper_canonical_topic: str
+    news_gatekeeper_relevance_reason: str
+    news_gatekeeper_priority_hint: str
+    news_gatekeeper_rejection_reason: str
 
 
 def _normalize_tags(values: List[str] | Tuple[str, ...]) -> Tuple[str, ...]:

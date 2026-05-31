@@ -40,6 +40,31 @@ Non-goals for this MVP release:
 
 ## Design Principles
 
+### Agent-led meaning over deterministic truth
+
+The target architecture is now explicit in code and docs:
+
+- deterministic pipeline remains the source of truth and safety layer for:
+  - providers
+  - normalization
+  - dedup
+  - geo validation
+  - competitor-region validation
+  - suppression/history
+  - delivery
+- agent roles operate above that foundation as controlled interpretation layers:
+  - `News Gatekeeper`
+  - `inDrive Marcom Editor`
+  - `Product Strategist`
+
+This foundation is intentionally conservative in the MVP:
+
+- the role boundaries are implemented now
+- backward-compatible flow remains unchanged
+- `News Gatekeeper` now runs as an explicit semantic gate over deterministic candidates
+- the existing Marcom-style alert enrichment remains the active editorial agent layer
+- `Product Strategist` is wired as a safe no-op seam for future expansion
+
 ### SQLite as source of truth
 
 `SQLite` is the operational backbone of the MVP. It stores:
@@ -143,6 +168,31 @@ graph TD
 
 ## Main Modules
 
+### Agent Contracts and Seams
+
+- [src/competitor_tracker/agent_contracts.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/agent_contracts.py)
+
+Responsibilities:
+
+- define the canonical agent contract version
+- describe the 3 role boundaries explicitly
+- encode which fields remain pipeline-owned
+- encode which fields are agent-owned vs only agent-proposed
+- provide the thin orchestration seam used by post-ranking alert enrichment
+- preserve backward compatibility by wrapping the current `CompetitorAlertAnalyzer` instead of replacing it
+
+### News Gatekeeper
+
+- [src/competitor_tracker/news_gatekeeper.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/news_gatekeeper.py)
+
+Responsibilities:
+
+- run after deterministic candidate filtering
+- return `accept/reject`, `canonical_topic`, `relevance_reason`, `priority_hint`, and optional `rejection_reason`
+- cut generic brand noise, broad industry fluff, mention-only stories, and off-scope visual/social-monitoring materials
+- preserve pipeline-owned `competitor`, `region`, and `country`
+- write trace metadata into accepted candidate artifacts and rejected drop audit rows
+
 ### Configuration
 
 - [src/competitor_tracker/config.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/config.py)
@@ -240,6 +290,7 @@ Responsibilities:
 - expose `resolved_publication_date` and `resolved_publication_date_source` so every downstream consumer uses the same canonical date
 - produce alert-ready schema for readable delivery
 - keep geo matching and ignored-geo policy isolated in a dedicated helper so region logic can evolve without bloating the analyzer orchestration
+- expose safe seams so future agents can interpret signals without taking ownership of deterministic truth fields
 
 ### Ranking and Suppression
 
@@ -346,6 +397,19 @@ At this stage, the analyzer also enforces the config truth layer for `competitor
 
 For geo detection specifically, the search `query` is no longer treated as location evidence. Region and `country_hint` are derived only from article-facing text such as title, snippet/body, and source metadata.
 
+### 4.5. Semantic Gate
+
+After deterministic prefiltering, `News Gatekeeper` applies one more semantic relevance decision before digest building:
+
+- accepted candidates keep their original pipeline-owned identity fields
+- accepted candidates receive gate metadata:
+  - `news_gatekeeper_accept`
+  - `news_gatekeeper_canonical_topic`
+  - `news_gatekeeper_relevance_reason`
+  - `news_gatekeeper_priority_hint`
+  - `news_gatekeeper_rejection_reason`
+- rejected candidates are appended to the audit trail with role-specific rejection reasons
+
 ### 5. Pre-Ranking Date Resolution
 
 Before final ranking, the pipeline builds alert schemas early enough to compute `resolved_publication_date` in advance.
@@ -396,7 +460,63 @@ The tracker keeps internal provenance markers such as:
 
 `region_source` can also become `geo_country_override` when the final region was restored from validated country evidence rather than preserved from the incoming pipeline field.
 
+The post-ranking alert step now also carries explicit agent-foundation metadata:
+
+- `agent_contract_version`
+- `agent_roles_available`
+- `agent_roles_executed`
+- `truth_layer_owner`
+- `safety_layer_owner`
+
 Those validation markers are visible in local review artifacts like markdown preview and CSV export, but they are intentionally kept out of the Telegram card.
+
+### Agent Ownership Contract
+
+Pipeline-owned fields:
+
+- candidate identity and evidence:
+  - `raw_article`
+  - `competitor`
+  - `topic_group`
+  - `score`
+  - `matched_keywords`
+  - `summary`
+  - `region`
+  - `country_hint`
+  - `language_hint`
+  - `reasons`
+- alert truth and safety:
+  - `competitor`
+  - `competitor_source`
+  - `region`
+  - `region_source`
+  - `country`
+  - `country_source`
+  - `published_date`
+  - `published_date_source`
+  - `resolved_publication_date`
+  - `resolved_publication_date_source`
+  - `geo_validation_fallback`
+
+Agent-owned fields:
+
+- `what_happened`
+- `why_it_matters`
+- `potential_impact`
+- `recommended_action`
+- `confidence`
+
+Agent-proposed but pipeline-validated fields:
+
+- `country`
+- `published_date`
+- `published_date_source`
+
+Reserved future strategist-only fields:
+
+- `strategic_take`
+- `follow_up_question`
+- `watchouts`
 
 ### 8. Artifacts and Delivery
 

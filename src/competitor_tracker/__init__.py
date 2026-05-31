@@ -5,6 +5,7 @@ from .environment import bootstrap_env
 bootstrap_env()
 
 from .config import TrackerConfig, TrackerRuntimeConfig
+from .agent_contracts import AGENT_CONTRACT_VERSION, AgentRoleContract, default_agent_role_contracts
 from .models import (
     Alert,
     AlertSchema,
@@ -21,6 +22,9 @@ from .models import (
 __all__ = [
     "TrackerConfig",
     "TrackerRuntimeConfig",
+    "AGENT_CONTRACT_VERSION",
+    "AgentRoleContract",
+    "default_agent_role_contracts",
     "RawArticle",
     "ArticleContext",
     "CandidateArticle",

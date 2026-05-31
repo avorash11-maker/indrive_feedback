@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional, Sequence
 
 from .article_context import ArticleContextExtractor
+from .agent_contracts import AgentRolePipeline, AgentRuntimeContext
 from .analyzer import (
     CompetitorAlertAnalyzer,
     CompetitorAnalyzer,
@@ -23,6 +24,7 @@ from .digest import DigestBuilder
 from .environment import build_env_preflight_report, get_env_value
 from .geo_policy import GeoPolicy
 from .models import CompetitorDigest, RunSummary
+from .news_gatekeeper import NewsGatekeeper
 from .normalization import (
     deduplicate_raw_articles,
     deduplicate_raw_articles_with_metrics,
@@ -1091,7 +1093,9 @@ def build_delivery_alert_schemas(
         except TypeError:
             return CompetitorAlertAnalyzer(use_llm=use_llm)
 
-    fallback_analyzer = make_alert_analyzer(use_llm=False)
+    agent_pipeline = AgentRolePipeline(
+        analyzer_factory=lambda use_llm, role_config: make_alert_analyzer(use_llm=use_llm),
+    )
     if not digest_alerts:
         return [], []
 
@@ -1106,22 +1110,17 @@ def build_delivery_alert_schemas(
         article_context_max_chars=article_context_max_chars,
     )
     llm_limit = max(0, effective_llm_top_n) if effective_use_llm_alerts else 0
-    llm_analyzer = (
-        make_alert_analyzer(use_llm=True) if llm_limit > 0 else fallback_analyzer
-    )
+    agent_pipeline.warmup(llm_enabled=llm_limit > 0, config=config)
     fallback_context_extractor = ArticleContextExtractor(
         max_chars=effective_article_context_max_chars
     )
-    context_extractor = (
-        fallback_context_extractor if llm_analyzer.use_llm else None
-    )
+    context_extractor = fallback_context_extractor if llm_limit > 0 else None
 
     alert_schemas = []
     article_contexts = []
     reusable_contexts = prefetched_contexts or {}
     for index, alert in enumerate(digest_alerts):
         article_context = reusable_contexts.get(alert.candidate.url)
-        analyzer = llm_analyzer if index < llm_limit else fallback_analyzer
         if (
             article_context is None
             and context_extractor is not None
@@ -1134,9 +1133,14 @@ def build_delivery_alert_schemas(
             or fallback_context_extractor.build_fallback_context(alert.candidate)
         )
         alert_schemas.append(
-            analyzer.analyze_candidate(
+            agent_pipeline.build_alert_schema(
                 alert.candidate,
                 article_context=article_context,
+                runtime=AgentRuntimeContext(
+                    ranking_index=index,
+                    llm_limit=llm_limit,
+                    config=config,
+                ),
             )
         )
     return alert_schemas, article_contexts
@@ -1515,6 +1519,15 @@ def run_pipeline(
 
     analyzer = CompetitorAnalyzer(min_score=min_score, config=config)
     analysis = analyzer.prefilter_raw_articles(raw_articles, regions=selected_regions)
+    gatekeeper_candidates, gatekeeper_dropped_articles = NewsGatekeeper(config=config).filter_candidates(
+        analysis.candidates
+    )
+    gatekeeper_analysis = type(analysis)(
+        candidates=gatekeeper_candidates,
+        dropped_count=len(gatekeeper_dropped_articles),
+        dropped_articles=gatekeeper_dropped_articles,
+    )
+    combined_dropped_articles = [*analysis.dropped_articles, *gatekeeper_dropped_articles]
     has_fresh_ingest = _has_fresh_ingest(
         raw_articles=raw_articles,
         fetched_articles_count=fetched_articles_count,
@@ -1525,7 +1538,7 @@ def run_pipeline(
     delivery_destination = (
         get_env_value("TELEGRAM_CHAT_ID") if telegram_mode in {"dry", "send"} else ""
     )
-    candidate_pool = list(analysis.candidates)
+    candidate_pool = list(gatekeeper_analysis.candidates)
 
     if telegram_mode in {"dry", "send"} and has_fresh_ingest:
         sqlite_storage.expire_stale_deferred(
@@ -1622,7 +1635,7 @@ def run_pipeline(
     )
     alert_schemas = all_alert_schemas
     article_contexts = all_article_contexts
-    for candidate in analysis.candidates:
+    for candidate in gatekeeper_analysis.candidates:
         candidate.raw_article.metadata.setdefault("is_expired", False)
         sqlite_storage.merge_raw_article_metadata(
             url=candidate.url,
@@ -1631,8 +1644,8 @@ def run_pipeline(
     sqlite_storage.insert_alerts(digest.alerts)
 
     storage = JsonFileStorage(runtime.output_dir)
-    candidates_path = storage.save_candidates(analysis.candidates)
-    dropped_articles_path = storage.save_dropped_articles(analysis.dropped_articles)
+    candidates_path = storage.save_candidates(gatekeeper_analysis.candidates)
+    dropped_articles_path = storage.save_dropped_articles(combined_dropped_articles)
     digest_path = storage.save_digest(digest)
     preview_path = storage.save_markdown_preview(
         digest.alerts,
@@ -1640,7 +1653,7 @@ def run_pipeline(
         generated_at=digest.generated_at,
     )
     candidates_csv_path = (
-        storage.save_candidates_csv(analysis.candidates, alert_schemas=alert_schemas)
+        storage.save_candidates_csv(gatekeeper_analysis.candidates, alert_schemas=alert_schemas)
         if export_csv
         else None
     )
@@ -1711,17 +1724,17 @@ def run_pipeline(
         providers=provider_names,
         queries_generated=len(config.queries_for_regions(selected_regions)),
         raw_articles_collected=len(raw_articles),
-        candidates_kept=len(analysis.candidates),
+        candidates_kept=len(gatekeeper_analysis.candidates),
         alerts_created=len(digest.alerts),
         daily_digest_limit=config.daily_digest_limit,
         raw_articles_fetched=fetched_articles_count,
         raw_articles_deduplicated=len(raw_articles),
-        articles_filtered_out=analysis.dropped_count,
+        articles_filtered_out=analysis.dropped_count + gatekeeper_analysis.dropped_count,
         alerts_sent=len(telegram_alerts) if telegram_mode == "send" and telegram_result else 0,
         status=run_status,
         drop_reasons={
-            reason: sum(1 for item in analysis.dropped_articles if item.reason == reason)
-            for reason in sorted({item.reason for item in analysis.dropped_articles})
+            reason: sum(1 for item in combined_dropped_articles if item.reason == reason)
+            for reason in sorted({item.reason for item in combined_dropped_articles})
         },
         provider_errors=provider_errors,
         provider_diagnostics=provider_diagnostics,
@@ -1743,6 +1756,7 @@ def run_pipeline(
 
     return {
         "analysis": analysis,
+        "gatekeeper_analysis": gatekeeper_analysis,
         "digest": digest,
         "alert_schemas": alert_schemas,
         "article_contexts": article_contexts,

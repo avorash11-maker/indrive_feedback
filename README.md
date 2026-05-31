@@ -2,6 +2,12 @@
 
 Config-driven competitor intelligence pipeline for daily market monitoring. The system collects low-cost public signals, removes duplicates, applies a cheap rule-based prefilter before any LLM step, ranks the strongest candidates, and delivers a compact digest to Telegram with an optional Notion mirror.
 
+The repository now also includes a safe foundation for an agent-led pipeline:
+
+- deterministic pipeline still owns truth and safety
+- agent roles are explicitly defined as `News Gatekeeper`, `inDrive Marcom Editor`, and `Product Strategist`
+- current behavior stays backward compatible, with the existing alert-enrichment path wrapped as the `inDrive Marcom Editor` seam
+
 ## Product Split
 
 - `competitor_tracker` is the new MVP product branch in this repository.
@@ -90,6 +96,7 @@ The design goal is not “use AI everywhere”, but “use AI only where it help
 - `Cheap before smart`: rule-based filtering reduces unnecessary LLM usage and lowers daily cost.
 - `Config over code`: new regions, competitors, and topic groups can be adjusted without rewriting pipeline logic.
 - `Truth before rewrite`: the LLM is not allowed to freely reinterpret `competitor` and `region`; config and pipeline detections stay primary unless the article clearly disproves them.
+- `Contracts before autonomy`: agent roles have explicit ownership boundaries so richer agent logic can be added later without eroding the deterministic foundation.
 - `Digest, not firehose`: suppression and ranking keep the daily output readable for humans.
 - `Carry-over, not loss`: relevant alerts that miss today's Telegram window can re-enter the next run, but only for a limited time.
 - `Dates with guardrails`: the pipeline resolves one canonical publication date before ranking, stale gating, Telegram, Notion, and CSV export, and very old articles are archived unless they qualify as strong newly detected signals.

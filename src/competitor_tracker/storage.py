@@ -139,6 +139,11 @@ class JsonFileStorage:
                     "region_source",
                     "country_source",
                     "geo_validation_fallback",
+                    "news_gatekeeper_accept",
+                    "news_gatekeeper_canonical_topic",
+                    "news_gatekeeper_relevance_reason",
+                    "news_gatekeeper_priority_hint",
+                    "news_gatekeeper_rejection_reason",
                     "title",
                     "source",
                     "published_at",
@@ -179,6 +184,19 @@ class JsonFileStorage:
                         "region_source": alert_schema.get("region_source", ""),
                         "country_source": alert_schema.get("country_source", ""),
                         "geo_validation_fallback": alert_schema.get("geo_validation_fallback", ""),
+                        "news_gatekeeper_accept": alert_schema.get("news_gatekeeper_accept", ""),
+                        "news_gatekeeper_canonical_topic": alert_schema.get(
+                            "news_gatekeeper_canonical_topic", ""
+                        ),
+                        "news_gatekeeper_relevance_reason": alert_schema.get(
+                            "news_gatekeeper_relevance_reason", ""
+                        ),
+                        "news_gatekeeper_priority_hint": alert_schema.get(
+                            "news_gatekeeper_priority_hint", ""
+                        ),
+                        "news_gatekeeper_rejection_reason": alert_schema.get(
+                            "news_gatekeeper_rejection_reason", ""
+                        ),
                         "title": candidate.title,
                         "source": candidate.raw_article.source,
                         "published_at": candidate.raw_article.published_at or "",
