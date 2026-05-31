@@ -1,7 +1,7 @@
 import csv
 import json
 
-from competitor_tracker.models import CandidateArticle, DroppedArticle, RawArticle
+from competitor_tracker.models import CandidateArticle, CompetitorDigest, DroppedArticle, RawArticle
 from competitor_tracker.storage import JsonFileStorage
 
 
@@ -134,6 +134,39 @@ def test_json_file_storage_keeps_run_summary_json_readable(tmp_path):
     assert payload["alerts_created"] == 2
     assert payload["drop_reasons"] == {"ignored_geo_without_target_confirmation": 1}
     assert payload["provider_errors"]["gdelt"] == "timeout"
+
+
+def test_json_file_storage_saves_digest_with_business_region_labels(tmp_path):
+    storage = JsonFileStorage(tmp_path)
+    candidate = build_candidate()
+    digest = CompetitorDigest(
+        generated_at="2026-05-19T09:00:00Z",
+        competitors=("Grab",),
+        alerts=(candidate.to_alert(priority="MEDIUM", confidence=0.82),),
+        highlights=("Grab: Grab launches a new driver support package in Manila",),
+        regions=("sea", "mea"),
+    )
+
+    path = storage.save_digest(digest)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["regions"] == ["SEA", "Africa & MEA"]
+
+
+def test_json_file_storage_deduplicates_business_region_labels_in_digest(tmp_path):
+    storage = JsonFileStorage(tmp_path)
+    digest = CompetitorDigest(
+        generated_at="2026-05-19T09:00:00Z",
+        competitors=("Bolt", "Uber", "Careem"),
+        alerts=(),
+        highlights=(),
+        regions=("africa", "mea", "africa"),
+    )
+
+    path = storage.save_digest(digest)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["regions"] == ["Africa & MEA"]
 
 
 def test_json_file_storage_saves_dropped_articles_json(tmp_path):

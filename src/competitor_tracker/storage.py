@@ -13,6 +13,7 @@ from typing import Any, Optional, Protocol, Sequence
 
 from .formatter import format_daily_digest_markdown
 from .models import Alert, CandidateArticle, CompetitorDigest, DeliveryRecord, DroppedArticle, RawArticle, RunSummary
+from .product_logic import normalize_topic_group_name, presentable_region_name
 
 
 class StorageBackend(Protocol):
@@ -71,8 +72,12 @@ class JsonFileStorage:
 
     def save_digest(self, digest: CompetitorDigest) -> Path:
         output_path = self.base_dir / "digest.json"
+        payload = asdict(digest)
+        payload["regions"] = list(
+            dict.fromkeys(presentable_region_name(region) for region in digest.regions)
+        )
         output_path.write_text(
-            json.dumps(asdict(digest), ensure_ascii=False, indent=2),
+            json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         return output_path
@@ -1072,7 +1077,7 @@ class SQLiteTrackerStorage:
                 CandidateArticle(
                     raw_article=raw_article,
                     competitor=row["competitor"],
-                    topic_group=row["topic_group"],
+                    topic_group=normalize_topic_group_name(row["topic_group"]),
                     score=int(row["candidate_score"]),
                     matched_keywords=tuple(json.loads(row["matched_keywords_json"] or "[]")),
                     summary=row["summary"],

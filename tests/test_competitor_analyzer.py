@@ -143,6 +143,24 @@ def test_prefilter_matches_topic_region_and_language_hint():
     assert candidate.score >= 8
 
 
+def test_prefilter_does_not_match_competitor_or_topic_from_query_only():
+    analyzer = CompetitorAnalyzer(min_score=5, config=build_config())
+    raw_article = RawArticle(
+        title="Middle East crisis live updates",
+        url="https://example.com/middle-east-liveblog",
+        provider="guardian",
+        source="The Guardian",
+        snippet="The liveblog covers ceasefire negotiations and overnight strikes.",
+        query='"Gojek" launching in Indonesia',
+        competitor_hints=("Gojek",),
+    )
+
+    result = analyzer.prefilter_raw_articles([raw_article], regions=("sea",))
+
+    assert result.candidates == []
+    assert result.dropped_articles[0].reason == "no_competitor_match"
+
+
 def test_prefilter_priority_candidate_scoring_for_regulation_signal():
     analyzer = CompetitorAnalyzer(min_score=6, config=build_config())
     raw_article = RawArticle(
@@ -158,7 +176,7 @@ def test_prefilter_priority_candidate_scoring_for_regulation_signal():
 
     assert len(result.candidates) == 1
     candidate = result.candidates[0]
-    assert candidate.topic_group == "regulation"
+    assert candidate.topic_group == "pricing"
     assert candidate.region == "latam"
     assert candidate.country_hint == "Mexico"
     assert candidate.language_hint == "es"
@@ -354,9 +372,8 @@ def test_prefilter_keeps_real_grab_superbank_article():
 
     result = analyzer.prefilter_raw_articles([raw_article], regions=("sea",))
 
-    assert len(result.candidates) == 1
-    assert result.candidates[0].competitor == "Grab"
-    assert result.candidates[0].country_hint == "Indonesia"
+    assert result.candidates == []
+    assert result.dropped_articles[0].reason == "no_topic_match"
 
 
 def test_prefilter_keeps_real_grab_qoo_media_article():
@@ -373,8 +390,8 @@ def test_prefilter_keeps_real_grab_qoo_media_article():
 
     result = analyzer.prefilter_raw_articles([raw_article], regions=("sea",))
 
-    assert len(result.candidates) == 1
-    assert result.candidates[0].competitor == "Grab"
+    assert result.candidates == []
+    assert result.dropped_articles[0].reason == "no_topic_match"
 
 
 def test_prefilter_keeps_real_grab_driver_recruitment_article():
@@ -431,7 +448,7 @@ def test_prefilter_keeps_target_article_when_ignored_geo_and_target_geo_coexist(
     assert len(result.candidates) == 1
     candidate = result.candidates[0]
     assert candidate.competitor == "Grab"
-    assert candidate.topic_group == "pricing"
+    assert candidate.topic_group == "product_launch"
     assert result.dropped_articles == []
 
 
@@ -457,7 +474,7 @@ def test_competitor_alert_analyzer_returns_fallback_schema_without_llm():
     alert = analyzer.analyze_candidate(candidate)
 
     assert alert["competitor"] == "Grab / Move It"
-    assert alert["region"] == "sea"
+    assert alert["region"] == "SEA"
     assert alert["country"] == "Philippines"
     assert alert["topic"] == "marketing + policy narrative"
     assert alert["priority"] == "MEDIUM"
@@ -938,7 +955,7 @@ def test_competitor_alert_analyzer_rejects_llm_competitor_region_mismatch():
     )
 
     assert alert["competitor"] == "Grab / Move It"
-    assert alert["region"] == "sea"
+    assert alert["region"] == "SEA"
     assert alert["country"] == "Philippines"
     assert alert["competitor_source"] == "pipeline"
     assert alert["region_source"] == "pipeline"

@@ -4,6 +4,11 @@ from pathlib import Path
 import pytest
 
 from competitor_tracker.config import TrackerConfig, TrackerRuntimeConfig
+from competitor_tracker.product_logic import (
+    TOPIC_GROUPS,
+    VISUAL_ASSETS_POLICY,
+    allowed_competitor_region_pairs,
+)
 
 
 def test_load_default_competitor_tracker_config():
@@ -32,14 +37,14 @@ def test_load_default_competitor_tracker_config():
     assert "market_expansion" in config.topic_groups
     assert "campaign_launches" in config.topic_groups
     assert "pricing_promo" in config.topic_groups
-    assert "industry_context" in config.topic_groups
+    assert "core_industry_terms" in config.topic_groups
     assert "strategic_operations" in config.topic_groups
     assert "performance_growth" in config.topic_groups
     assert "product_features_innovation" in config.topic_groups
     assert "launching in" in config.topic_groups["market_expansion"]
     assert "brand ambassador" in config.topic_groups["campaign_launches"]
     assert "promo code" in config.topic_groups["pricing_promo"]
-    assert "ride-hailing" in config.topic_groups["industry_context"]
+    assert "ride-hailing" in config.topic_groups["core_industry_terms"]
     assert "bidding model" in config.topic_groups["product_features_innovation"]
     assert config.daily_digest_limit == 12
     assert config.enabled_providers == ("gdelt", "google_news_rss", "regional_rss", "guardian")
@@ -76,6 +81,15 @@ def test_load_default_competitor_tracker_config():
     assert config.is_competitor_allowed_in_region("Grab", "latam") is False
     assert config.is_competitor_allowed_in_region("99", "latam") is True
     assert config.is_competitor_allowed_in_region("99", "sea") is False
+    assert config.allowed_competitor_region_pairs() == allowed_competitor_region_pairs()
+    assert config.business_region_name("latam") == "LATAM"
+    assert config.business_region_name("sea") == "SEA"
+    assert config.business_region_name("africa") == "Africa & MEA"
+    assert config.business_region_name("mea") == "Africa & MEA"
+    assert config.business_region_name("cis_central_asia") == "CIS / Central Asia"
+    assert config.canonical_topic_group_name("industry_context") == "core_industry_terms"
+    assert config.visual_assets_enabled_by_default is False
+    assert VISUAL_ASSETS_POLICY.in_scope is False
 
 
 def test_competitor_truth_layer_helpers_reject_unknown_or_empty_values():
@@ -88,6 +102,15 @@ def test_competitor_truth_layer_helpers_reject_unknown_or_empty_values():
     assert config.region_for_competitor("Unknown Brand") == ()
     assert config.is_competitor_allowed_in_region("", "sea") is False
     assert config.is_competitor_allowed_in_region("Grab", "unknown_region") is False
+
+
+def test_default_product_config_matches_canonical_topic_contract():
+    config = TrackerConfig.load_default()
+
+    assert config.topic_groups == {
+        topic_name: tuple(keywords)
+        for topic_name, keywords in TOPIC_GROUPS.items()
+    }
 
 
 def test_from_dict_rejects_unknown_region_reference():
@@ -299,6 +322,7 @@ def test_runtime_config_reads_llm_settings_from_env(monkeypatch):
     monkeypatch.setenv("COMPETITOR_TRACKER_TELEGRAM_TOP_N", "9")
     monkeypatch.setenv("COMPETITOR_TRACKER_ARTICLE_CONTEXT_MAX_CHARS", "1234")
     monkeypatch.setenv("COMPETITOR_TRACKER_ENABLE_NEWSAPI_FULL_RUN", "true")
+    monkeypatch.setenv("COMPETITOR_TRACKER_GDELT_MAX_QUERIES_PER_RUN", "8")
     monkeypatch.setenv("COMPETITOR_TRACKER_NEWSAPI_MAX_QUERIES_PER_RUN", "11")
     monkeypatch.setenv("COMPETITOR_TRACKER_GUARDIAN_MAX_QUERIES_PER_RUN", "13")
     monkeypatch.setenv("COMPETITOR_TRACKER_HISTORICAL_PRECISION_HALF_LIFE_DAYS", "21")
@@ -315,6 +339,7 @@ def test_runtime_config_reads_llm_settings_from_env(monkeypatch):
     assert runtime.telegram_top_n == 9
     assert runtime.article_context_max_chars == 1234
     assert runtime.enable_newsapi_full_run is True
+    assert runtime.gdelt_max_queries_per_run == 8
     assert runtime.newsapi_max_queries_per_run == 11
     assert runtime.guardian_max_queries_per_run == 13
     assert runtime.historical_precision_half_life_days == 21
@@ -326,6 +351,7 @@ def test_runtime_config_defaults_llm_settings_to_safe_non_llm_mode(monkeypatch):
     monkeypatch.delenv("COMPETITOR_TRACKER_TELEGRAM_TOP_N", raising=False)
     monkeypatch.delenv("COMPETITOR_TRACKER_ARTICLE_CONTEXT_MAX_CHARS", raising=False)
     monkeypatch.delenv("COMPETITOR_TRACKER_ENABLE_NEWSAPI_FULL_RUN", raising=False)
+    monkeypatch.delenv("COMPETITOR_TRACKER_GDELT_MAX_QUERIES_PER_RUN", raising=False)
     monkeypatch.delenv("COMPETITOR_TRACKER_NEWSAPI_MAX_QUERIES_PER_RUN", raising=False)
     monkeypatch.delenv("COMPETITOR_TRACKER_GUARDIAN_MAX_QUERIES_PER_RUN", raising=False)
     monkeypatch.delenv("COMPETITOR_TRACKER_HISTORICAL_PRECISION_HALF_LIFE_DAYS", raising=False)
@@ -337,6 +363,7 @@ def test_runtime_config_defaults_llm_settings_to_safe_non_llm_mode(monkeypatch):
     assert runtime.telegram_top_n == 15
     assert runtime.article_context_max_chars == 8000
     assert runtime.enable_newsapi_full_run is False
+    assert runtime.gdelt_max_queries_per_run == 10
     assert runtime.newsapi_max_queries_per_run == 25
     assert runtime.guardian_max_queries_per_run == 40
     assert runtime.historical_precision_half_life_days == 30

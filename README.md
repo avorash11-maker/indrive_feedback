@@ -234,6 +234,7 @@ For quick local automation you can also run [qa_competitor_feeds.py](/abs/path/C
 The tracker uses one config file as source of truth:
 
 - [default_config.json](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/default_config.json)
+- [product_logic.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/product_logic.py)
 
 It defines:
 
@@ -247,6 +248,8 @@ It defines:
 
 Important config contract:
 
+- `product_logic.py` is the explicit frozen MVP product contract. It defines canonical regions, canonical `competitors_by_region`, canonical topic groups, allowed competitor-region pairs, digest relevance rules, legacy aliases, and the visual-assets scope boundary.
+- `default_config.json` is validated against that contract on `TrackerConfig.load_default()`, so drift in the default product path now fails fast.
 - `competitors_by_region` is not only a query-expansion helper.
 - It is the validation matrix for allowed `competitor + region` combinations in the new tracker flow.
 - If a detected or LLM-returned pair conflicts with this matrix, the pipeline should reject or normalize it instead of trusting free-form model output.
@@ -264,22 +267,33 @@ Important config contract:
 - `country` validation understands configured country vocabulary plus common aliases and ISO-style country codes.
 - Local review artifacts such as markdown preview and review CSV should expose geo/date validation outcomes for manual QA, while the Telegram card should stay concise and human-readable.
 
-The default MVP config is now aligned to these monitoring themes:
+The canonical MVP monitoring themes are:
 
 - `market_expansion`
-  keywords like `launching in`, `new city`, `entering market`, `expansion`
+  keywords: `launching in`, `new city`, `entering market`, `expansion`
 - `campaign_launches`
-  keywords like `campaign`, `partnership`, `brand ambassador`, `new feature`
+  keywords: `campaign`, `partnership`, `brand ambassador`, `new feature`
 - `pricing_promo`
-  keywords like `discount`, `promo code`, `price cut`, `subscription`
-- `industry_context`
-  terms like `ride-hailing`, `e-hailing`, `on-demand mobility`, `ride-sharing`, `taxi app`, `VTC`, `MaaS`
+  keywords: `discount`, `promo code`, `price cut`, `subscription`
+- `core_industry_terms`
+  keywords: `ride-hailing`, `e-hailing`, `on-demand mobility`, `ride-sharing`, `taxi app`, `VTC`, `MaaS`
 - `strategic_operations`
-  terms like `market entry`, `launching operations`, `license obtained`, `regulatory approval`, `strategic partnership`, `driver recruitment campaign`
+  keywords: `market entry`, `launching operations`, `license obtained`, `regulatory approval`, `strategic partnership`, `driver recruitment campaign`
 - `performance_growth`
-  terms like `first ride free`, `discounted rides`, `referral bonus`, `loyalty program`, `low commission for drivers`, `bonus for new drivers`
+  keywords: `first ride free`, `discounted rides`, `referral bonus`, `loyalty program`, `low commission for drivers`, `bonus for new drivers`
 - `product_features_innovation`
-  terms like `intercity`, `delivery`, `courier service`, `freight`, `fixed price`, `bidding model`, `safety features`
+  keywords: `intercity`, `delivery`, `courier service`, `freight`, `fixed price`, `bidding model`, `safety features`
+
+Canonical competitor coverage by business region:
+
+- `LATAM`: `Uber`, `DiDi`, `Cabify`, `99`
+- `SEA`: `Grab`, `Gojek`, `Maxim`, `Bolt`
+- `Africa & MEA`: `Bolt`, `Uber`, `Careem`, `Yassir`, `Heetch`
+- `CIS / Central Asia`: `Yandex Go`, `Bolt`, `Maxim`
+
+Canonical visual-assets rule:
+
+- logos, banners, direct social-media monitoring, vision analysis, and social scraping are explicitly `out of scope` and `disabled by default` for the current MVP
 
 Runtime settings come from env:
 
@@ -294,6 +308,9 @@ COMPETITOR_TRACKER_LLM_TOP_N=
 COMPETITOR_TRACKER_TELEGRAM_TOP_N=
 COMPETITOR_TRACKER_ARTICLE_CONTEXT_MAX_CHARS=
 COMPETITOR_TRACKER_ENABLE_NEWSAPI_FULL_RUN=false
+COMPETITOR_TRACKER_GDELT_MAX_QUERIES_PER_RUN=10
+COMPETITOR_TRACKER_GDELT_MIN_REQUEST_INTERVAL_SECONDS=5
+COMPETITOR_TRACKER_GDELT_COOLDOWN_SECONDS=60
 COMPETITOR_TRACKER_NEWSAPI_MAX_QUERIES_PER_RUN=25
 COMPETITOR_TRACKER_NEWSAPI_DAILY_REQUEST_LIMIT=90
 COMPETITOR_TRACKER_NEWSAPI_CACHE_TTL_SECONDS=600
@@ -303,6 +320,7 @@ COMPETITOR_TRACKER_GUARDIAN_DAILY_REQUEST_LIMIT=450
 COMPETITOR_TRACKER_GUARDIAN_CACHE_TTL_SECONDS=900
 COMPETITOR_TRACKER_GUARDIAN_COOLDOWN_SECONDS=900
 COMPETITOR_TRACKER_HISTORICAL_PRECISION_HALF_LIFE_DAYS=30
+COMPETITOR_TRACKER_GDELT_RATE_LIMIT_STATE_PATH=
 COMPETITOR_TRACKER_NEWSAPI_CACHE_PATH=
 COMPETITOR_TRACKER_NEWSAPI_BUDGET_PATH=
 COMPETITOR_TRACKER_GUARDIAN_CACHE_PATH=
@@ -352,6 +370,15 @@ Important behavior:
 - missing Notion secrets never block the Telegram-only release path unless you explicitly request Notion sync
 
 NewsAPI is now treated as an opt-in provider for full pipeline runs. By default, the repository config uses `gdelt`, `google_news_rss`, and a curated `regional_rss` tier, while `newsapi` remains available for `test-provider` and manual diagnostics. If you explicitly enable NewsAPI for a full run, the tracker applies a local query cap, daily request budget, TTL cache, and cooldown after `429 rateLimited` responses.
+
+GDELT is now treated as a best-effort, quota-sensitive provider in the product architecture. The tracker applies:
+
+- a per-run query cap via `COMPETITOR_TRACKER_GDELT_MAX_QUERIES_PER_RUN`
+- a minimum pacing interval of `1 request every 5 seconds` by default via `COMPETITOR_TRACKER_GDELT_MIN_REQUEST_INTERVAL_SECONDS`
+- a persisted cooldown after `429` responses via `COMPETITOR_TRACKER_GDELT_COOLDOWN_SECONDS`
+- a persisted local state file via `COMPETITOR_TRACKER_GDELT_RATE_LIMIT_STATE_PATH`
+
+This matches GDELT's published guidance that the hosted DOC API is rate limited and that higher-volume querying should move to `Web NGrams 3.0` instead of treating the API as an at-scale bulk retrieval interface.
 
 `competitor_tracker` now loads `.env` automatically, so the CLI reads keys from one place without manual shell export. Canonical names are:
 

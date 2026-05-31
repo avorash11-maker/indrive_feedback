@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -343,6 +344,197 @@ def test_gdelt_provider_surfaces_unexpected_json_structure():
     assert diagnostics["queries"][0]["response_body_kind"] == "json"
     assert diagnostics["queries"][0]["response_parse_stage"] == "schema_validation"
     assert '{"articles": {}}' in diagnostics["queries"][0]["response_preview"]
+
+
+def test_gdelt_provider_waits_five_seconds_between_queries(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "COMPETITOR_TRACKER_GDELT_RATE_LIMIT_STATE_PATH",
+        str(tmp_path / "gdelt_rate_limit_state.json"),
+    )
+    monkeypatch.setenv("COMPETITOR_TRACKER_GDELT_MIN_REQUEST_INTERVAL_SECONDS", "5")
+    sleep_calls: list[float] = []
+    monkeypatch.setattr("competitor_tracker.providers.time.sleep", sleep_calls.append)
+
+    payload = {
+        "articles": [
+            {
+                "title": "Bolt expands courier partnership in Kenya",
+                "url": "https://example.com/bolt-kenya",
+                "domain": "example.com",
+                "seendate": "2026-05-18T09:00:00Z",
+                "snippet": "Courier partnership update.",
+            }
+        ]
+    }
+    provider = GdeltProvider(
+        session=FakeSession(
+            [
+                FakeResponse(payload=payload, headers={"Content-Type": "application/json"}),
+                FakeResponse(payload=payload, headers={"Content-Type": "application/json"}),
+            ]
+        )
+    )
+    base_time = datetime(2026, 5, 18, 9, 0, 0, tzinfo=timezone.utc)
+    timestamps = iter(
+        [
+            base_time,
+            base_time + timedelta(seconds=1),
+            base_time + timedelta(seconds=5),
+        ]
+    )
+    monkeypatch.setattr(provider, "_utc_now", lambda: next(timestamps))
+
+    _articles, diagnostics = provider.fetch_with_diagnostics(
+        ProviderRequest(
+            competitors=("Bolt",),
+            days=7,
+            queries=['"Bolt" partnership Kenya', '"Bolt" expansion Kenya'],
+        )
+    )
+
+    assert sleep_calls == [4.0]
+    assert diagnostics["queries"][0]["rate_limit_wait_seconds"] == 0.0
+    assert diagnostics["queries"][1]["rate_limit_wait_seconds"] == 4.0
+
+
+def test_gdelt_provider_rate_limit_state_persists_between_instances(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "COMPETITOR_TRACKER_GDELT_RATE_LIMIT_STATE_PATH",
+        str(tmp_path / "gdelt_rate_limit_state.json"),
+    )
+    monkeypatch.setenv("COMPETITOR_TRACKER_GDELT_MIN_REQUEST_INTERVAL_SECONDS", "5")
+    sleep_calls: list[float] = []
+    monkeypatch.setattr("competitor_tracker.providers.time.sleep", sleep_calls.append)
+
+    payload = {
+        "articles": [
+            {
+                "title": "Bolt expands courier partnership in Kenya",
+                "url": "https://example.com/bolt-kenya",
+                "domain": "example.com",
+                "seendate": "2026-05-18T09:00:00Z",
+                "snippet": "Courier partnership update.",
+            }
+        ]
+    }
+    first_provider = GdeltProvider(
+        session=FakeSession([FakeResponse(payload=payload, headers={"Content-Type": "application/json"})])
+    )
+    second_provider = GdeltProvider(
+        session=FakeSession([FakeResponse(payload=payload, headers={"Content-Type": "application/json"})])
+    )
+    base_time = datetime(2026, 5, 18, 9, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(first_provider, "_utc_now", lambda: base_time)
+    later_timestamps = iter(
+        [
+            base_time + timedelta(seconds=2),
+            base_time + timedelta(seconds=5),
+        ]
+    )
+    monkeypatch.setattr(second_provider, "_utc_now", lambda: next(later_timestamps))
+
+    first_provider.fetch(
+        ProviderRequest(
+            competitors=("Bolt",),
+            days=7,
+            queries=['"Bolt" partnership Kenya'],
+        )
+    )
+    _articles, diagnostics = second_provider.fetch_with_diagnostics(
+        ProviderRequest(
+            competitors=("Bolt",),
+            days=7,
+            queries=['"Bolt" expansion Kenya'],
+        )
+    )
+
+    assert sleep_calls == [3.0]
+    assert diagnostics["queries"][0]["rate_limit_wait_seconds"] == 3.0
+
+
+def test_gdelt_provider_surfaces_429_without_retrying_same_query(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "COMPETITOR_TRACKER_GDELT_RATE_LIMIT_STATE_PATH",
+        str(tmp_path / "gdelt_rate_limit_state.json"),
+    )
+    monkeypatch.setenv("COMPETITOR_TRACKER_GDELT_MIN_REQUEST_INTERVAL_SECONDS", "5")
+    monkeypatch.setattr("competitor_tracker.providers.time.sleep", lambda _: None)
+
+    class RateLimitedSession:
+        def __init__(self) -> None:
+            self.headers = {}
+            self.calls = 0
+
+        def get(self, *args, **kwargs):
+            self.calls += 1
+            return FakeResponse(
+                content=(
+                    b"Please limit requests to one every 5 seconds or contact "
+                    b"kalev.leetaru5@gmail.com for larger queries."
+                ),
+                status_code=429,
+            )
+
+    session = RateLimitedSession()
+    provider = GdeltProvider(session=session)
+
+    with pytest.raises(ProviderError, match="rate limit hit \\[429\\]") as exc_info:
+        provider.fetch(
+            ProviderRequest(
+                competitors=("Grab",),
+                days=1,
+                queries=["Grab Indonesia"],
+            )
+        )
+
+    diagnostics = exc_info.value.diagnostics
+    assert session.calls == 1
+    assert diagnostics["queries"][0]["http_status"] == 429
+    assert diagnostics["queries"][0]["rate_limit_wait_seconds"] == 0.0
+    assert diagnostics["queries"][0]["response_preview"].startswith("Please limit requests")
+
+
+def test_gdelt_provider_fetch_with_diagnostics_soft_fails_and_skips_remaining_queries_after_429(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "COMPETITOR_TRACKER_GDELT_RATE_LIMIT_STATE_PATH",
+        str(tmp_path / "gdelt_rate_limit_state.json"),
+    )
+    monkeypatch.setenv("COMPETITOR_TRACKER_GDELT_MIN_REQUEST_INTERVAL_SECONDS", "5")
+    monkeypatch.setenv("COMPETITOR_TRACKER_GDELT_COOLDOWN_SECONDS", "60")
+    monkeypatch.setattr("competitor_tracker.providers.time.sleep", lambda _: None)
+
+    provider = GdeltProvider(
+        session=FakeSession(
+            [
+                FakeResponse(
+                    content=(
+                        b"Please limit requests to one every 5 seconds or contact "
+                        b"kalev.leetaru5@gmail.com for larger queries."
+                    ),
+                    status_code=429,
+                )
+            ]
+        )
+    )
+
+    articles, diagnostics = provider.fetch_with_diagnostics(
+        ProviderRequest(
+            competitors=("Grab", "Uber"),
+            days=1,
+            queries=["Grab Indonesia", "Uber Mexico"],
+        )
+    )
+
+    assert articles == []
+    assert diagnostics["status"] == "error"
+    assert len(diagnostics["queries"]) == 2
+    assert diagnostics["queries"][0]["http_status"] == 429
+    assert diagnostics["queries"][0]["cooldown_hit"] is True
+    assert diagnostics["queries"][1]["status"] == "skipped"
+    assert diagnostics["queries"][1]["cooldown_hit"] is True
+    assert diagnostics["queries"][1]["response_body_kind"] == "cooldown"
 
 
 def test_newsapi_provider_fetches_raw_articles(tmp_path, monkeypatch):
@@ -977,10 +1169,73 @@ def test_collect_raw_articles_simplifies_gdelt_queries_for_broad_source(tmp_path
         providers=[FakeGdeltProvider()],
     )
 
-    assert captured["queries"] == [
-        '"Grab" launch Indonesia',
-        '"Grab" discount Indonesia',
-    ]
+    assert captured["queries"] == ["Grab Indonesia"]
+
+
+def test_collect_raw_articles_limits_gdelt_queries_per_run(tmp_path):
+    config = TrackerConfig.from_dict(
+        {
+            "regions": {
+                "sea": {
+                    "label": "Southeast Asia",
+                    "geo_terms": ["Indonesia"],
+                    "language_hints": ["en"],
+                }
+            },
+            "competitors_by_region": {"sea": ["Grab", "Gojek"]},
+            "topic_groups": {
+                "market_expansion": ["launch", "new city", "market entry"],
+                "pricing_promo": ["discount", "promo code"],
+            },
+            "topic_priority_groups": ["market_expansion", "pricing_promo"],
+            "keyword_templates": [
+                '"{competitor}" {topic_keywords} {geo_terms}',
+                '"{competitor}" {topic_name} {region_label} {language_hints}',
+            ],
+            "daily_digest_limit": 10,
+            "enabled_providers": ["gdelt"],
+        }
+    )
+    runtime = TrackerRuntimeConfig(
+        output_dir=tmp_path / "output",
+        database_path=tmp_path / "tracker.db",
+        lookback_days=7,
+        min_score=5,
+        config_path=tmp_path / "config.json",
+        gdelt_max_queries_per_run=1,
+    )
+    captured = {}
+
+    class FakeGdeltProvider:
+        name = "gdelt"
+
+        def fetch_with_diagnostics(self, request: ProviderRequest):
+            captured["queries"] = list(request.queries)
+            return [], {
+                "provider": self.name,
+                "status": "ok",
+                "queries": [],
+                "items_found": 0,
+                "items_after_filter": 0,
+                "items_after_global_dedup": 0,
+            }
+
+    (
+        _raw_articles,
+        _provider_names,
+        _provider_errors,
+        _fetched_articles_count,
+        provider_diagnostics,
+    ) = collect_raw_articles(
+        config=config,
+        runtime=runtime,
+        regions=("sea",),
+        competitors=("Grab", "Gojek"),
+        providers=[FakeGdeltProvider()],
+    )
+
+    assert captured["queries"] == ["Grab Indonesia"]
+    assert "warning" in provider_diagnostics["gdelt"]
 
 
 def test_collect_raw_articles_relaxes_google_news_queries_for_secondary_source(tmp_path):
@@ -1038,10 +1293,7 @@ def test_collect_raw_articles_relaxes_google_news_queries_for_secondary_source(t
         providers=[FakeGoogleNewsProvider()],
     )
 
-    assert captured["queries"] == [
-        '"Grab" launch Indonesia',
-        '"Grab" discount Indonesia',
-    ]
+    assert captured["queries"] == ["Grab Indonesia"]
 
 
 def test_collect_raw_articles_limits_guardian_query_count_and_prefers_historical_precision(tmp_path):

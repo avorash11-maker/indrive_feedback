@@ -147,27 +147,38 @@ graph TD
 
 - [src/competitor_tracker/config.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/config.py)
 - [default_config.json](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/default_config.json)
+- [product_logic.py](/C:/Users/shar0/Desktop/indrive_feedback/src/competitor_tracker/product_logic.py)
 
 Responsibilities:
 
 - load and validate config
+- freeze the canonical MVP product contract in code
 - define regions and competitors
 - define topic groups and keyword templates
 - expand search queries for providers
 - provide the strict competitor-by-region validation matrix for downstream checks
+- expose the canonical allowed competitor-region pairs to downstream logic
+- expose digest relevance rules and legacy topic aliases to downstream logic
+- keep visual-assets monitoring explicitly out of scope and disabled by default
 - allow broader `country_validation_terms` for post-LLM country safety checks
 - allow global `ignored_geo_terms` so obvious non-target geographies can be dropped early
 - keep runtime settings separate from domain config
+- treat `GDELT` as a best-effort quota-sensitive source with local pacing, query caps, cooldown, and diagnostics rather than as a bulk high-volume retrieval backend
 
 Default monitoring themes currently encoded in config:
 
 - `market_expansion`
 - `campaign_launches`
 - `pricing_promo`
-- `industry_context`
+- `core_industry_terms`
 - `strategic_operations`
 - `performance_growth`
 - `product_features_innovation`
+
+Provider architecture note:
+
+- `GDELT` is now intentionally throttled and capped in-product. The API path is used as a lightweight auxiliary source only.
+- If product needs high-volume archive-scale or native-language keyword search, the architecture should move that workload to `Web NGrams 3.0` rather than increasing DOC API pressure.
 
 ### Providers
 

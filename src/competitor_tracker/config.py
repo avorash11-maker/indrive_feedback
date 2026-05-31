@@ -8,6 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .product_logic import (
+    VISUAL_ASSETS_POLICY,
+    allowed_competitor_region_pairs,
+    normalize_topic_group_name,
+    presentable_region_name,
+    validate_default_product_config,
+)
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("default_config.json")
 
@@ -73,7 +80,9 @@ class TrackerConfig:
     @classmethod
     def load_default(cls) -> "TrackerConfig":
         """Load the repository default config."""
-        return cls.load(DEFAULT_CONFIG_PATH)
+        payload = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+        validate_default_product_config(payload)
+        return cls.from_dict(payload)
 
     @classmethod
     def load(cls, path: Path | str) -> "TrackerConfig":
@@ -316,6 +325,29 @@ class TrackerConfig:
             return False
         return normalized in self.competitors_by_region[region]
 
+    def allowed_competitor_region_pairs(self) -> frozenset[tuple[str, str]]:
+        """Return the strict allowed competitor-region matrix for this config."""
+
+        return allowed_competitor_region_pairs(self.competitors_by_region)
+
+    @staticmethod
+    def canonical_topic_group_name(topic_group: str) -> str:
+        """Return the canonical product-contract topic group name."""
+
+        return normalize_topic_group_name(topic_group)
+
+    @staticmethod
+    def business_region_name(region: str) -> str:
+        """Return the outward-facing region label used by delivery layers."""
+
+        return presentable_region_name(region)
+
+    @property
+    def visual_assets_enabled_by_default(self) -> bool:
+        """Expose the frozen MVP visual-assets scope boundary."""
+
+        return VISUAL_ASSETS_POLICY.enabled_by_default
+
     def queries_for_region(
         self,
         region: str,
@@ -536,6 +568,7 @@ class TrackerRuntimeConfig:
     telegram_top_n: int = 15
     article_context_max_chars: int = 8000
     enable_newsapi_full_run: bool = False
+    gdelt_max_queries_per_run: int = 10
     newsapi_max_queries_per_run: int = 25
     guardian_max_queries_per_run: int = 40
     historical_precision_half_life_days: int = 30
@@ -571,6 +604,10 @@ class TrackerRuntimeConfig:
             "COMPETITOR_TRACKER_ENABLE_NEWSAPI_FULL_RUN",
             False,
         )
+        gdelt_max_queries_per_run = max(
+            0,
+            int(os.getenv("COMPETITOR_TRACKER_GDELT_MAX_QUERIES_PER_RUN", "10")),
+        )
         newsapi_max_queries_per_run = max(
             0,
             int(os.getenv("COMPETITOR_TRACKER_NEWSAPI_MAX_QUERIES_PER_RUN", "25")),
@@ -599,6 +636,7 @@ class TrackerRuntimeConfig:
             telegram_top_n=telegram_top_n,
             article_context_max_chars=article_context_max_chars,
             enable_newsapi_full_run=enable_newsapi_full_run,
+            gdelt_max_queries_per_run=gdelt_max_queries_per_run,
             newsapi_max_queries_per_run=newsapi_max_queries_per_run,
             guardian_max_queries_per_run=guardian_max_queries_per_run,
             historical_precision_half_life_days=historical_precision_half_life_days,

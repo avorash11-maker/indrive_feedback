@@ -125,7 +125,11 @@ class CandidateArticle:
         channels: Tuple[str, ...] = (),
     ) -> "Alert":
         """Promote a candidate into an alert object."""
-        normalized_key = digest_key or f"{self.competitor.lower()}::{self.topic_group}::{self.url}"
+        normalized_key = (
+            digest_key
+            or self.raw_article.metadata.get("deferred_digest_key")
+            or f"{self.competitor.lower()}::{self.topic_group}::{self.url}"
+        )
         reason = self.summary or "; ".join(self.reasons) or self.title
         headline = f"{self.competitor}: {self.title}"
         normalized_priority = (priority or self._priority_from_score(self.score)).upper()

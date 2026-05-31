@@ -258,6 +258,7 @@ def test_sqlite_storage_returns_only_recent_undelivered_deferred_candidates(tmp_
     )
 
     assert [candidate.url for candidate in deferred] == [recent_undelivered.url]
+    assert deferred[0].topic_group == "product_features_innovation"
 
 
 def test_sqlite_storage_marks_deferred_and_expires_stale_entries(tmp_path):

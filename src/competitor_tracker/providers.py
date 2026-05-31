@@ -6,6 +6,7 @@ import logging
 import os
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -33,6 +34,8 @@ DEFAULT_HEADERS = {
 }
 GOOGLE_NEWS_MAX_ITEMS = 75
 GDELT_MAX_RECORDS = 75
+GDELT_MIN_REQUEST_INTERVAL_SECONDS = 5.0
+GDELT_COOLDOWN_SECONDS = 60
 NEWSAPI_PAGE_SIZE = 50
 NEWSAPI_DAILY_REQUEST_LIMIT = 90
 NEWSAPI_CACHE_TTL_SECONDS = 600
@@ -1345,8 +1348,62 @@ class GdeltProvider(BaseHttpProvider):
 
     name = "gdelt"
 
+    def __init__(self, session: Optional[requests.Session] = None) -> None:
+        super().__init__(session=session)
+        output_dir = Path(
+            os.getenv("COMPETITOR_TRACKER_OUTPUT_DIR", "output/competitor_tracker")
+        )
+        self.rate_limit_state_path = Path(
+            os.getenv(
+                "COMPETITOR_TRACKER_GDELT_RATE_LIMIT_STATE_PATH",
+                str(output_dir / "gdelt_rate_limit_state.json"),
+            )
+        )
+        self.min_request_interval_seconds = max(
+            0.0,
+            float(
+                os.getenv(
+                    "COMPETITOR_TRACKER_GDELT_MIN_REQUEST_INTERVAL_SECONDS",
+                    str(GDELT_MIN_REQUEST_INTERVAL_SECONDS),
+                )
+            ),
+        )
+        self.cooldown_seconds = max(
+            0,
+            int(
+                os.getenv(
+                    "COMPETITOR_TRACKER_GDELT_COOLDOWN_SECONDS",
+                    str(GDELT_COOLDOWN_SECONDS),
+                )
+            ),
+        )
+
     def fetch(self, request: ProviderRequest) -> List[RawArticle]:
-        articles, _ = self.fetch_with_diagnostics(request)
+        articles, diagnostics = self.fetch_with_diagnostics(request)
+        if not articles and str(diagnostics.get("status") or "").strip().lower() in {
+            "error",
+            "skipped",
+        }:
+            query_rows = diagnostics.get("queries")
+            first_query = ""
+            first_exception = "GDELT provider failed."
+            if isinstance(query_rows, list):
+                for item in query_rows:
+                    if not isinstance(item, dict):
+                        continue
+                    first_query = str(item.get("query") or "").strip()
+                    http_status = item.get("http_status")
+                    item_exception = str(item.get("exception") or "").strip()
+                    if http_status == 429:
+                        first_exception = "rate limit hit [429]"
+                    elif item_exception:
+                        first_exception = item_exception
+                    if first_exception:
+                        break
+            raise ProviderError(
+                f"Failed to fetch from gdelt for query '{first_query}': {first_exception}",
+                diagnostics=diagnostics,
+            )
         return articles
 
     def fetch_with_diagnostics(
@@ -1355,7 +1412,27 @@ class GdeltProvider(BaseHttpProvider):
     ) -> tuple[List[RawArticle], dict[str, object]]:
         articles: List[RawArticle] = []
         query_diagnostics: list[dict[str, object]] = []
+        rate_limited = False
         for query in request.queries:
+            if rate_limited:
+                query_diagnostics.append(
+                    self._cooldown_skip_diagnostic(
+                        query=query,
+                        request_url=self._build_request_url(
+                            url="https://api.gdeltproject.org/api/v2/doc/doc",
+                            params={
+                                "query": query,
+                                "mode": "artlist",
+                                "format": "json",
+                                "maxrecords": GDELT_MAX_RECORDS,
+                                "sort": "datedesc",
+                                "timespan": f"{request.days}d",
+                            },
+                        ),
+                        exception="GDELT cooldown is active after a prior 429 response in this run.",
+                    )
+                )
+                continue
             fetched, diagnostic = self._fetch_query(
                 query=query,
                 days=request.days,
@@ -1363,20 +1440,33 @@ class GdeltProvider(BaseHttpProvider):
             )
             articles.extend(fetched)
             query_diagnostics.append(diagnostic)
+            if diagnostic.get("cooldown_hit"):
+                rate_limited = True
+        successful_rows = [
+            item for item in query_diagnostics if str(item.get("status") or "").strip().lower() == "ok"
+        ]
+        error_rows = [
+            item for item in query_diagnostics if str(item.get("status") or "").strip().lower() == "error"
+        ]
+        skipped_rows = [
+            item for item in query_diagnostics if str(item.get("status") or "").strip().lower() == "skipped"
+        ]
+        status = "ok"
+        if error_rows and successful_rows:
+            status = "partial_error"
+        elif error_rows:
+            status = "error"
+        elif skipped_rows and not successful_rows:
+            status = "skipped"
         return articles, {
             "provider": self.name,
-            "status": "ok",
+            "status": status,
             "queries": query_diagnostics,
             "items_found": sum(int(item["items_found"]) for item in query_diagnostics),
             "items_after_filter": sum(int(item["items_after_filter"]) for item in query_diagnostics),
             "items_after_global_dedup": 0,
         }
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type(requests.RequestException),
-    )
     def _fetch_query(
         self,
         *,
@@ -1384,6 +1474,8 @@ class GdeltProvider(BaseHttpProvider):
         days: int,
         competitor_hints: Sequence[str],
     ) -> tuple[List[RawArticle], dict[str, object]]:
+        rate_limit_wait_seconds = 0.0
+
         def _build_gdelt_diagnostic(
             *,
             exception: str = "",
@@ -1411,6 +1503,7 @@ class GdeltProvider(BaseHttpProvider):
             diagnostic["response_body_kind"] = response_body_kind
             diagnostic["response_preview"] = clean_text(normalized_body[:240])
             diagnostic["response_parse_stage"] = response_parse_stage
+            diagnostic["rate_limit_wait_seconds"] = round(rate_limit_wait_seconds, 3)
             return diagnostic
 
         url = "https://api.gdeltproject.org/api/v2/doc/doc"
@@ -1425,7 +1518,24 @@ class GdeltProvider(BaseHttpProvider):
         request_url = self._build_request_url(url=url, params=params)
         response = None
         try:
+            cooldown_skip = self._active_cooldown_skip_diagnostic(
+                query=query,
+                request_url=request_url,
+            )
+            if cooldown_skip is not None:
+                return [], cooldown_skip
+            rate_limit_wait_seconds = self._wait_for_rate_limit_window()
             response = self.session.get(url, params=params, timeout=25)
+            if self._http_status(response) == 429:
+                diagnostic = _build_gdelt_diagnostic(
+                    exception="GDELT rate limit hit; enforced 5-second pacing remains active.",
+                    status="error",
+                    response_body_kind="unknown",
+                    response_parse_stage="http",
+                )
+                diagnostic["cooldown_hit"] = True
+                self._activate_cooldown()
+                return [], diagnostic
             response.raise_for_status()
             raw_text = self._response_text(response)
             normalized_text = raw_text.strip()
@@ -1581,7 +1691,14 @@ class GdeltProvider(BaseHttpProvider):
                 response_parse_stage="schema_validation",
             )
             return articles, diagnostic
-        except ProviderError:
+        except ProviderError as exc:
+            diagnostics = getattr(exc, "diagnostics", {}) or {}
+            query_rows = diagnostics.get("queries")
+            if isinstance(query_rows, list) and query_rows:
+                query_diagnostic = query_rows[0]
+                if isinstance(query_diagnostic, dict):
+                    query_diagnostic.setdefault("rate_limit_wait_seconds", round(rate_limit_wait_seconds, 3))
+                    return [], query_diagnostic
             raise
         except Exception as exc:
             diagnostic = _build_gdelt_diagnostic(
@@ -1590,19 +1707,107 @@ class GdeltProvider(BaseHttpProvider):
                 response_body_kind="unknown",
                 response_parse_stage="http",
             )
-            self._raise_provider_error(
-                provider=self.name,
-                query=query,
-                exc=exc,
-                diagnostics={
-                    "provider": self.name,
-                    "status": "error",
-                    "queries": [diagnostic],
-                    "items_found": 0,
-                    "items_after_filter": 0,
-                    "items_after_global_dedup": 0,
-                },
+            return [], diagnostic
+
+    def _wait_for_rate_limit_window(self) -> float:
+        if self.min_request_interval_seconds <= 0:
+            return 0.0
+        payload = self._read_rate_limit_state()
+        last_request_at_raw = str(payload.get("last_request_at") or "").strip()
+        waited_seconds = 0.0
+        if last_request_at_raw:
+            try:
+                last_request_at = datetime.fromisoformat(last_request_at_raw)
+            except ValueError:
+                last_request_at = self._utc_now() - timedelta(seconds=self.min_request_interval_seconds)
+            if last_request_at.tzinfo is None:
+                last_request_at = last_request_at.replace(tzinfo=timezone.utc)
+            elapsed_seconds = max(
+                (self._utc_now() - last_request_at.astimezone(timezone.utc)).total_seconds(),
+                0.0,
             )
+            if elapsed_seconds < self.min_request_interval_seconds:
+                waited_seconds = self.min_request_interval_seconds - elapsed_seconds
+                time.sleep(waited_seconds)
+        self._write_rate_limit_state({"last_request_at": self._utc_now().isoformat()})
+        return waited_seconds
+
+    def _read_rate_limit_state(self) -> dict[str, object]:
+        try:
+            return json.loads(self.rate_limit_state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except json.JSONDecodeError:
+            logger.warning("Ignoring unreadable GDELT rate limit state file: %s", self.rate_limit_state_path)
+            return {}
+
+    def _write_rate_limit_state(self, payload: dict[str, object]) -> None:
+        self.rate_limit_state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.rate_limit_state_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def _activate_cooldown(self) -> None:
+        payload = self._read_rate_limit_state()
+        payload["last_request_at"] = self._utc_now().isoformat()
+        if self.cooldown_seconds > 0:
+            payload["cooldown_until"] = (
+                self._utc_now() + timedelta(seconds=self.cooldown_seconds)
+            ).isoformat()
+        self._write_rate_limit_state(payload)
+
+    def _active_cooldown_skip_diagnostic(
+        self,
+        *,
+        query: str,
+        request_url: str,
+    ) -> dict[str, object] | None:
+        payload = self._read_rate_limit_state()
+        cooldown_until_raw = str(payload.get("cooldown_until") or "").strip()
+        if not cooldown_until_raw:
+            return None
+        try:
+            cooldown_until = datetime.fromisoformat(cooldown_until_raw)
+        except ValueError:
+            return None
+        if cooldown_until.tzinfo is None:
+            cooldown_until = cooldown_until.replace(tzinfo=timezone.utc)
+        if cooldown_until <= self._utc_now():
+            return None
+        return self._cooldown_skip_diagnostic(
+            query=query,
+            request_url=request_url,
+            exception="GDELT cooldown is active after a prior 429 response.",
+        )
+
+    def _cooldown_skip_diagnostic(
+        self,
+        *,
+        query: str,
+        request_url: str,
+        exception: str,
+    ) -> dict[str, object]:
+        diagnostic = self._query_diagnostic(
+            provider=self.name,
+            query=query,
+            request_url=request_url,
+            exception=exception,
+            status="skipped",
+        )
+        diagnostic["cooldown_hit"] = True
+        diagnostic["rate_limit_wait_seconds"] = 0.0
+        diagnostic["response_content_type"] = ""
+        diagnostic["response_body_length"] = 0
+        diagnostic["response_body_empty"] = True
+        diagnostic["response_body_kind"] = "cooldown"
+        diagnostic["response_preview"] = ""
+        diagnostic["response_parse_stage"] = "cooldown_guard"
+        return diagnostic
+
+    @staticmethod
+    def _utc_now() -> datetime:
+        return datetime.now(timezone.utc)
 
 
 def supported_provider_names() -> tuple[str, ...]:

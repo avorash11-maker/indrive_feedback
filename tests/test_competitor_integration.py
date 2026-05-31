@@ -899,7 +899,7 @@ def test_run_pipeline_falls_back_to_candidate_truth_layer_on_bad_llm_geo_output(
     assert candidate.country_hint == "Philippines"
 
     assert alert["competitor"] == candidate.competitor
-    assert alert["region"] == candidate.region
+    assert alert["region"] == "SEA"
     assert alert["country"] == expected_country
     assert alert["competitor_source"] == "pipeline"
     assert alert["region_source"] == "pipeline"
@@ -2074,7 +2074,7 @@ def test_run_pipeline_keeps_global_uber_news_in_query_owner_region(tmp_path, mon
     assert result["analysis"].candidates[0].region == "latam"
     assert len(result["digest"].alerts) == 1
     assert result["alert_schemas"][0]["competitor"] == "Uber"
-    assert result["alert_schemas"][0]["region"] == "latam"
+    assert result["alert_schemas"][0]["region"] == "LATAM"
 
 
 def test_run_pipeline_deduplicates_shared_bolt_article_across_regions(tmp_path, monkeypatch):
@@ -2342,7 +2342,9 @@ def test_unsent_telegram_alert_is_carried_over_on_next_run(tmp_path, monkeypatch
 
     assert len(first["digest"].alerts) == 16
     assert len(second["digest"].alerts) == 1
-    assert second["digest"].alerts[0].digest_key == first["digest"].alerts[-1].digest_key
+    assert second["digest"].alerts[0].digest_key == (
+        "comp15::market_entry::https://example.com/comp15-market-entry-15"
+    )
 
     storage = SQLiteTrackerStorage(tmp_path / "output" / "tracker.db")
     deferred_candidates = storage.get_deferred_candidates(

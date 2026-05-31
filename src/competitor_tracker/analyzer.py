@@ -25,15 +25,17 @@ from .models import (
     RawArticle,
     ResolvedPublicationDateSource,
 )
+from .product_logic import (
+    TOPIC_GROUPS,
+    normalize_topic_group_name,
+    presentable_region_name,
+    presentable_topic_name,
+)
 
 
 logger = logging.getLogger(__name__)
 
 UNDATED_FALLBACK_PUBLICATION_DATE = date.min
-BUSINESS_REGION_NAMES = {
-    "africa": "Africa & MEA",
-    "mea": "Africa & MEA",
-}
 NINETY_NINE_CONTEXT_PATTERN = re.compile(
     r"(?:\b99\b(?!\s*[%$])(?:\W+(app|ride|rides|rider|riders|taxi|driver|drivers|transport))\b)"
     r"|(?:\b(app|ride|rides|rider|riders|taxi|driver|drivers|transport)\b(?:\W+99\b(?![%$])))",
@@ -315,6 +317,7 @@ class CompetitorAnalyzer:
             return None, None
 
         text_blob = self._article_text_blob(article)
+        language_blob = self._language_text_blob(article)
         geo_text_blob = self._geo_text_blob(article)
         selected_regions = tuple(regions or self.config.regions.keys())
         competitor = self._detect_competitor(article, text_blob, selected_regions)
@@ -383,7 +386,7 @@ class CompetitorAnalyzer:
                     details={"competitor": competitor},
                 )
             region_key = owner_region
-        language_hint = self._detect_language(article, text_blob, region_key)
+        language_hint = self._detect_language(article, language_blob, region_key)
         score, reasons = self._score_candidate(
             article=article,
             competitor=competitor,
@@ -409,15 +412,13 @@ class CompetitorAnalyzer:
 
     @staticmethod
     def _article_text_blob(article: RawArticle) -> str:
+        # Competitor/topic scoring must use article-facing text only, not the originating search query.
         return " ".join(
             value.casefold()
             for value in (
                 article.title,
                 article.snippet,
-                article.query,
                 article.source,
-                article.region or "",
-                article.language or "",
             )
             if value
         )
@@ -431,6 +432,32 @@ class CompetitorAnalyzer:
                 article.title,
                 article.snippet,
                 article.source,
+            )
+            if value
+        )
+
+    @staticmethod
+    def _contains_text_term(text_blob: str, term: str) -> bool:
+        normalized_term = str(term or "").casefold().strip()
+        if not normalized_term:
+            return False
+        if re.fullmatch(r"[a-z]+", normalized_term):
+            pattern = r"(?<!\w)" + re.escape(normalized_term) + r"(?:s|es|ed|ing)?(?!\w)"
+            return re.search(pattern, text_blob) is not None
+        pattern = r"(?<!\w)" + re.escape(normalized_term).replace(r"\ ", r"\s+") + r"(?!\w)"
+        return re.search(pattern, text_blob) is not None
+
+    @staticmethod
+    def _language_text_blob(article: RawArticle) -> str:
+        return " ".join(
+            value.casefold()
+            for value in (
+                article.title,
+                article.snippet,
+                article.query,
+                article.source,
+                article.region or "",
+                article.language or "",
             )
             if value
         )
@@ -498,13 +525,13 @@ class CompetitorAnalyzer:
             return bool(MAXIM_CONTEXT_PATTERN.search(article_content))
         if normalized_competitor == "grab":
             return self._matches_grab_brand(article=article, article_content=article_content)
-        if normalized_competitor in text_blob:
+        if normalized_competitor in content_casefold:
             return True
         if self.config is None:
             return False
         for alias in self.config.competitor_aliases_for(competitor):
             normalized_alias = alias.casefold()
-            if normalized_alias and normalized_alias in text_blob:
+            if normalized_alias and normalized_alias in content_casefold:
                 return True
         return False
 
@@ -603,7 +630,9 @@ class CompetitorAnalyzer:
         best_keywords: tuple[str, ...] = ()
         best_score = 0
         for topic_name, keywords in self.config.topic_groups.items():
-            matched = tuple(keyword for keyword in keywords if keyword.casefold() in text_blob)
+            matched = tuple(
+                keyword for keyword in keywords if self._contains_text_term(text_blob, keyword)
+            )
             if len(matched) > best_score:
                 best_topic = topic_name
                 best_keywords = matched
@@ -686,29 +715,11 @@ class CompetitorAnalyzer:
             "regulation": ("ban", "permit", "license", "compliance", "regulation", "regulatory approval"),
             "safety": ("incident", "security", "insurance", "background check", "safety"),
             "product_launch": ("launch", "rollout", "expansion", "partnership", "pilot"),
-            "market_expansion": (
-                "launch",
-                "launching in",
-                "new city",
-                "entering market",
-                "market entry",
-                "expansion",
-                "license obtained",
-                "regulatory approval",
-            ),
-            "campaign_launches": (
-                "campaign",
-                "partnership",
-                "brand ambassador",
-                "new feature",
-                "strategic partnership",
-                "driver recruitment campaign",
-            ),
-            "pricing_promo": (
-                "discount",
-                "promo code",
-                "price cut",
-                "subscription",
+            "market_expansion": TOPIC_GROUPS["market_expansion"] + ("launch",),
+            "campaign_launches": TOPIC_GROUPS["campaign_launches"]
+            + ("strategic partnership", "driver recruitment campaign"),
+            "pricing_promo": TOPIC_GROUPS["pricing_promo"]
+            + (
                 "first ride free",
                 "discounted rides",
                 "referral bonus",
@@ -716,43 +727,18 @@ class CompetitorAnalyzer:
                 "low commission",
                 "bonus for new drivers",
             ),
-            "industry_context": (
-                "ride-hailing",
-                "e-hailing",
-                "on-demand mobility",
-                "ride-sharing",
-                "taxi app",
-                "vtc",
-                "maas",
-                "mobility as a service",
-            ),
-            "strategic_operations": (
-                "market entry",
-                "launching operations",
-                "license obtained",
-                "regulatory approval",
-                "strategic partnership",
-                "driver recruitment campaign",
-            ),
-            "performance_growth": (
-                "first ride free",
-                "discounted rides",
-                "referral bonus",
-                "loyalty program",
-                "low commission",
-                "bonus for new drivers",
-            ),
-            "product_features_innovation": (
-                "intercity",
-                "delivery",
-                "courier service",
-                "freight",
-                "fixed price",
-                "bidding model",
-                "safety features",
-            ),
+            "core_industry_terms": TOPIC_GROUPS["core_industry_terms"] + ("mobility as a service",),
+            "strategic_operations": TOPIC_GROUPS["strategic_operations"],
+            "performance_growth": TOPIC_GROUPS["performance_growth"] + ("low commission",),
+            "product_features_innovation": TOPIC_GROUPS["product_features_innovation"] + ("launch", "rollout", "partnership", "pilot"),
         }
-        if any(term in text_blob for term in priority_terms.get(topic_group, ())):
+        effective_topic_group = (
+            topic_group if topic_group in priority_terms else normalize_topic_group_name(topic_group)
+        )
+        if any(
+            self._contains_text_term(text_blob, term)
+            for term in priority_terms.get(effective_topic_group, ())
+        ):
             score += 2
             reasons.append("priority_signal")
 
@@ -831,6 +817,11 @@ class CompetitorAlertAnalyzer:
         if not llm_result:
             return fallback
         merged = {**fallback, **llm_result}
+        if "region" in llm_result:
+            merged["_llm_region"] = llm_result.get("_llm_region_raw", llm_result.get("region", ""))
+        if candidate.region:
+            # Keep internal region keys during truth validation; outward business labels are applied later.
+            merged["region"] = candidate.region
         merged.pop("resolved_publication_date", None)
         merged.pop("resolved_publication_date_source", None)
         llm_publication_date = self._normalize_published_date(
@@ -968,7 +959,7 @@ When writing:
                 "competitor": candidate.competitor,
                 "region": candidate.region or "",
                 "country": candidate.country_hint or "",
-                "topic": candidate.topic_group.replace("_", " "),
+                "topic": presentable_topic_name(candidate.topic_group),
                 "priority": self._priority_from_score(candidate.score),
                 "published_date": self._normalize_published_date(
                     context.published_at or candidate.raw_article.published_at
@@ -1007,10 +998,13 @@ When writing:
             )
             content = response.choices[0].message.content.strip()
             content = re.sub(r"^```json\s*|\s*```$", "", content, flags=re.I | re.S)
-            return self._normalize_alert(
-                json.loads(content),
+            parsed_content = json.loads(content)
+            normalized_alert = self._normalize_alert(
+                parsed_content,
                 apply_truth_validation=False,
             )
+            normalized_alert["_llm_region_raw"] = parsed_content.get("region", "")
+            return normalized_alert
         except Exception as exc:
             logger.warning(
                 "Competitor alert LLM analysis failed; falling back to rule-based alert. title=%r url=%r error=%s",
@@ -1028,7 +1022,7 @@ When writing:
         article_context: Optional[ArticleContext] = None,
     ) -> AlertSchema:
         priority = self._priority_from_score(candidate.score)
-        topic = candidate.topic_group.replace("_", " ")
+        topic = presentable_topic_name(candidate.topic_group)
         country = candidate.country_hint or ""
         region = self._presentable_region(candidate.region or "")
         matched = ", ".join(candidate.matched_keywords) or topic
@@ -1097,6 +1091,7 @@ When writing:
         normalized["topic"] = CompetitorAlertAnalyzer._clean_text(
             normalized.get("topic") or "general movement"
         )
+        normalized["topic"] = presentable_topic_name(normalized["topic"])
         priority = str(normalized.get("priority") or "LOW").upper()
         if priority not in {"LOW", "MEDIUM", "HIGH"}:
             priority = "LOW"
@@ -1151,8 +1146,8 @@ When writing:
                 else resolved_publication_date.isoformat()
             )
             normalized["published_date_source"] = resolved_publication_date_source
-        normalized["region"] = self._presentable_region(normalized.get("region") or "")
         if not apply_truth_validation:
+            normalized["region"] = self._presentable_region(normalized.get("region") or "")
             return normalized  # type: ignore[return-value]
         normalized = self._enforce_competitor_region_truth(normalized, candidate=candidate)
         normalized["region"] = self._presentable_region(normalized.get("region") or "")
@@ -1182,7 +1177,7 @@ When writing:
 
         resolved_region, region_fallback, region_source_hint = self._resolve_safe_region(
             competitor=competitor,
-            llm_region=normalized.get("region", ""),
+            llm_region=normalized.get("_llm_region", normalized.get("region", "")),
             llm_country=normalized.get("country", ""),
             fallback_region=fallback_region,
             fallback_country=fallback_country,
@@ -1216,7 +1211,7 @@ When writing:
     @staticmethod
     def _presentable_region(region: str) -> str:
         cleaned_region = CompetitorAlertAnalyzer._clean_text(region)
-        return BUSINESS_REGION_NAMES.get(cleaned_region, cleaned_region)
+        return presentable_region_name(cleaned_region)
 
     def _resolve_safe_region(
         self,

@@ -168,14 +168,11 @@ def _build_gdelt_request(
     seen_queries: set[str] = set()
     for _query, competitor, region, topic_name in query_specs:
         region_config = config.regions[region]
-        topic_keywords = config.topic_groups.get(topic_name, ())
-        primary_keyword = str(topic_keywords[0] if topic_keywords else topic_name.replace("_", " ")).strip()
         primary_geo = str(region_config.geo_terms[0] if region_config.geo_terms else region_config.label).strip()
         simplified_query = " ".join(
             part
             for part in (
-                f'"{competitor}"',
-                primary_keyword,
+                competitor,
                 primary_geo,
             )
             if part
@@ -721,6 +718,34 @@ def collect_raw_articles(
                 query_specs=query_specs,
                 config=config,
             )
+            provider_request, skipped_reason = _limit_provider_request(
+                provider_request,
+                provider_name="GDELT",
+                max_queries=runtime.gdelt_max_queries_per_run,
+            )
+            if not provider_request.queries:
+                provider_errors[provider.name] = skipped_reason or "GDELT skipped for this run."
+                provider_diagnostics[provider.name] = {
+                    "provider": provider.name,
+                    "status": "skipped",
+                    "queries": [
+                        {
+                            "provider": provider.name,
+                            "query": query,
+                            "request_url": "",
+                            "http_status": None,
+                            "exception": provider_errors[provider.name],
+                            "items_found": 0,
+                            "items_after_filter": 0,
+                            "status": "skipped",
+                        }
+                        for query in request.queries
+                    ],
+                    "items_found": 0,
+                    "items_after_filter": 0,
+                    "items_after_global_dedup": 0,
+                }
+                continue
         elif provider.name == "google_news_rss":
             provider_request = _build_gdelt_request(
                 request=request,
@@ -938,6 +963,7 @@ def test_provider(
         diagnostics["items_after_global_dedup"] = len(deduplicate_raw_articles(articles))
         provider_status = str(diagnostics.get("status") or "").strip().lower()
         skipped = provider_status == "skipped"
+        has_error = provider_status == "error" and not articles
         query_rows = diagnostics.get("queries")
         if not isinstance(query_rows, list):
             query_rows = []
@@ -950,7 +976,7 @@ def test_provider(
                 if skip_reason:
                     break
         return {
-            "ok": not skipped,
+            "ok": not skipped and not has_error,
             "skipped": skipped,
             "provider": provider.name,
             "query_count": len(queries),
@@ -959,6 +985,11 @@ def test_provider(
             "diagnostics": diagnostics,
             "sample_urls": [article.url for article in articles[:5]],
             **({"warning": skip_reason} if skipped and skip_reason else {}),
+            **(
+                {"error": "Provider returned no articles and reported an error status."}
+                if has_error
+                else {}
+            ),
         }
     except ProviderError as exc:
         diagnostics = (

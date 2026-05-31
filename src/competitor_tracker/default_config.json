@@ -41,44 +41,30 @@
   "topic_groups": {
     "market_expansion": [
       "launching in",
-      "launch",
-      "launching operations",
       "new city",
       "entering market",
-      "market entry",
-      "expansion",
-      "license obtained",
-      "regulatory approval"
+      "expansion"
     ],
     "campaign_launches": [
       "campaign",
       "partnership",
       "brand ambassador",
-      "new feature",
-      "strategic partnership",
-      "driver recruitment campaign"
+      "new feature"
     ],
     "pricing_promo": [
       "discount",
       "promo code",
       "price cut",
-      "subscription",
-      "first ride free",
-      "discounted rides",
-      "referral bonus",
-      "loyalty program",
-      "low commission for drivers",
-      "bonus for new drivers"
+      "subscription"
     ],
-    "industry_context": [
+    "core_industry_terms": [
       "ride-hailing",
       "e-hailing",
       "on-demand mobility",
       "ride-sharing",
       "taxi app",
       "vtc",
-      "maas",
-      "mobility as a service"
+      "maas"
     ],
     "strategic_operations": [
       "market entry",
@@ -113,7 +99,7 @@
     "strategic_operations",
     "performance_growth",
     "product_features_innovation",
-    "industry_context"
+    "core_industry_terms"
   ],
   "competitor_aliases": {
     "Yandex Go": ["Yango", "Yandex Taxi"],

@@ -200,6 +200,44 @@ def test_test_provider_marks_skipped_provider_as_not_ok_with_warning(monkeypatch
     assert result["warning"] == "GUARDIAN_API_KEY is missing; Guardian provider skipped."
 
 
+def test_test_provider_marks_error_status_without_articles_as_not_ok(monkeypatch):
+    class FakeErrorProvider:
+        name = "gdelt"
+
+        def fetch_with_diagnostics(self, request):
+            return [], {
+                "provider": self.name,
+                "status": "error",
+                "queries": [
+                    {
+                        "provider": self.name,
+                        "query": request.queries[0],
+                        "request_url": "https://api.gdeltproject.org/api/v2/doc/doc",
+                        "http_status": 429,
+                        "exception": "rate limit hit [429]",
+                        "items_found": 0,
+                        "items_after_filter": 0,
+                        "status": "error",
+                    }
+                ],
+                "items_found": 0,
+                "items_after_filter": 0,
+                "items_after_global_dedup": 0,
+            }
+
+    monkeypatch.setattr(cli, "build_providers", lambda names: [FakeErrorProvider()])
+
+    result = cli.test_provider(
+        provider_name="gdelt",
+        queries=["Grab Indonesia"],
+        days=1,
+    )
+
+    assert result["ok"] is False
+    assert result["diagnostics"]["status"] == "error"
+    assert result["error"] == "Provider returned no articles and reported an error status."
+
+
 def test_cli_qa_feeds_prints_stored_feed_health_report(monkeypatch, capsys):
     monkeypatch.setattr(
         cli,

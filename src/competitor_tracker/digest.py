@@ -10,6 +10,12 @@ from typing import Any, Callable, Iterable, List, Mapping, Optional, Sequence
 from .config import TrackerConfig
 from .geo_policy import GeoPolicy
 from .models import AlertSchema, CandidateArticle, CompetitorDigest
+from .product_logic import (
+    DIGEST_ALWAYS_RELEVANT_TOPICS,
+    DIGEST_COMPETITOR_ACTION_TERMS,
+    TOPIC_GROUPS,
+    normalize_topic_group_name,
+)
 from .normalization import (
     extract_domain,
     is_semantic_title_duplicate,
@@ -25,55 +31,7 @@ class DigestBuilder:
 
     PRIORITY_ORDER = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
     DEFERRED_MAX_AGE_DAYS = 2
-    MARKETING_DIGEST_TOPIC_ALLOWLIST = {
-        "market_expansion",
-        "market_entry",
-        "campaign_launches",
-        "pricing_promo",
-        "pricing",
-        "strategic_operations",
-        "performance_growth",
-    }
-    PRODUCT_FEATURES_MARKETING_TERMS = (
-        "launch",
-        "new feature",
-        "subscription",
-        "driver",
-        "rider",
-        "courier",
-        "delivery",
-        "intercity",
-        "safety",
-        "freight",
-        "fixed price",
-        "bidding model",
-    )
-    INDUSTRY_CONTEXT_ACTION_TERMS = (
-        "launch",
-        "launches",
-        "launched",
-        "expands",
-        "expansion",
-        "enters",
-        "entering market",
-        "market entry",
-        "campaign",
-        "partnership",
-        "partnered",
-        "partners with",
-        "promo",
-        "discount",
-        "subscription",
-        "price cut",
-        "regulatory approval",
-        "license obtained",
-        "driver recruitment",
-        "new feature",
-        "rolls out",
-        "rolled out",
-        "pilot",
-        "pilots",
-    )
+    PRODUCT_FEATURES_MARKETING_TERMS = TOPIC_GROUPS["product_features_innovation"]
     MARKETING_SOURCE_DENYLIST = {
         "openpr",
         "openpr.com",
@@ -219,7 +177,7 @@ class DigestBuilder:
         regions: Sequence[str],
         config: Optional[TrackerConfig],
     ) -> bool:
-        topic_group = str(candidate.topic_group or "").strip()
+        topic_group = normalize_topic_group_name(candidate.topic_group)
         if not self._has_marketing_geo_confirmation(
             candidate,
             regions=regions,
@@ -230,11 +188,11 @@ class DigestBuilder:
             return False
         if not self._passes_secondary_source_quality(candidate):
             return False
-        if topic_group in self.MARKETING_DIGEST_TOPIC_ALLOWLIST:
+        if topic_group in DIGEST_ALWAYS_RELEVANT_TOPICS:
             return True
-        if topic_group in {"product_features_innovation", "product_launch"}:
+        if topic_group == "product_features_innovation":
             return self._product_features_candidate_is_marketing_relevant(candidate)
-        if topic_group == "industry_context":
+        if topic_group == "core_industry_terms":
             return self._industry_context_candidate_has_competitor_action(candidate)
         return False
 
@@ -244,7 +202,7 @@ class DigestBuilder:
 
     def _industry_context_candidate_has_competitor_action(self, candidate: CandidateArticle) -> bool:
         text_blob = self._candidate_text_blob(candidate)
-        return any(term in text_blob for term in self.INDUSTRY_CONTEXT_ACTION_TERMS)
+        return any(term in text_blob for term in DIGEST_COMPETITOR_ACTION_TERMS)
 
     @staticmethod
     def _candidate_text_blob(candidate: CandidateArticle) -> str:
@@ -355,7 +313,7 @@ class DigestBuilder:
             return True
 
         text_blob = self._candidate_text_blob(candidate)
-        has_action_signal = any(term in text_blob for term in self.INDUSTRY_CONTEXT_ACTION_TERMS)
+        has_action_signal = any(term in text_blob for term in DIGEST_COMPETITOR_ACTION_TERMS)
         if not has_action_signal:
             return False
 
@@ -481,7 +439,7 @@ class DigestBuilder:
                 continue
             if item.get("competitor") != alert.competitor:
                 continue
-            if item.get("topic_group") != alert.topic_group:
+            if normalize_topic_group_name(item.get("topic_group") or "") != normalize_topic_group_name(alert.topic_group):
                 continue
             history_country = item.get("country_hint") or ""
             alert_country = alert.candidate.country_hint or ""
@@ -502,7 +460,7 @@ class DigestBuilder:
         for existing in kept:
             if existing.competitor != alert.competitor:
                 continue
-            if existing.topic_group != alert.topic_group:
+            if normalize_topic_group_name(existing.topic_group) != normalize_topic_group_name(alert.topic_group):
                 continue
             if self._is_similar_title(title_key, normalize_title(existing.candidate.title)):
                 return True

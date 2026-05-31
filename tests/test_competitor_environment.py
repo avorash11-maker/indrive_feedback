@@ -52,6 +52,15 @@ def test_get_runtime_env_names_lists_supported_runtime_overrides():
     names = get_runtime_env_names()
 
     assert names["config_path"] == ("COMPETITOR_TRACKER_CONFIG_PATH",)
+    assert names["gdelt_min_request_interval_seconds"] == (
+        "COMPETITOR_TRACKER_GDELT_MIN_REQUEST_INTERVAL_SECONDS",
+    )
+    assert names["gdelt_cooldown_seconds"] == (
+        "COMPETITOR_TRACKER_GDELT_COOLDOWN_SECONDS",
+    )
+    assert names["gdelt_rate_limit_state_path"] == (
+        "COMPETITOR_TRACKER_GDELT_RATE_LIMIT_STATE_PATH",
+    )
     assert names["newsapi_cache_path"] == ("COMPETITOR_TRACKER_NEWSAPI_CACHE_PATH",)
     assert names["guardian_budget_path"] == ("COMPETITOR_TRACKER_GUARDIAN_BUDGET_PATH",)
 
