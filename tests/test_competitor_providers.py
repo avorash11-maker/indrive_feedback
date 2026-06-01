@@ -1110,7 +1110,7 @@ def test_collect_raw_articles_limits_newsapi_query_count_per_run(tmp_path):
     assert provider_errors == {}
     assert fetched_articles_count == 0
     assert len(captured["queries"]) == 1
-    assert captured["queries"] == ['"Uber" product launch Latin America']
+    assert captured["queries"] == ['"Uber" launch "Latin America" Mexico']
     assert "warning" in provider_diagnostics["newsapi"]
 
 
@@ -1169,7 +1169,7 @@ def test_collect_raw_articles_simplifies_gdelt_queries_for_broad_source(tmp_path
         providers=[FakeGdeltProvider()],
     )
 
-    assert captured["queries"] == ["Grab Indonesia"]
+    assert captured["queries"] == ['Grab launch Indonesia', 'Grab discount Indonesia']
 
 
 def test_collect_raw_articles_limits_gdelt_queries_per_run(tmp_path):
@@ -1234,7 +1234,7 @@ def test_collect_raw_articles_limits_gdelt_queries_per_run(tmp_path):
         providers=[FakeGdeltProvider()],
     )
 
-    assert captured["queries"] == ["Grab Indonesia"]
+    assert captured["queries"] == ["Grab launch Indonesia"]
     assert "warning" in provider_diagnostics["gdelt"]
 
 
@@ -1293,7 +1293,10 @@ def test_collect_raw_articles_relaxes_google_news_queries_for_secondary_source(t
         providers=[FakeGoogleNewsProvider()],
     )
 
-    assert captured["queries"] == ["Grab Indonesia"]
+    assert captured["queries"] == [
+        '"Grab" launch "new city" "market entry" "Southeast Asia" Indonesia Thailand',
+        '"Grab" discount "promo code" "Southeast Asia" Indonesia Thailand',
+    ]
 
 
 def test_collect_raw_articles_limits_guardian_query_count_and_prefers_historical_precision(tmp_path):
@@ -1333,7 +1336,7 @@ def test_collect_raw_articles_limits_guardian_query_count_and_prefers_historical
         source="The Guardian",
         published_at="2026-05-18T09:00:00Z",
         snippet="Expansion update.",
-        query='"Uber" market expansion Latin America',
+        query='"Uber" launch "Latin America" Mexico',
         region="latam",
         language="en",
         competitor_hints=("Uber",),
@@ -1345,7 +1348,7 @@ def test_collect_raw_articles_limits_guardian_query_count_and_prefers_historical
         source="The Guardian",
         published_at="2026-05-18T09:00:00Z",
         snippet="Roundup mention.",
-        query='"DiDi" market expansion Latin America',
+        query='"DiDi" launch "Latin America" Mexico',
         region="latam",
         language="en",
         competitor_hints=("DiDi",),
@@ -1401,7 +1404,7 @@ def test_collect_raw_articles_limits_guardian_query_count_and_prefers_historical
     assert provider_names == ("guardian",)
     assert provider_errors == {}
     assert fetched_articles_count == 0
-    assert captured["queries"] == ['"Uber" market expansion Latin America']
+    assert captured["queries"] == ['"Uber" launch "Latin America" Mexico']
     assert "warning" in provider_diagnostics["guardian"]
 
 
@@ -1462,8 +1465,8 @@ def test_collect_raw_articles_uses_focused_queries_for_guardian_quality_source(t
     )
 
     assert captured["queries"] == [
-        '"Uber" market expansion Latin America',
-        '"Uber" pricing promo Latin America',
+        '"Uber" launch "new city" "market entry" "Latin America" Mexico Brazil',
+        '"Uber" discount "promo code" "Latin America" Mexico Brazil',
     ]
 
 

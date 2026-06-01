@@ -275,6 +275,53 @@ def test_prioritized_topic_groups_keep_business_priority_first():
     assert prioritized_specs[1][2] == "pricing_promo"
 
 
+def test_provider_query_specs_use_real_keyword_phrases_by_provider():
+    config = TrackerConfig.load_default()
+
+    google_specs = config.provider_query_specs_for_region(
+        "latam",
+        provider_name="google_news_rss",
+        topic_groups=["market_expansion"],
+        competitors=["Uber"],
+    )
+    guardian_specs = config.provider_query_specs_for_region(
+        "sea",
+        provider_name="guardian",
+        topic_groups=["pricing_promo"],
+        competitors=["Grab"],
+    )
+    gdelt_specs = config.provider_query_specs_for_region(
+        "cis_central_asia",
+        provider_name="gdelt",
+        topic_groups=["product_features_innovation"],
+        competitors=["Yandex Go"],
+    )
+
+    assert google_specs[0].query == (
+        '"Uber" "launching in" "new city" "entering market" expansion '
+        '"Latin America" Mexico Brazil Colombia'
+    )
+    assert guardian_specs[0].query == (
+        '"Grab" discount "promo code" "price cut" "Southeast Asia" Indonesia Thailand'
+    )
+    assert gdelt_specs[0].query == 'Yandex Go intercity Kazakhstan'
+
+
+def test_provider_query_specs_preserve_scope_metadata():
+    config = TrackerConfig.load_default()
+
+    specs = config.provider_query_specs_for_regions(
+        ("africa", "mea"),
+        provider_name="guardian",
+        topic_groups=["strategic_operations"],
+        competitors=["Careem"],
+    )
+
+    assert {spec.region for spec in specs} == {"africa", "mea"}
+    assert {spec.competitor for spec in specs} == {"Careem"}
+    assert {spec.topic_group for spec in specs} == {"strategic_operations"}
+
+
 def test_from_dict_accepts_competitor_aliases_and_regional_rss_feeds():
     config = TrackerConfig.from_dict(
         {

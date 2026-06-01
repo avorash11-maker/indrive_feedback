@@ -764,6 +764,9 @@ class CompetitorAlertAnalyzer:
     INSUFFICIENT_SOURCE_DATA_MESSAGE = (
         "Недостаточно данных для анализа, так как сайт источника недоступен"
     )
+    UNCLEAR_POTENTIAL_IMPACT_MESSAGE = (
+        "Потенциальное влияние неясно и требует дополнительной проверки."
+    )
     def __init__(
         self,
         use_llm: bool = True,
@@ -979,7 +982,7 @@ When writing:
                 ),
                 "what_happened": candidate.summary or candidate.title,
                 "why_it_matters": self.INSUFFICIENT_SOURCE_DATA_MESSAGE,
-                "potential_impact": "Potential impact remains unclear and needs validation.",
+                "potential_impact": self.UNCLEAR_POTENTIAL_IMPACT_MESSAGE,
                 "recommended_action": self.INSUFFICIENT_SOURCE_DATA_MESSAGE,
                 "confidence": 0.0,
             }
@@ -1389,6 +1392,25 @@ When writing:
             return datetime.fromisoformat(candidate.replace("Z", "+00:00")).date().isoformat()
         except ValueError:
             return ""
+
+    @classmethod
+    def is_editorial_fallback_alert(cls, alert: Mapping[str, Any]) -> bool:
+        """Detect alerts that should not be delivered as final editorial cards."""
+
+        why_it_matters = cls._clean_text(alert.get("why_it_matters") or "")
+        potential_impact = cls._clean_text(alert.get("potential_impact") or "")
+        recommended_action = cls._clean_text(alert.get("recommended_action") or "")
+        try:
+            confidence = float(alert.get("confidence", 0))
+        except Exception:
+            confidence = 0.0
+
+        return (
+            why_it_matters == cls.INSUFFICIENT_SOURCE_DATA_MESSAGE
+            or recommended_action == cls.INSUFFICIENT_SOURCE_DATA_MESSAGE
+            or potential_impact == cls.UNCLEAR_POTENTIAL_IMPACT_MESSAGE
+            or (why_it_matters == cls.INSUFFICIENT_SOURCE_DATA_MESSAGE and confidence <= 0.0)
+        )
 
 
 InDriveMarcomEditor = CompetitorAlertAnalyzer

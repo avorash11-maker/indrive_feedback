@@ -70,9 +70,10 @@ def format_alert_card(
         what_happened = f"{what_happened}."
     why_it_matters = _clean(alert.get("why_it_matters"))
     potential_impact = _clean(alert.get("potential_impact"))
-    product_take = _clean(alert.get("product_take"))
-    product_risk = _clean(alert.get("product_risk"))
-    product_follow_up = _clean(alert.get("product_follow_up"))
+    product_take, product_risk, product_follow_up = _localized_product_block(
+        alert,
+        locale=locale,
+    )
     lines = [
         headline or build_alert_headline(alert, locale=locale),
         "",
@@ -220,3 +221,48 @@ def format_daily_digest_markdown(
 
 def _clean(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()
+
+
+def _localized_product_block(
+    alert: Mapping[str, Any],
+    *,
+    locale: str,
+) -> tuple[str, str, str]:
+    raw_take = _clean(alert.get("product_take"))
+    raw_risk = _clean(alert.get("product_risk"))
+    raw_follow_up = _clean(alert.get("product_follow_up"))
+    if locale != "ru":
+        return raw_take, raw_risk, raw_follow_up
+
+    trigger = _clean(alert.get("product_strategist_trigger"))
+    if not trigger:
+        return raw_take, raw_risk, raw_follow_up
+
+    market = _clean(
+        alert.get("country")
+        or alert.get("region")
+        or LABELS["ru"]["unknown_where"]
+    )
+    localized = {
+        "pricing_promo": (
+            f"Этот ценовой ход может изменить восприятие ценности для райдеров и экономики заработка для водителей в {market}.",
+            "Есть риск давления на value proposition, если конкурент задаст более сильный локальный ориентир по цене или incentives.",
+            "Проверьте локальную ценовую архитектуру, промо-ограничения и нужен ли inDrive более точный ответ по value proposition.",
+        ),
+        "product_features_innovation": (
+            f"Этот продуктовый или сервисный запуск может поднять ожидания по feature parity для райдеров или водителей в {market}.",
+            "Есть риск восприятия продуктового отставания, если конкурент превратит эту возможность в заметное пользовательское обещание.",
+            "Проверьте релевантность для parity, скорость rollout и нужен ли ответ через продукт, GTM или messaging.",
+        ),
+        "strategic_operations": (
+            f"Этот операционный ход может улучшить надёжность сервиса, качество supply или эффективность выхода на рынок в {market}.",
+            "Есть риск усиления локального execution advantage, если партнёрства, market-entry mechanics или сервисные операции улучшатся быстрее ответа inDrive.",
+            "Проверьте операционные зависимости, friction при выходе на рынок и нужен ли ответ через продукт или ops, а не только через коммуникации.",
+        ),
+        "performance_growth": (
+            f"Этот growth-сигнал, вероятно, связан с продуктовыми или операционными механиками в {market}.",
+            "Есть риск усиления давления на marketplace quality или value perception, если underlying mechanism масштабируется локально.",
+            "Проверьте, должен ли ответ идти через ops levers, driver experience или service design.",
+        ),
+    }
+    return localized.get(trigger, (raw_take, raw_risk, raw_follow_up))

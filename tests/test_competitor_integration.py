@@ -1300,6 +1300,105 @@ def test_run_pipeline_no_body_context_uses_insufficient_source_fallback(
     assert alert["published_date"] == "2026-05-20"
 
 
+def test_run_pipeline_telegram_quality_gate_skips_editorial_fallback_alert(
+    tmp_path, monkeypatch
+):
+    config = build_config()
+    patch_runtime(monkeypatch, tmp_path, config, use_llm_alerts=True, llm_top_n=1)
+    monkeypatch.setattr(
+        cli,
+        "build_providers",
+        lambda names: [
+            StaticProvider(
+                "mock_news",
+                [
+                    article(
+                        competitor="Grab",
+                        title="Grab launches driver campaign in Manila",
+                        url="https://example.com/grab-no-body-quality-gate",
+                        query='"Grab" campaign_launches Southeast Asia',
+                    )
+                ],
+            )
+        ],
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    class FakeContextExtractor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def extract(self, candidate):
+            return ArticleContext(
+                title=candidate.title,
+                snippet=candidate.raw_article.snippet,
+                source_url=candidate.url,
+                article_body="",
+                published_at="2026-05-20",
+                published_at_source="html_scraped",
+            )
+
+        def build_fallback_context(self, candidate):
+            return self.extract(candidate)
+
+    class FakeOpenAIClient:
+        def __init__(self, api_key=None, http_client=None):
+            self.chat = type(
+                "ChatNamespace",
+                (),
+                {
+                    "completions": type(
+                        "CompletionNamespace",
+                        (),
+                        {
+                            "create": staticmethod(
+                                lambda **kwargs: (_ for _ in ()).throw(
+                                    AssertionError("LLM should not be called when article body is empty")
+                                )
+                            )
+                        },
+                    )()
+                },
+            )()
+
+    sender_calls = {}
+
+    class FakeTelegramSender:
+        def __init__(self, storage, dry_run):
+            sender_calls["dry_run"] = dry_run
+
+        def send_daily_digest(self, alert_schemas, alerts, source_urls, generated_at):
+            sender_calls["alerts"] = len(alerts)
+            sender_calls["schemas"] = len(alert_schemas)
+            return {
+                "ok": True,
+                "dry_run": True,
+                "message_id": None,
+                "message_ids": [],
+                "messages_sent": len(alerts),
+            }
+
+    monkeypatch.setattr(cli, "ArticleContextExtractor", FakeContextExtractor)
+    monkeypatch.setattr("competitor_tracker.analyzer.openai.OpenAI", FakeOpenAIClient)
+    monkeypatch.setattr(cli, "TelegramSender", FakeTelegramSender)
+
+    result = cli.run_pipeline(
+        days=7,
+        min_score=5,
+        regions=["sea"],
+        telegram_mode="dry",
+    )
+
+    assert len(result["alert_schemas"]) == 1
+    assert result["telegram_quality_dropped_count"] == 1
+    assert sender_calls == {
+        "dry_run": True,
+        "alerts": 0,
+        "schemas": 0,
+    }
+    assert result["telegram_result"]["messages_sent"] == 0
+
+
 def test_telegram_delivery_uses_enriched_alert_cards_from_llm_output(
     tmp_path, monkeypatch
 ):

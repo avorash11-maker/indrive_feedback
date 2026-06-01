@@ -723,6 +723,17 @@ def test_competitor_alert_analyzer_fallback_output_includes_marcom_editor_fields
     assert alert["recommended_action"]
 
 
+def test_competitor_alert_analyzer_detects_editorial_fallback_alert():
+    alert = {
+        "why_it_matters": CompetitorAlertAnalyzer.INSUFFICIENT_SOURCE_DATA_MESSAGE,
+        "potential_impact": CompetitorAlertAnalyzer.UNCLEAR_POTENTIAL_IMPACT_MESSAGE,
+        "recommended_action": CompetitorAlertAnalyzer.INSUFFICIENT_SOURCE_DATA_MESSAGE,
+        "confidence": 0.0,
+    }
+
+    assert CompetitorAlertAnalyzer.is_editorial_fallback_alert(alert) is True
+
+
 def test_competitor_alert_analyzer_prefers_llm_date_when_provider_is_missing_even_if_html_exists():
     def fake_create(**kwargs):
         return SimpleNamespace(

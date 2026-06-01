@@ -137,6 +137,8 @@ def test_format_alert_card_uses_business_region_name_when_country_is_missing():
 
 def test_format_alert_card_can_render_russian_telegram_labels():
     alert = build_alert_payload()
+    alert["product_strategist_trigger"] = "product_features_innovation"
+    alert["product_strategist_invoked"] = True
 
     card = format_alert_card(
         alert,
@@ -154,3 +156,5 @@ def test_format_alert_card_can_render_russian_telegram_labels():
     assert "Почему это важно:" in card
     assert "Потенциальное влияние:" in card
     assert "Продуктовый вывод:" in card
+    assert "This may raise parity expectations" not in card
+    assert "Этот продуктовый или сервисный запуск" in card

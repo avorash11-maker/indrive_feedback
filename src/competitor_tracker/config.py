@@ -63,6 +63,16 @@ class RssFeedConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class QuerySpec:
+    """Provider-ready search query plus the scope it belongs to."""
+
+    query: str
+    competitor: str
+    region: str
+    topic_group: str
+
+
+@dataclass(frozen=True, slots=True)
 class TrackerConfig:
     """Loaded configuration and source of truth for competitor tracking."""
 
@@ -488,6 +498,72 @@ class TrackerConfig:
                     query_specs.append((normalized_query, competitor, topic_name))
         return query_specs
 
+    def provider_query_specs_for_region(
+        self,
+        region: str,
+        *,
+        provider_name: str,
+        topic_groups: Optional[Sequence[str]] = None,
+        competitors: Optional[Sequence[str]] = None,
+    ) -> List[QuerySpec]:
+        """Build provider-specific query specs from the frozen competitor/topic scope."""
+        if region not in self.regions:
+            raise ValueError(f"Unknown region '{region}'")
+
+        base_specs = self.prioritized_query_specs_for_region(
+            region,
+            topic_groups=topic_groups,
+            competitors=competitors,
+        )
+        provider = str(provider_name or "").strip().lower()
+        query_specs: List[QuerySpec] = []
+        seen_queries: set[str] = set()
+        for _query, competitor, topic_group in base_specs:
+            query_text = self._provider_query_text(
+                provider_name=provider,
+                competitor=competitor,
+                region=region,
+                topic_group=topic_group,
+            )
+            normalized_query = " ".join(query_text.split())
+            if not normalized_query or normalized_query in seen_queries:
+                continue
+            seen_queries.add(normalized_query)
+            query_specs.append(
+                QuerySpec(
+                    query=normalized_query,
+                    competitor=competitor,
+                    region=region,
+                    topic_group=topic_group,
+                )
+            )
+        return query_specs
+
+    def provider_query_specs_for_regions(
+        self,
+        regions: Optional[Sequence[str]] = None,
+        *,
+        provider_name: str,
+        topic_groups: Optional[Sequence[str]] = None,
+        competitors: Optional[Sequence[str]] = None,
+    ) -> List[QuerySpec]:
+        """Build provider-specific query specs across multiple regions."""
+        selected_regions = _dedupe_keep_order(regions or self.regions.keys())
+        query_specs: List[QuerySpec] = []
+        seen_queries: set[str] = set()
+        for region in selected_regions:
+            for spec in self.provider_query_specs_for_region(
+                region,
+                provider_name=provider_name,
+                topic_groups=topic_groups,
+                competitors=competitors,
+            ):
+                if spec.query in seen_queries:
+                    continue
+                seen_queries.add(spec.query)
+                query_specs.append(spec)
+        return query_specs
+
     def queries_for_regions(
         self,
         regions: Optional[Sequence[str]] = None,
@@ -552,6 +628,126 @@ class TrackerConfig:
             "geo_terms": " OR ".join(region_config.geo_terms),
             "language_hints": " OR ".join(region_config.language_hints),
         }
+
+    def _provider_query_text(
+        self,
+        *,
+        provider_name: str,
+        competitor: str,
+        region: str,
+        topic_group: str,
+    ) -> str:
+        region_config = self.regions[region]
+        keywords = self.topic_groups[topic_group]
+        provider = str(provider_name or "").strip().lower()
+        if provider == "gdelt":
+            return self._build_gdelt_query(
+                competitor=competitor,
+                region_config=region_config,
+                keywords=keywords,
+            )
+        if provider == "google_news_rss":
+            return self._build_google_news_query(
+                competitor=competitor,
+                region_config=region_config,
+                keywords=keywords,
+            )
+        if provider in {"guardian", "newsapi"}:
+            return self._build_human_search_query(
+                competitor=competitor,
+                region_config=region_config,
+                keywords=keywords,
+            )
+        expanded = self._expand_template_values(
+            competitor=competitor,
+            topic_name=topic_group,
+            topic_keywords=keywords,
+            region_config=region_config,
+        )
+        for template in self.keyword_templates:
+            query = " ".join(template.format(**expanded).split()).strip()
+            if query:
+                return query
+        return ""
+
+    @staticmethod
+    def _quote_if_needed(value: str) -> str:
+        term = str(value or "").strip()
+        if not term:
+            return ""
+        if " " in term or "/" in term:
+            return f'"{term}"'
+        return term
+
+    @classmethod
+    def _query_phrase_blob(
+        cls,
+        values: Sequence[str],
+        *,
+        limit: Optional[int] = None,
+    ) -> str:
+        selected = values[:limit] if limit is not None else values
+        return " ".join(
+            cls._quote_if_needed(value)
+            for value in selected
+            if str(value or "").strip()
+        )
+
+    @classmethod
+    def _build_gdelt_query(
+        cls,
+        *,
+        competitor: str,
+        region_config: RegionConfig,
+        keywords: Sequence[str],
+    ) -> str:
+        primary_geo = str(region_config.geo_terms[0] if region_config.geo_terms else region_config.label).strip()
+        primary_keyword = str(keywords[0] if keywords else "").strip()
+        return " ".join(
+            part
+            for part in (
+                competitor,
+                cls._quote_if_needed(primary_keyword),
+                cls._quote_if_needed(primary_geo),
+            )
+            if part
+        )
+
+    @classmethod
+    def _build_google_news_query(
+        cls,
+        *,
+        competitor: str,
+        region_config: RegionConfig,
+        keywords: Sequence[str],
+    ) -> str:
+        return " ".join(
+            part
+            for part in (
+                f'"{competitor}"',
+                cls._query_phrase_blob(keywords, limit=4),
+                cls._query_phrase_blob((region_config.label, *region_config.geo_terms), limit=4),
+            )
+            if part
+        )
+
+    @classmethod
+    def _build_human_search_query(
+        cls,
+        *,
+        competitor: str,
+        region_config: RegionConfig,
+        keywords: Sequence[str],
+    ) -> str:
+        return " ".join(
+            part
+            for part in (
+                f'"{competitor}"',
+                cls._query_phrase_blob(keywords, limit=3),
+                cls._query_phrase_blob((region_config.label, *region_config.geo_terms), limit=3),
+            )
+            if part
+        )
 
 
 @dataclass(frozen=True, slots=True)
